@@ -2,27 +2,26 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from openalgo import api
-from utils import load_symbols
+from event_bus import signal_queue
 
 load_dotenv()
 
 
 class TradeExecutor:
     """
-    RAM-DRIVEN EXECUTOR (FINAL, FULL VISIBILITY)
-    -------------------------------------------
-    • Live monitor: LTP / PH / PL (one line per symbol)
-    • Breakout trading (prev candle)
+    TRADE EXECUTOR (ORDERS / POSITIONS ONLY)
+    -----------------------------------------
+    • Consumes signals from signal_queue (produced by SignalGenerator)
     • ONE active position globally
-    • Stoploss = 0.2%
+    • Stoploss = 0.2%, monitored on its own loop
     • Force square-off on shutdown using MARKET orders
+    • Has NO knowledge of breakout / candle logic
     """
 
     STOPLOSS_PCT = 0.002  # 0.2%
 
-    def __init__(self, ohlc, symbols_csv: str = "symbols.csv"):
+    def __init__(self, ohlc):
         self.ohlc = ohlc
-        self.symbols = load_symbols(symbols_csv)
         self.active_position = None
 
         self.client = api(
@@ -30,46 +29,43 @@ class TradeExecutor:
             host=os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000")
         )
 
-        print("[EXEC] Executor initialized (FULL MONITOR MODE)", flush=True)
+        print("[EXEC] Executor initialized (SIGNAL-DRIVEN MODE)", flush=True)
 
     # =====================================================
     # MAIN LOOP
     # =====================================================
 
     async def run(self):
-        print("[EXEC] Executor running (live monitor)", flush=True)
+        print("[EXEC] Executor running (consuming signals)", flush=True)
 
+        stoploss_task = asyncio.create_task(self._stoploss_loop())
+
+        try:
+            while True:
+                signal = await signal_queue.get()
+                self._handle_signal(signal)
+        finally:
+            stoploss_task.cancel()
+            await asyncio.gather(stoploss_task, return_exceptions=True)
+
+    def _handle_signal(self, signal):
+        if self.active_position:
+            # Already in a trade — ignore further signals until it's closed
+            return
+
+        self._enter_trade(
+            signal["exchange"],
+            signal["symbol"],
+            signal["side"],
+            signal["price"],
+        )
+
+    async def _stoploss_loop(self):
         while True:
-            for instr in self.symbols:
-                symbol = instr["symbol"]
-                exchange = instr["exchange"]
-
-                ltp = self.ohlc.latest_ltp.get(symbol)
-                candles = self.ohlc.ohlc_1m.get(symbol)
-
-                if ltp is None or not candles:
-                    continue
-
-                # ------------------------------
-                # Trading logic
-                # ------------------------------
-                last_candle = candles[-1]
-                ph = last_candle["high"]
-                pl = last_candle["low"]
-
-                if self.active_position:
-                    self._check_stoploss()
-                    continue
-
-                if ltp > ph:
-                    self._enter_trade(exchange, symbol, "BUY", ltp)
-
-                elif ltp < pl:
-                    self._enter_trade(exchange, symbol, "SELL", ltp)
-
+            if self.active_position:
+                self._check_stoploss()
             await asyncio.sleep(0.1)
 
-    # =====================================================
     # =====================================================
     # ENTRY
     # =====================================================
