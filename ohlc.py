@@ -3,11 +3,12 @@
 import os
 import re
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from market_time import tz_kolkata, MARKET_OPEN
 from event_bus import market_data_queue
 import asyncio
 import threading
+from collections import deque
 from parquet_writer import ParquetWriter
 
 # 9:15:00 in seconds from midnight
@@ -15,7 +16,7 @@ MARKET_OPEN_SECS = MARKET_OPEN.hour * 3600 + MARKET_OPEN.minute * 60  # 33300
 
 
 # ─────────────────────────────────────────────
-# TF utilities  (also mirrored in ohlc_backfill.py)
+# TF utilities  (also mirrored in gap_detector.py's compute_bucket)
 # ─────────────────────────────────────────────
 
 def _tf_to_seconds(tf_str: str) -> int:
@@ -110,6 +111,22 @@ class OHLCCollector:
         # current_candles[tf][symbol] = { timestamp, open, high, low, close, volume }
         self.current_candles = {tf: {} for tf in self._configured_tfs}
 
+        # ── RAM retention (rolling window) ─────────────────────────────
+        # Raw ticks + closed candles are pruned from RAM (NOT from disk —
+        # Parquet keeps full history) once they age out of this window.
+        # Per-TF window = max(RAM_WINDOW_MINUTES, MIN_CANDLES * tf_seconds)
+        # so higher TFs always retain at least MIN_CANDLES candles, which
+        # indicators.py / ADX depend on — a flat 30-min cap alone would
+        # starve 5m/15m of enough history.
+        self.ram_window_secs = int(os.getenv("RAM_WINDOW_MINUTES", "30")) * 60
+        self.min_candles     = int(os.getenv("MIN_CANDLES", "15"))
+        self._tf_seconds_map = dict(self._tf_list)
+
+        # Raw Quote ticks, kept only for the flat RAM_WINDOW_MINUTES window
+        # (no MIN_CANDLES-style requirement applies to raw ticks).
+        # raw_ticks[symbol] = deque of {timestamp, ltp, qty}
+        self.raw_ticks = {}
+
         # ── Backward-compat references ────────────────────────────────
         # executor.py / indicators.py / PreviousCandleGuard use these names directly.
         # They point to the SAME dict objects inside ohlc_data / current_candles
@@ -144,6 +161,10 @@ class OHLCCollector:
         self._append_ram(symbol, timeframe, candle)
         self.parquet_writer.enqueue(symbol, timeframe, candle)
 
+    def _retention_secs(self, tf_seconds: int) -> int:
+        """max(flat RAM window, enough seconds for MIN_CANDLES) for this TF."""
+        return max(self.ram_window_secs, self.min_candles * tf_seconds)
+
     def _append_ram(self, symbol, timeframe, candle):
         with self._ram_lock:
             store = self.ohlc_data.get(timeframe)
@@ -166,6 +187,15 @@ class OHLCCollector:
                 series.append(row)
                 series.sort(key=lambda x: pd.Timestamp(x["timestamp"]))
 
+            # ── Prune RAM to this TF's retention window ─────────────────
+            # Disk (Parquet) always keeps full history — this only trims
+            # what stays resident in memory.
+            tf_seconds = self._tf_seconds_map.get(timeframe)
+            if tf_seconds and series:
+                cutoff = row["timestamp"] - timedelta(seconds=self._retention_secs(tf_seconds))
+                while series and pd.Timestamp(series[0]["timestamp"]) < cutoff:
+                    series.pop(0)
+
     # =====================================================
     # BACKFILL TRIGGER  (called once at startup)
     # =====================================================
@@ -178,8 +208,8 @@ class OHLCCollector:
         if self._backfilled:
             return
 
-        from ohlc_backfill import OHLCBackfill
-        backfill = OHLCBackfill(self)
+        from backfill_manager import BackfillManager
+        backfill = BackfillManager(self)
         backfill.run(symbols)
 
         self._backfilled       = True
@@ -232,6 +262,18 @@ class OHLCCollector:
             return
         ts = datetime.fromtimestamp(data["ltt"] / 1000, tz=tz_kolkata)
 
+        # ── Raw tick RAM store — flat rolling window, no MIN_CANDLES rule ──
+        with self._ram_lock:
+            ticks = self.raw_ticks.setdefault(symbol, deque())
+            ticks.append({
+                "timestamp": ts,
+                "ltp":       ltp,
+                "qty":       data.get("last_trade_quantity", 0),
+            })
+            cutoff = ts - timedelta(seconds=self.ram_window_secs)
+            while ticks and ticks[0]["timestamp"] < cutoff:
+                ticks.popleft()
+
         # ── Update every configured TF directly from this tick ────────
         for tf_str, tf_seconds in self._tf_list:
             bucket   = _compute_bucket(ts, tf_seconds)
@@ -267,13 +309,3 @@ class OHLCCollector:
 
     def shutdown(self):
         self.parquet_writer.shutdown()
-
-
-
-
-
-
-        
-
-
-        
