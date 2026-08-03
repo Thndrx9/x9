@@ -48,17 +48,25 @@ class BackfillManager:
     to GapDetector (gap_detector.py) — this class has no bucket math of
     its own beyond what it needs to run SQL queries.
 
-    Schema expected (main db, from pg_writer.py):
-        table : quote_{SYMBOL}   (e.g. quote_RELIANCE)
-        cols  : timestamp BIGINT (exchange ms, indexed)
-                ingest_ns BIGINT
-                raw_json  JSONB  → fields used: ltp, last_trade_quantity
+    Schema (main db, confirmed against pg_writer.py's _QUOTE_COLUMN_DEFS —
+    typed columns, NOT JSONB):
+        table : quote_{symbol}   (e.g. quote_reliance; pg_writer always
+                lowercases the table name, Postgres folds unquoted idents
+                to lowercase anyway so this matters cosmetically only)
+        cols  : timestamp BIGINT (exchange ms, indexed), ingest_ns BIGINT,
+                ltp DOUBLE PRECISION, ltt BIGINT, volume BIGINT,
+                open/high/low/close DOUBLE PRECISION,
+                last_quantity BIGINT, oi BIGINT,
+                upper_circuit/lower_circuit DOUBLE PRECISION
 
-    Schema expected (history db, PG_HDBNAME):
-        table : quote_{SYMBOL}   (same naming convention)
-        cols  : timestamp BIGINT, ingest_ns BIGINT,
-                raw_json JSONB → pre-aggregated OHLCV + "interval" tag
-                (e.g. {"open":.., "high":.., ..., "interval": "1m"})
+    Schema (history db, PG_HDBNAME) — UNCONFIRMED, pending clarification:
+        pg_writer.py never shows PG_HDBNAME holding a pre-aggregated,
+        interval-tagged quote_{SYMBOL} table. The only JSONB-schema table
+        it defines is 'daily_{SYMBOL}' (one row per symbol per day, EOD
+        candle). _fetch_history_candles() below still queries the OLD
+        (wrong) shape and will simply fail safely — caught, logged as a
+        WARN, treated as "no history fallback available" — until this is
+        confirmed and rewritten to match whatever PG_HDBNAME actually holds.
     """
 
     def __init__(self, ohlc):
@@ -313,19 +321,27 @@ class BackfillManager:
     # ─────────────────────────────────────────────
 
     def _fetch_ticks(self, symbol: str, start_ts: datetime):
-        # Sanitize symbol for table name (alphanumeric + underscore only)
+        # Sanitize symbol for table name (alphanumeric + underscore only).
+        # pg_writer._ensure_table always lowercases; Postgres folds unquoted
+        # identifiers to lowercase too, but lowering here keeps the SQL
+        # text matching what's actually on disk instead of relying on
+        # that fold happening implicitly.
         safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
-        table    = f"quote_{safe_sym}"
+        table    = f"quote_{safe_sym}".lower()
         start_ms = int(start_ts.timestamp() * 1000)
 
+        # Real schema (pg_writer._QUOTE_COLUMN_DEFS) is typed columns —
+        # there is no raw_json column on quote_*/depth_* tables, and the
+        # tick-quantity column is named last_quantity, not
+        # last_trade_quantity.
         query = f"""
             SELECT
                 timestamp,
-                (raw_json->>'ltp')::float                                    AS ltp,
-                COALESCE((raw_json->>'last_trade_quantity')::float, 0)       AS qty
+                ltp,
+                COALESCE(last_quantity, 0) AS qty
             FROM {table}
             WHERE timestamp >= %s
-              AND raw_json->>'ltp' IS NOT NULL
+              AND ltp IS NOT NULL
             ORDER BY timestamp
         """
 
