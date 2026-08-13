@@ -74,8 +74,11 @@ async def websocket_client(
                     grouped.setdefault(ex, []).append(sym)
 
                 for ex, symbols in grouped.items():
+                    suffix = (
+                        " (same universe as Quote)" if mode_label == "Depth" else ""
+                    )
                     print(
-                        f"[WS] Subscribed {mode_label} {ex}:{','.join(symbols)}",
+                        f"[WS] Subscribed {mode_label} {ex}:{len(symbols)} symbols{suffix}",
                         flush=True,
                     )
 
@@ -108,7 +111,17 @@ async def websocket_client(
                             data["_subscription_mode"] = mode_label
                             await target_queue.put(data)
                         elif data.get("status") == "error":
-                            print(f"[WS][ERROR] mode={mode_label} {data}", flush=True)
+                            # A mid-session error — e.g. the broker session
+                            # was invalidated after we'd already
+                            # authenticated — is a real fault. Raising
+                            # instead of just printing routes us into the
+                            # except-Exception block below, which logs
+                            # DISCONNECTED and retries in 2s, instead of
+                            # leaving a socket open that looks "connected"
+                            # while receiving nothing useful.
+                            raise RuntimeError(
+                                f"server error message | mode={mode_label} data={data}"
+                            )
                 finally:
                     hb_task.cancel()
                     await asyncio.gather(hb_task, return_exceptions=True)

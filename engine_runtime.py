@@ -15,6 +15,7 @@ from signal_generator import SignalGenerator
 from executor import TradeExecutor
 from market_time import (
     MARKET_OPEN,
+    MARKET_CLOSE,
     is_market_open,
     is_trading_day,
     now_kolkata,
@@ -57,6 +58,44 @@ async def _run_backfill_safe(ohlc, symbols):
         import traceback
         print("[BACKFILL][FATAL] Backfill task crashed:", flush=True)
         traceback.print_exc()
+
+
+async def _auto_stop_after_close(stop_event, poll_secs=30):
+    """
+    Automatically triggers graceful shutdown POST_CLOSE_STOP_MINUTES
+    (default 2) after TODAY's market close — instead of sitting there
+    with a live-but-idle WebSocket connection until someone kills the
+    process manually. Assumes a scheduler (cron/systemd/etc.) restarts
+    the process fresh before the next session; this does NOT itself wait
+    for or resume at the next open.
+
+    Only ever fires on an actual trading day, and only once today's
+    close + the grace period has passed — so it never triggers during
+    the pre-open wait (CASE 3 in run_engine below), and never triggers
+    at all on a weekend/holiday.
+    """
+    stop_after_min = int(os.getenv("POST_CLOSE_STOP_MINUTES", "2"))
+
+    while not stop_event.is_set():
+        now = now_kolkata()
+
+        if is_trading_day(now.date()):
+            close_dt = datetime.combine(now.date(), MARKET_CLOSE, tzinfo=tz_kolkata)
+            stop_at  = close_dt + timedelta(minutes=stop_after_min)
+
+            if now >= stop_at:
+                print(
+                    f"[SYSTEM] Market closed {stop_after_min}+ minute(s) ago — "
+                    f"stopping.",
+                    flush=True,
+                )
+                stop_event.set()
+                return
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=poll_secs)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def run_engine(enable_trading: bool):
@@ -108,6 +147,12 @@ async def run_engine(enable_trading: bool):
         tasks.append(asyncio.create_task(ohlc.run()))
         tasks.append(asyncio.create_task(depth_store.run()))
         tasks.append(asyncio.create_task(indicator_loop()))
+        # Only matters once actually live for today — starting this
+        # earlier (e.g. unconditionally at process start) would fire
+        # immediately and wrongly short-circuit CASE 3's "waiting for
+        # tomorrow's open" path if the process happens to be started
+        # after today's close specifically to sit and wait overnight.
+        tasks.append(asyncio.create_task(_auto_stop_after_close(stop_event)))
 
         if executor:
             tasks.append(asyncio.create_task(signal_generator.run()))

@@ -1,6 +1,5 @@
 # start_data.py
 
-import venv_setup
 import asyncio
 from engine_runtime import run_engine
 
