@@ -122,8 +122,11 @@ class OHLCCollector:
         self.min_candles     = int(os.getenv("MIN_CANDLES", "15"))
         self._tf_seconds_map = dict(self._tf_list)
 
-        # Raw Quote ticks, kept only for the flat RAM_WINDOW_MINUTES window
-        # (no MIN_CANDLES-style requirement applies to raw ticks).
+        # Raw Quote ticks, kept only for a dedicated flat window — separate
+        # from RAM_WINDOW_MINUTES (candle retention) so tuning one never
+        # accidentally shifts the other. No MIN_CANDLES-style floor applies
+        # to raw ticks since they're not candles.
+        self.tick_ram_window_secs = int(os.getenv("TICK_RAM_WINDOW_MINUTES", "9")) * 60
         # raw_ticks[symbol] = deque of {timestamp, ltp, qty}
         self.raw_ticks = {}
 
@@ -270,7 +273,7 @@ class OHLCCollector:
                 "ltp":       ltp,
                 "qty":       data.get("last_trade_quantity", 0),
             })
-            cutoff = ts - timedelta(seconds=self.ram_window_secs)
+            cutoff = ts - timedelta(seconds=self.tick_ram_window_secs)
             while ticks and ticks[0]["timestamp"] < cutoff:
                 ticks.popleft()
 
@@ -309,3 +312,25 @@ class OHLCCollector:
 
     def shutdown(self):
         self.parquet_writer.shutdown()
+
+    # =====================================================
+    # READ ACCESS  (for other in-process modules)
+    # =====================================================
+
+    def get_recent_ticks(self, symbol, seconds=None):
+        """
+        Return buffered ticks for `symbol` as a list of
+        {"timestamp", "ltp", "qty"} dicts, oldest first.
+
+        Defaults to the full retained window (TICK_RAM_WINDOW_MINUTES,
+        9 minutes by default). Pass `seconds` for a narrower slice of
+        that same buffer — it can't exceed what's actually retained.
+        """
+        with self._ram_lock:
+            ticks = self.raw_ticks.get(symbol)
+            if not ticks:
+                return []
+            if seconds is None:
+                return list(ticks)
+            cutoff = ticks[-1]["timestamp"] - timedelta(seconds=seconds)
+            return [t for t in ticks if t["timestamp"] >= cutoff]
