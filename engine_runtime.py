@@ -9,7 +9,7 @@ from utils import load_symbols
 from websocket_connect import run_market_data_feeds
 from ohlc import OHLCCollector, PreviousCandleGuard
 from depth_store import DepthStore
-from depth_writer import DepthWriter
+from tick_writer import TickWriter
 from indicators import IndicatorEngine
 from signal_generator import SignalGenerator
 from executor import TradeExecutor
@@ -33,6 +33,10 @@ PARALLEL_BACKFILL_THRESHOLD_SECS = 60
 # the Quote-mode websocket connection (the one backfill/gap-detection
 # cares about for figuring out when the feed actually dropped).
 CONN_LOG_DIR = os.getenv("CONN_LOG_DIR", "connection_logs")
+
+# How many trading days of local SQLite tick history to retain (pruned
+# at market close / on shutdown — see TickWriter.prune_older_than_days).
+TICK_CACHE_RETENTION_DAYS = int(os.getenv("TICK_CACHE_RETENTION_DAYS", "3"))
 
 
 def _next_market_open(dt: datetime) -> datetime:
@@ -58,6 +62,46 @@ async def _run_backfill_safe(ohlc, symbols):
         import traceback
         print("[BACKFILL][FATAL] Backfill task crashed:", flush=True)
         traceback.print_exc()
+
+
+async def _run_backfill_and_release(ohlc, symbols, tick_writer):
+    """
+    Same as _run_backfill_safe(), plus releasing tick_writer's
+    hold/release gate afterward. Used when backfill runs in PARALLEL
+    with the live websocket (CASE 1/2 below): tick_writer.hold() is
+    called right before start_live_tasks(), so any live ticks that
+    arrive while this backfill's own PG tick-fetch is still in flight
+    get buffered in RAM instead of racing those (earlier-timestamp)
+    historical rows onto disk out of order. Releasing here — after the
+    backfill (and its inline tick-cache writes) has fully finished —
+    flushes that buffer in the correct order and resumes direct writes.
+    """
+    try:
+        await _run_backfill_safe(ohlc, symbols)
+    finally:
+        tick_writer.release()
+
+
+async def _catchup_and_release(ohlc, symbols, tick_writer):
+    """
+    Standalone pre-live catch-up: fetches whatever PG ticks landed
+    since the local SQLite tick cache's last row and writes them
+    straight to it, then releases the hold/release gate. Used in CASE 3
+    below, where the full historical backfill already ran and
+    completed earlier (while the market was closed, no live ticks
+    existed yet) — this only needs to cover the short gap between then
+    and the websocket actually going live.
+    """
+    try:
+        from backfill_manager import BackfillManager
+        backfill = BackfillManager(ohlc)
+        await asyncio.to_thread(backfill.cache_recent_ticks_to_sqlite, symbols)
+    except Exception:
+        import traceback
+        print("[TICK_CACHE][WARN] pre-live catch-up fetch failed:", flush=True)
+        traceback.print_exc()
+    finally:
+        tick_writer.release()
 
 
 async def _auto_stop_after_close(stop_event, poll_secs=30):
@@ -111,9 +155,11 @@ async def run_engine(enable_trading: bool):
         return
     api_key = os.getenv("API_KEY")
 
-    ohlc             = OHLCCollector()
-    depth_writer     = DepthWriter(base_dir="depthdata")
-    depth_store      = DepthStore(depth_writer=depth_writer)
+    # Single local SQLite tick cache, shared by quote ticks (via ohlc)
+    # and depth snapshots (via depth_store) — see tick_writer.py.
+    tick_writer      = TickWriter(base_dir="tickdata")
+    ohlc             = OHLCCollector(tick_writer=tick_writer)
+    depth_store      = DepthStore(tick_writer=tick_writer)
     indicators       = IndicatorEngine(ohlc)
     prev_candle_guard = PreviousCandleGuard(ohlc)
     signal_generator  = SignalGenerator(ohlc) if enable_trading else None
@@ -184,8 +230,12 @@ async def run_engine(enable_trading: bool):
             "and running backfill in parallel.",
             flush=True,
         )
+        # Backfill's own PG tick-fetch runs in parallel with live ticks
+        # from here on — hold the gate so they can't land out of order
+        # (see _run_backfill_and_release's docstring).
+        tick_writer.hold()
         start_live_tasks()
-        tasks.append(asyncio.create_task(_run_backfill_safe(ohlc, symbols)))
+        tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer)))
 
     else:
         next_open      = _next_market_open(now)
@@ -197,8 +247,9 @@ async def run_engine(enable_trading: bool):
                 f"starting WebSocket now and running backfill in parallel.",
                 flush=True,
             )
+            tick_writer.hold()
             start_live_tasks()
-            tasks.append(asyncio.create_task(_run_backfill_safe(ohlc, symbols)))
+            tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer)))
 
         else:
             # Market is closed and not imminent — block until backfill finishes
@@ -222,7 +273,15 @@ async def run_engine(enable_trading: bool):
 
             if not stop_event.is_set():
                 print("[SYSTEM] Starting WebSocket 30s before market open.", flush=True)
+                # Blocking backfill above already cached PG ticks to
+                # SQLite directly (no live producer existed yet, so no
+                # ordering risk there). From here on live ticks may
+                # start arriving any moment — hold the gate, start the
+                # feed, then run one last small catch-up fetch for
+                # whatever landed in PG since backfill finished.
+                tick_writer.hold()
                 start_live_tasks()
+                tasks.append(asyncio.create_task(_catchup_and_release(ohlc, symbols, tick_writer)))
 
     await stop_event.wait()
 
@@ -234,5 +293,11 @@ async def run_engine(enable_trading: bool):
 
     await asyncio.gather(*tasks, return_exceptions=True)
     ohlc.shutdown()
-    depth_writer.shutdown()
+
+    # Market end or manual stop — both come through here (stop_event
+    # fires from _auto_stop_after_close() or SIGINT/SIGTERM either way)
+    # — trim the local tick cache back down to the retention window
+    # before closing the writer out.
+    tick_writer.prune_older_than_days(TICK_CACHE_RETENTION_DAYS)
+    tick_writer.shutdown()
     print("[SYSTEM] Shutdown complete", flush=True)

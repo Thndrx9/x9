@@ -11,8 +11,8 @@ class ParquetWriter:
     Dedicated single-writer service for parquet.
     All parquet writes must flow through this class.
 
-    OHLC candles only — depth snapshots are written separately by
-    DepthWriter (SQLite-backed, see depth_writer.py), since depth's
+    OHLC candles only — quote/depth ticks are written separately by
+    TickWriter (SQLite-backed, see tick_writer.py), since their
     write pattern (frequent inserts) doesn't suit Parquet's
     read-whole-file/rewrite-whole-file append model the way low-frequency
     candle writes do.

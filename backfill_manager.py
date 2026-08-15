@@ -9,8 +9,14 @@ from collections import deque
 from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
-from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day
-from gap_detector import GapDetector, compute_bucket
+from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata
+from gap_detector import (
+    GapDetector,
+    compute_bucket,
+    compute_bucket_vectorized,
+    is_at_or_after_market_open_vectorized,
+    is_market_hours_weekday_vectorized,
+)
 
 load_dotenv()
 
@@ -104,6 +110,10 @@ class BackfillManager:
 
     def __init__(self, ohlc):
         self.ohlc        = ohlc
+        # Local SQLite tick cache — set on the OHLCCollector instance by
+        # engine_runtime.py. Optional: None just means "don't cache PG
+        # ticks to disk", everything else still works.
+        self.tick_writer = getattr(ohlc, "tick_writer", None)
         self.min_candles = int(os.getenv("MIN_CANDLES", "15"))
         self.timeframes  = self._load_timeframes()   # [(tf_str, tf_seconds), ...]
         self.conn        = self._connect()
@@ -485,14 +495,19 @@ class BackfillManager:
                 print(f"[BACKFILL][WARN] {symbol} {tf_str}: 0 candles aggregated", flush=True)
                 continue
 
-            for _, row in candles.iterrows():
+            # itertuples() instead of iterrows() — same one-row-at-a-time
+            # save_candle() calls (its per-symbol upsert/sort logic in
+            # ohlc.py is unchanged), just avoids the per-row pandas Series
+            # construction that iterrows() does, which is pure overhead here
+            # since we only read scalar fields off each row.
+            for row in candles.itertuples(index=False):
                 self.ohlc.save_candle(symbol, tf_str, {
-                    "timestamp": row["timestamp"],
-                    "open":      float(row["open"]),
-                    "high":      float(row["high"]),
-                    "low":       float(row["low"]),
-                    "close":     float(row["close"]),
-                    "volume":    float(row["volume"]),
+                    "timestamp": row.timestamp,
+                    "open":      float(row.open),
+                    "high":      float(row.high),
+                    "low":       float(row.low),
+                    "close":     float(row.close),
+                    "volume":    float(row.volume),
                 })
 
             print(
@@ -634,6 +649,47 @@ class BackfillManager:
         return len(entries)
 
     # ─────────────────────────────────────────────
+    # Standalone catch-up: fetch PG ticks since each symbol's last
+    # cached row and write them straight to the local SQLite tick
+    # cache. Used by engine_runtime.py for the final catch-up right
+    # before going live (see tick_writer.py's hold()/release() gate) —
+    # NOT part of the main run()/backfill flow, which caches ticks
+    # inline in _fetch_ticks_batch() above as a side effect of its own
+    # candle-gap fetches.
+    # ─────────────────────────────────────────────
+
+    def cache_recent_ticks_to_sqlite(self, symbols: list, default_window_secs: int = 9 * 60):
+        """
+        symbols: list of {"symbol": ...} dicts (same shape load_symbols()
+        returns) or plain symbol strings.
+
+        For each symbol, resumes from tick_writer.max_ts(symbol) if
+        anything's cached already, else falls back to
+        default_window_secs ago. Safe to call with tick_writer=None
+        (no-op) or when nothing new has arrived (writes nothing).
+        """
+        if self.tick_writer is None or not symbols:
+            return
+
+        existing_tables = self._load_existing_quote_tables(self.conn) if self.conn else set()
+        now = now_kolkata()
+        default_start = now - timedelta(seconds=default_window_secs)
+
+        fetch_starts = {}
+        for s in symbols:
+            symbol = s["symbol"] if isinstance(s, dict) else s
+            last_ms = self.tick_writer.max_ts(symbol)
+            fetch_starts[symbol] = (
+                datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata) + timedelta(milliseconds=1)
+                if last_ms is not None else default_start
+            )
+
+        # _fetch_ticks_batch already caches whatever it fetches to
+        # self.tick_writer as a side effect (see the groupby loop
+        # below) — nothing further to do with its return value here.
+        self._fetch_ticks_batch(fetch_starts, existing_tables)
+
+    # ─────────────────────────────────────────────
     # Fetch ticks from PostgreSQL (main db) — BATCHED across symbols
     # ─────────────────────────────────────────────
 
@@ -715,15 +771,31 @@ class BackfillManager:
             df = pd.DataFrame(rows, columns=["symbol", "timestamp", "ltp", "qty"])
             df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
 
+            # Keep only market-hours rows on weekdays — same filter the old
+            # single-symbol _fetch_ticks() applied. Vectorized once across
+            # the whole chunk (all symbols together), instead of re-running
+            # a .dt.time / .dt.dayofweek comparison per symbol inside the
+            # groupby loop below — same anti-pattern class as _aggregate()'s
+            # bucket/market-open filters. See
+            # is_market_hours_weekday_vectorized()'s docstring in
+            # gap_detector.py.
+            df = df[is_market_hours_weekday_vectorized(df["ist_ts"])]
+
             for symbol, group in df.groupby("symbol"):
                 g = group.drop(columns=["symbol"]).reset_index(drop=True)
-                # Keep only market-hours rows on weekdays — same filter
-                # the old single-symbol _fetch_ticks() applied.
-                t = g["ist_ts"].dt.time
-                g = g[
-                    (t >= MARKET_OPEN) & (t < MARKET_CLOSE) & (g["ist_ts"].dt.dayofweek < 5)
-                ].reset_index(drop=True)
                 out[symbol] = g
+
+                # Cache these PG-fetched ticks to the local SQLite tick
+                # store too. `g` is already ascending by timestamp (the
+                # query is ORDER BY symbol, timestamp), so this is a
+                # single ordered block — see tick_writer.py's ordering
+                # guarantee docstring for why that matters.
+                if self.tick_writer is not None:
+                    rows = [
+                        {"timestamp": int(row.timestamp), "ltp": row.ltp, "qty": row.qty}
+                        for row in g.itertuples(index=False)
+                    ]
+                    self.tick_writer.enqueue_backfill_rows(symbol, rows)
 
         if skipped_no_table:
             preview = ", ".join(skipped_no_table[:10])
@@ -762,13 +834,21 @@ class BackfillManager:
                 columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
 
-        df["bucket"] = df["ist_ts"].apply(
-            lambda ts: compute_bucket(ts, tf_seconds)
-        )
+        # Vectorized — was previously a per-row .apply(compute_bucket), which
+        # is a pure-Python loop over every tick and dominated Phase 3's wall
+        # time (measured ~2.5s per 130k-tick symbol per timeframe; with 199
+        # symbols x 2 TFs that adds up to several minutes). This does the
+        # same bucket math as numpy array ops instead of a scalar function
+        # call per row. See compute_bucket_vectorized()'s docstring in
+        # gap_detector.py for the equivalence guarantee with compute_bucket().
+        df["bucket"] = compute_bucket_vectorized(df["ist_ts"], tf_seconds)
 
         # Drop any tick that landed before market open (bucket would be 9:15:00
-        # even for pre-market ticks — filter them by comparing raw ist_ts)
-        df = df[df["ist_ts"].dt.time >= MARKET_OPEN]
+        # even for pre-market ticks — filter them by comparing raw ist_ts).
+        # Vectorized (int64 seconds-of-day) instead of .dt.time — see
+        # is_at_or_after_market_open_vectorized()'s docstring in
+        # gap_detector.py; this was the dominant cost (~86%) of _aggregate().
+        df = df[is_at_or_after_market_open_vectorized(df["ist_ts"])]
 
         # Exclude the currently-forming (incomplete) candle
         current_bucket = compute_bucket(now, tf_seconds)
