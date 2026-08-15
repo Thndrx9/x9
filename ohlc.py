@@ -91,7 +91,7 @@ class OHLCCollector:
 
     _WRITER_LOCK = False
 
-    def __init__(self, base_dir="ohlcdata"):
+    def __init__(self, base_dir="ohlcdata", tick_writer=None):
         if OHLCCollector._WRITER_LOCK:
             raise RuntimeError("[OHLC][FATAL] Multiple OHLCCollector instances detected")
         OHLCCollector._WRITER_LOCK = True
@@ -145,6 +145,12 @@ class OHLCCollector:
         self._backfilled     = False
         self.backfill_complete = False
         self.parquet_writer  = ParquetWriter(base_dir=base_dir, tz=tz_kolkata)
+
+        # Local SQLite tick cache (shared with DepthStore, kind='quote'
+        # here) — optional; BackfillManager also writes PG catch-up
+        # rows through this same writer, so it's read here as
+        # `self.tick_writer` (see backfill_manager.py).
+        self.tick_writer = tick_writer
 
         print(
             f"[OHLC] Initialized | TFs: {self._configured_tfs} | base_dir: {base_dir}",
@@ -276,6 +282,14 @@ class OHLCCollector:
             cutoff = ts - timedelta(seconds=self.tick_ram_window_secs)
             while ticks and ticks[0]["timestamp"] < cutoff:
                 ticks.popleft()
+
+        # ── Local SQLite tick cache (kind='quote') ─────────────────────
+        if self.tick_writer is not None:
+            self.tick_writer.enqueue_live(symbol, "quote", {
+                "timestamp": data["ltt"],
+                "ltp":       ltp,
+                "qty":       data.get("last_trade_quantity", 0),
+            })
 
         # ── Update every configured TF directly from this tick ────────
         for tf_str, tf_seconds in self._tf_list:
