@@ -1,6 +1,5 @@
 # gap_detector.py
 
-import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -263,52 +262,6 @@ class GapDetector:
             })
 
         return pd.DataFrame(rows) if rows else empty
-
-    # ─────────────────────────────────────────────
-    # Local parquet check — read what's already on disk BEFORE any DB
-    # is touched. This is the first tier BackfillManager consults; a
-    # symbol/TF fully covered here means zero main-db/history-db queries
-    # for it at all.
-    # ─────────────────────────────────────────────
-
-    def read_local_parquet(self, base_dir: str, symbol: str, tf_str: str) -> pd.DataFrame:
-        """
-        Read {base_dir}/{symbol}/{tf_str}.parquet if it exists (written by
-        OHLCCollector's own live candle saves, or a previous backfill run).
-        Returns empty DataFrame if missing, unreadable, or empty — never
-        raises, since a bad/partial local file should just fall through to
-        the DB tiers rather than crash the whole backfill.
-        """
-        empty = pd.DataFrame(columns=_CANDLE_COLUMNS)
-        path = os.path.join(base_dir, symbol, f"{tf_str}.parquet")
-
-        if not os.path.exists(path):
-            return empty
-
-        try:
-            df = pd.read_parquet(path)
-        except Exception as exc:
-            print(f"[GAP_DETECTOR][WARN] Failed to read {path}: {exc}", flush=True)
-            return empty
-
-        if df.empty or "timestamp" not in df.columns:
-            return empty
-
-        ts = df["timestamp"]
-        try:
-            if ts.dt.tz is None:
-                df["timestamp"] = ts.dt.tz_localize(tz_kolkata)
-            else:
-                df["timestamp"] = ts.dt.tz_convert(tz_kolkata)
-        except Exception as exc:
-            print(f"[GAP_DETECTOR][WARN] Bad timestamp column in {path}: {exc}", flush=True)
-            return empty
-
-        present = [c for c in _CANDLE_COLUMNS if c in df.columns]
-        if "timestamp" not in present:
-            return empty
-
-        return df[present].dropna(subset=["timestamp"]).reset_index(drop=True)
 
     # ─────────────────────────────────────────────
     # Merge helper

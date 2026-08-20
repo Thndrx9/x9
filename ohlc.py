@@ -91,7 +91,7 @@ class OHLCCollector:
 
     _WRITER_LOCK = False
 
-    def __init__(self, base_dir="ohlcdata", tick_writer=None):
+    def __init__(self, base_dir="ohlcdata", tick_writer=None, history_store=None):
         if OHLCCollector._WRITER_LOCK:
             raise RuntimeError("[OHLC][FATAL] Multiple OHLCCollector instances detected")
         OHLCCollector._WRITER_LOCK = True
@@ -151,6 +151,11 @@ class OHLCCollector:
         # rows through this same writer, so it's read here as
         # `self.tick_writer` (see backfill_manager.py).
         self.tick_writer = tick_writer
+
+        # Local SQLite cache for candles fetched from the history
+        # (fallback) DB — optional; BackfillManager reads/writes this
+        # as `self.history_store` (see tick_writer.py's HistoryCandleStore).
+        self.history_store = history_store
 
         print(
             f"[OHLC] Initialized | TFs: {self._configured_tfs} | base_dir: {base_dir}",

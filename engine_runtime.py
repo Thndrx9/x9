@@ -9,7 +9,7 @@ from utils import load_symbols
 from websocket_connect import run_market_data_feeds
 from ohlc import OHLCCollector, PreviousCandleGuard
 from depth_store import DepthStore
-from tick_writer import TickWriter
+from tick_writer import TickWriter, HistoryCandleStore
 from indicators import IndicatorEngine
 from signal_generator import SignalGenerator
 from executor import TradeExecutor
@@ -158,7 +158,10 @@ async def run_engine(enable_trading: bool):
     # Single local SQLite tick cache, shared by quote ticks (via ohlc)
     # and depth snapshots (via depth_store) — see tick_writer.py.
     tick_writer      = TickWriter(base_dir="tickdata")
-    ohlc             = OHLCCollector(tick_writer=tick_writer)
+    # Local SQLite cache for candles fetched from the history (fallback)
+    # DB — see tick_writer.py's HistoryCandleStore. Same folder as the tick cache.
+    history_store    = HistoryCandleStore(base_dir="tickdata")
+    ohlc             = OHLCCollector(tick_writer=tick_writer, history_store=history_store)
     depth_store      = DepthStore(tick_writer=tick_writer)
     indicators       = IndicatorEngine(ohlc)
     prev_candle_guard = PreviousCandleGuard(ohlc)
