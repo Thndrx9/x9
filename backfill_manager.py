@@ -81,27 +81,41 @@ class BackfillManager:
     "1m"). open/high/low/close/volume are populated directly; ltp/ltt are
     NULL (the history API doesn't return them); there is no interval
     column to distinguish timeframes by, because none was ever written.
-    See _fetch_history_candles_batch()'s docstring for how this
-    constrains tier 2.
+
+    History-db candles are treated as the authoritative 1m source
+    whenever present: at history_native_tf itself they win over
+    tick-aggregated candles on any bucket collision, and every higher
+    TF is derived FIRST from that (history-priority) 1m sequence — see
+    _aggregate_symbol_with_history()'s docstring — rather than from
+    raw-tick aggregation directly at that TF. Ticks only fill in
+    buckets history_native_tf's own data doesn't cover.
 
     Batching (run() overview):
     Per-symbol DB round trips used to dominate wall-clock time for large
     symbol universes — every symbol paid its own network round trip(s)
     to a remote AWS RDS instance, strictly sequentially. run() now does
     this in distinct phases instead of one big per-symbol loop:
-        Phase 0: list which quote_{SYMBOL} tables actually exist (1 query)
-        Phase 1: local-parquet-only pass — pure disk I/O, no DB at all
-        Phase 2: ONE batched (UNION ALL, chunked) tick fetch for every
-                 symbol that still needs data beyond local parquet
-        Phase 3: per-symbol aggregation (pure pandas, no DB) — also
-                 collects each symbol's still-missing buckets at
-                 history_native_tf
-        Phase 4: ONE batched history-db fetch across every symbol's
-                 native-tf gaps at once
-        Phase 5: per-symbol merge of the history fill + derive-from-1m
-                 tier + save to ohlc (pure pandas/RAM, no DB)
-        Phase 6: tick-buffer seeding — reuses Phase 2's fetch where
-                 possible (zero extra queries), batches the rest
+        Phase 0:  list which quote_{SYMBOL} tables actually exist in
+                  the main db AND the history db (1 query each)
+        Phase 1:  local-tick-cache-only pass — pure disk I/O, no DB at
+                  all (checks ticks.db via TickWriter.max_ts for what's
+                  already cached per symbol)
+        Phase 1h: local-history-candle-cache-only pass — same idea,
+                  against history_candles.db via HistoryCandleStore
+        Phase 2:  ONE batched (UNION ALL, chunked) tick fetch for every
+                  symbol that still needs data newer than the local
+                  tick cache
+        Phase 2h: ONE batched history-db candle fetch for every symbol
+                  that still needs data newer than the local history-
+                  candle cache — always run now, not just for gaps —
+                  caches fetched rows into history_candles.db
+        Phase 3:  per-symbol aggregation (pure pandas, no DB) with
+                  history-db candles given priority over tick-
+                  aggregated ones (see _aggregate_symbol_with_history)
+        Phase 4:  per-symbol save to ohlc + missing-bucket reporting
+                  (pure pandas/RAM, no DB)
+        Phase 5:  tick-buffer seeding — reuses Phase 2's fetch where
+                  possible (zero extra queries), batches the rest
     Every "batched" step above fetches every symbol in ONE query by
     default (BACKFILL_BATCH_SIZE=0) — set it to a positive number in
     .env to chunk instead, if a single mega-query ever proves too slow
@@ -114,11 +128,23 @@ class BackfillManager:
         # engine_runtime.py. Optional: None just means "don't cache PG
         # ticks to disk", everything else still works.
         self.tick_writer = getattr(ohlc, "tick_writer", None)
+        # Local SQLite cache for history-db candles — same deal, set by
+        # engine_runtime.py, optional. See tick_writer.py's HistoryCandleStore and this
+        # class's Phase 1h/2h.
+        self.history_store = getattr(ohlc, "history_store", None)
         self.min_candles = int(os.getenv("MIN_CANDLES", "15"))
         self.timeframes  = self._load_timeframes()   # [(tf_str, tf_seconds), ...]
         self.conn        = self._connect()
         self.gaps        = GapDetector()
         self.batch_size  = int(os.getenv("BACKFILL_BATCH_SIZE", "0"))  # 0 = no chunking, all symbols in one query
+
+        # How large a same-session silent gap in cached ticks (ticks.db)
+        # has to be before we stop trusting the cache from that point
+        # onward and re-fetch from the main db instead. max_ts() is only
+        # a high-water mark — it doesn't guarantee everything before it
+        # is actually present (crash mid-write, a failed insert batch,
+        # etc.) — see run()'s Phase 1 and _first_suspicious_gap_ms().
+        self.gap_threshold_secs = int(os.getenv("TICK_CACHE_GAP_THRESHOLD_SECS", "180"))
 
         # History (fallback) DB — only connected lazily, on first gap found
         self.conn_history           = None
@@ -167,7 +193,7 @@ class BackfillManager:
                 # Without this, a slow/large batched query (or a stuck
                 # connection) blocks the backfill thread forever with no
                 # error and no way to notice — exactly the "silently
-                # stops after local-parquet checks" symptom this fixes.
+                # stops after local-tick-cache checks" symptom this fixes.
                 options         = f"-c statement_timeout={timeout_sec * 1000}",
             )
             conn.autocommit = True
@@ -179,9 +205,14 @@ class BackfillManager:
 
     def _get_history_conn(self):
         """
-        Lazily connects to the history DB (PG_HDBNAME) — only opened the
-        first time a gap is actually found, so symbols with clean primary
-        data never pay for a second connection.
+        Lazily connects to the history DB (PG_HDBNAME) — cached after
+        the first call. run() now calls this unconditionally near the
+        top (Phase 0h) since history-db candles are always fetched for
+        every symbol (not just as a last-resort gap filler anymore —
+        see the module docstring and _aggregate_symbol_with_history()),
+        but the lazy-connect-and-cache shape is kept as-is so anything
+        else calling this mid-run still gets the same connection
+        without reconnecting.
         """
         if self.conn_history is not None:
             return self.conn_history
@@ -255,42 +286,125 @@ class BackfillManager:
             flush=True,
         )
 
-        # ── Phase 0: which quote_ tables exist in the main db ───────────
+        # ── Phase 0: which quote_ tables exist in the main db AND history db ──
+        # History db tables are loaded here too (not lazily on first gap
+        # anymore) since history-db candles are now always fetched for
+        # every symbol — see Phase 2h.
         existing_tables = self._load_existing_quote_tables(self.conn)
+        history_conn = self._get_history_conn()
+        history_existing_tables = self._load_existing_quote_tables(history_conn)
 
-        # ── Phase 1: local-parquet-only pass — pure disk I/O, no DB ─────
+        # ── Phase 1: local-SQLite-only pass — pure disk I/O, no main-db query ──
+        # Instead of checking pre-computed OHLC parquet files for
+        # completeness, check the local raw-tick cache (ticks.db, via
+        # TickWriter.max_ts) for what's already cached per symbol, and
+        # only fetch the ticks NEWER than that from the main db in
+        # Phase 2. Whatever's already cached gets combined with the
+        # freshly fetched ticks before aggregation (Phase 3), so
+        # candles are still built over the FULL lookback window — just
+        # without re-downloading ticks Postgres already gave us on a
+        # previous run.
+        #
+        # Before trusting the cached range, verify it: max_ts is only
+        # a high-water mark — it doesn't guarantee everything before it
+        # is actually present (a crash mid-write, a failed insert
+        # batch, etc. can leave a silent hole earlier in the range).
+        # _first_suspicious_gap_ms() checks for same-session silent
+        # gaps larger than gap_threshold_secs (overnight/weekend/
+        # holiday gaps between sessions are expected and never
+        # flagged). If one's found, everything from just after it
+        # onward is purged from ticks.db and re-fetched from the main
+        # db instead of being trusted.
+        start_ms = int(start_ts.timestamp() * 1000)
+        now_ms   = int(now.timestamp() * 1000)
+
         symbol_state = {}
+        gap_flagged = []
         for inst in symbols:
-            symbol = inst["symbol"]
-            local_by_tf     = {}
-            earliest_needed = None
+            symbol  = inst["symbol"]
+            last_ms = self.tick_writer.max_ts(symbol) if self.tick_writer is not None else None
 
-            for tf_str, tf_seconds in self.timeframes:
-                local_df = self.gaps.read_local_parquet(self.ohlc.base_dir, symbol, tf_str)
-                expected = self.gaps.expected_buckets(start_ts, now, tf_seconds)
-                missing  = self.gaps.find_missing(local_df, expected)
-                local_by_tf[tf_str] = (local_df, missing)
+            cached_df       = pd.DataFrame()
+            cached_until_ms = None
 
-                if not local_df.empty:
-                    print(
-                        f"[BACKFILL] {symbol} {tf_str}: {len(local_df)} candle(s) "
-                        f"already on disk (local parquet)",
-                        flush=True,
-                    )
+            if last_ms is not None and last_ms >= start_ms:
+                cached_df = self._cached_ticks_df(symbol, start_ms, last_ms)
+                gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
 
-                if missing and (earliest_needed is None or missing[0] < earliest_needed):
-                    earliest_needed = missing[0]
+                if gap_ms is not None:
+                    gap_flagged.append(symbol)
+                    self.tick_writer.delete_range(symbol, start_ms=gap_ms + 1, kind="quote")
+                    cached_df = cached_df[cached_df["timestamp"] <= gap_ms].reset_index(drop=True)
+                    cached_until_ms = gap_ms if not cached_df.empty else None
+                else:
+                    cached_until_ms = last_ms
+
+            fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
 
             symbol_state[symbol] = {
-                "local_by_tf": local_by_tf,
-                "fetch_start": max(start_ts, earliest_needed) if earliest_needed else None,
+                "cached_df": cached_df,
+                "cached_until_ms": cached_until_ms,
+                "fetch_start": (
+                    datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+                    if fetch_start_ms < now_ms else None
+                ),
             }
+
+        if gap_flagged:
+            preview = ", ".join(gap_flagged[:10])
+            more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
+            print(
+                f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
+                f"(>{self.gap_threshold_secs}s within a session) in their cached "
+                f"ticks — discarded the untrusted tail and will re-fetch it: "
+                f"{preview}{more}",
+                flush=True,
+            )
 
         fully_covered = [s for s, st in symbol_state.items() if st["fetch_start"] is None]
         if fully_covered:
             print(
                 f"[BACKFILL] {len(fully_covered)}/{len(symbols)} symbol(s) fully "
-                f"covered by local parquet — skipping main db fetch for them",
+                f"caught up in the local tick cache — skipping main db fetch "
+                f"for them",
+                flush=True,
+            )
+
+        # ── Phase 1h: local-history-candle-cache-only pass ──────────────
+        # Same idea as Phase 1, but against history_candles.db
+        # (HistoryCandleStore) instead of ticks.db — history-db candles
+        # are idempotent (upserted, not appended) so this doesn't need
+        # the same silent-gap verification tick caching does; a stale
+        # partial range there just gets topped up by the next fetch,
+        # never duplicated.
+        history_state = {}
+        for inst in symbols:
+            symbol   = inst["symbol"]
+            last_hms = self.history_store.max_ts(symbol) if self.history_store is not None else None
+
+            cached_hdf        = pd.DataFrame()
+            cached_h_until_ms = None
+
+            if last_hms is not None and last_hms >= start_ms:
+                cached_hdf        = self._cached_history_df(symbol, start_ms, last_hms)
+                cached_h_until_ms = last_hms
+
+            h_fetch_start_ms = (cached_h_until_ms + 1) if cached_h_until_ms is not None else start_ms
+
+            history_state[symbol] = {
+                "cached_df": cached_hdf,
+                "fetch_start": (
+                    datetime.fromtimestamp(h_fetch_start_ms / 1000, tz=tz_kolkata)
+                    if h_fetch_start_ms < now_ms else None
+                ),
+            }
+
+        history_fully_covered = [s for s, st in history_state.items() if st["fetch_start"] is None]
+        if history_fully_covered:
+            print(
+                f"[BACKFILL] {len(history_fully_covered)}/{len(symbols)} symbol(s) "
+                f"fully caught up in the local history-candle cache — skipping "
+                f"history db fetch for them",
                 flush=True,
             )
 
@@ -301,47 +415,79 @@ class BackfillManager:
         }
         batched_ticks = self._fetch_ticks_batch(fetch_starts, existing_tables)
 
-        # ── Phase 3: per-symbol aggregation (pure pandas) + native-tf gaps ──
-        history_requests = {}   # symbol -> missing buckets at history_native_tf
+        # ── Phase 2h: ONE batched history-db candle fetch ────────────────
+        # Always run now (not just as a last-resort gap filler) — see
+        # _aggregate_symbol_with_history() for how the result gets
+        # priority over tick-aggregated candles.
+        history_fetch_starts = {
+            s: st["fetch_start"] for s, st in history_state.items()
+            if st["fetch_start"] is not None
+        }
+        batched_history = self._fetch_history_candles_batch(
+            history_fetch_starts, history_existing_tables
+        )
 
+        # ── Phase 3: per-symbol aggregation, history-priority (pure pandas) ──
         for inst in symbols:
-            symbol   = inst["symbol"]
-            state    = symbol_state[symbol]
-            ticks_df = batched_ticks.get(symbol, pd.DataFrame())
+            symbol    = inst["symbol"]
+            state     = symbol_state[symbol]
+            fresh_df  = batched_ticks.get(symbol, pd.DataFrame())
+            cached_df = state.get("cached_df", pd.DataFrame())
+
+            if not cached_df.empty and not fresh_df.empty:
+                ticks_df = (
+                    pd.concat([cached_df, fresh_df], ignore_index=True)
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
+            elif not cached_df.empty:
+                ticks_df = cached_df
+            else:
+                ticks_df = fresh_df
+
             state["ticks_df"] = ticks_df
 
-            if fetch_starts.get(symbol) is not None and ticks_df.empty:
-                print(f"[BACKFILL][WARN] {symbol}: no tick data in main db", flush=True)
+            if cached_df.empty and fresh_df.empty and state["fetch_start"] is not None:
+                print(f"[BACKFILL][WARN] {symbol}: no tick data in main db or local cache", flush=True)
             elif not ticks_df.empty:
-                print(f"[BACKFILL] {symbol}: {len(ticks_df)} ticks fetched", flush=True)
+                print(
+                    f"[BACKFILL] {symbol}: {len(ticks_df)} tick(s) total "
+                    f"({len(cached_df)} from local cache + {len(fresh_df)} fetched)",
+                    flush=True,
+                )
 
-            per_tf, native_missing = self._aggregate_symbol(
-                state["local_by_tf"], ticks_df, start_ts, now
-            )
+            hstate     = history_state[symbol]
+            fresh_hdf  = batched_history.get(symbol, pd.DataFrame())
+            cached_hdf = hstate.get("cached_df", pd.DataFrame())
+
+            if not cached_hdf.empty and not fresh_hdf.empty:
+                history_df = (
+                    pd.concat([cached_hdf, fresh_hdf], ignore_index=True)
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
+            elif not cached_hdf.empty:
+                history_df = cached_hdf
+            else:
+                history_df = fresh_hdf
+
+            if not history_df.empty:
+                print(
+                    f"[BACKFILL] {symbol}: {len(history_df)} history-db candle(s) "
+                    f"total ({len(cached_hdf)} from local cache + {len(fresh_hdf)} fetched) "
+                    f"— priority source for candle building",
+                    flush=True,
+                )
+
+            per_tf = self._aggregate_symbol_with_history(ticks_df, history_df, start_ts, now)
             state["per_tf"] = per_tf
 
-            if native_missing:
-                history_requests[symbol] = native_missing
-
-        # ── Phase 4: ONE batched history-db fetch across all symbols' gaps ──
-        filled_from_history = {}
-        if history_requests:
-            history_conn = self._get_history_conn()
-            history_tables = self._load_existing_quote_tables(history_conn)
-            filled_from_history = self._fetch_history_candles_batch(
-                history_requests, history_tables
-            )
-
-        # ── Phase 5: merge history fill + derive-from-1m + save (per symbol) ──
+        # ── Phase 4: per-symbol save to ohlc + missing-bucket reporting ──
         for inst in symbols:
             symbol = inst["symbol"]
-            self._finalize_symbol(
-                symbol,
-                symbol_state[symbol]["per_tf"],
-                filled_from_history.get(symbol),
-            )
+            self._finalize_symbol(symbol, symbol_state[symbol]["per_tf"])
 
-        # ── Phase 6: tick-buffer seeding — reuse Phase 2 fetch, batch the rest ──
+        # ── Phase 5: tick-buffer seeding — reuse Phase 2 fetch, batch the rest ──
         window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
         seed_stats  = {"seeded": 0, "empty": 0, "ticks": 0}
         need_seed_batch = []
@@ -391,104 +537,168 @@ class BackfillManager:
     # Per-symbol aggregation (Phase 3) — pure pandas, no DB
     # ─────────────────────────────────────────────
 
-    def _aggregate_symbol(self, local_by_tf, ticks_df, start_ts, now):
+    def _cached_ticks_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """
-        For every configured TF: aggregate ticks_df into candles, merge
-        with local parquet, compute what's still missing. Deliberately
-        stops there — history-db fill and the derive-from-1m tier are
-        deferred to _finalize_symbol() so the history-db fetch for every
-        symbol's native-tf gaps can be batched across the whole symbol
-        set first (see run()'s Phase 4), instead of one query per symbol.
+        Read symbol's already-cached quote ticks back out of ticks.db
+        (TickWriter) for [start_ms, end_ms], shaped into the same
+        columns _fetch_ticks_batch()'s output uses (timestamp, ltp,
+        qty, ist_ts) so it can be concatenated directly with freshly
+        fetched rows before aggregation.
+        """
+        if self.tick_writer is None:
+            return pd.DataFrame()
 
-        Returns (per_tf, native_missing):
-            per_tf: {tf_str: {"candles", "missing", "expected"}}
-            native_missing: the missing-bucket list for
-                            self.history_native_tf (empty list if that TF
-                            isn't even configured, or if there's nothing
-                            missing there)
+        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="quote")
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty"])
+        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+        return df
+
+    def _cached_history_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """
+        Read symbol's already-cached history-db candles back out of
+        history_candles.db (HistoryCandleStore) for [start_ms, end_ms],
+        shaped into the same columns _fetch_history_candles_batch()'s
+        output uses (timestamp as tz-aware Kolkata, open/high/low/close/
+        volume) so it can be concatenated directly with freshly fetched
+        rows.
+        """
+        if self.history_store is None:
+            return pd.DataFrame()
+
+        rows = self.history_store.read_candles(symbol, start_ms=start_ms, end_ms=end_ms)
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+        return df
+
+    def _first_suspicious_gap_ms(self, df: pd.DataFrame, threshold_secs: int):
+        """
+        Verifies a cached tick range instead of blindly trusting
+        max_ts() as proof of completeness. Scans df (must have an
+        'ist_ts' column; sorted internally) for the first pair of
+        consecutive ticks that are:
+          - on the same calendar day, AND
+          - both within market hours (MARKET_OPEN..MARKET_CLOSE), AND
+          - more than threshold_secs apart.
+        Overnight/weekend/holiday gaps between sessions never match
+        (different day, or outside market hours) — only a genuinely
+        silent stretch *inside* a live session counts as suspicious.
+
+        Returns the ts_ms of the tick immediately before that gap (the
+        last point still safe to trust), or None if no such gap exists
+        (including when df has fewer than 2 rows).
+        """
+        if df is None or len(df) < 2:
+            return None
+
+        d = df.sort_values("timestamp").reset_index(drop=True)
+        prev_ist = d["ist_ts"].iloc[:-1].reset_index(drop=True)
+        next_ist = d["ist_ts"].iloc[1:].reset_index(drop=True)
+        prev_ms  = d["timestamp"].iloc[:-1].reset_index(drop=True)
+
+        gap_secs = (next_ist - prev_ist).dt.total_seconds()
+        same_day = prev_ist.dt.date == next_ist.dt.date
+        prev_in_hours = (prev_ist.dt.time >= MARKET_OPEN) & (prev_ist.dt.time <= MARKET_CLOSE)
+        next_in_hours = (next_ist.dt.time >= MARKET_OPEN) & (next_ist.dt.time <= MARKET_CLOSE)
+
+        suspicious = same_day & prev_in_hours & next_in_hours & (gap_secs > threshold_secs)
+        hits = prev_ms[suspicious]
+
+        return int(hits.iloc[0]) if not hits.empty else None
+
+    def _aggregate_symbol_with_history(self, ticks_df, history_df, start_ts, now):
+        """
+        For every configured TF: build candles giving priority to
+        history-db data (history_df — already this symbol's full
+        lookback-window's worth of history-db candles, local-cache rows
+        plus freshly fetched ones, stitched together by run()'s Phase 3)
+        over tick-aggregated ones:
+
+          - self.history_native_tf itself (default "1m"): a history-db
+            candle wins on any bucket collision; tick-aggregated candles
+            at that TF only fill buckets history_df doesn't cover.
+          - every OTHER (higher) TF: ALWAYS derived first by rolling up
+            the merged 1m base above via gaps.derive_from_1m(), across
+            every expected bucket for that TF — not just ones missing —
+            so a history-backed 1m sequence produces the higher-TF
+            candle even where raw-tick aggregation at that TF would
+            also have produced one. Only a bucket whose full run of 1m
+            sub-candles isn't available in the merged base falls back
+            to tick-aggregated-at-that-TF instead.
+
+        No DB calls in here — history_df/ticks_df were already fetched
+        in Phase 2/2h.
+
+        Returns per_tf: {tf_str: {"candles", "missing", "expected"}}
+        """
+        native_tf_seconds = dict(self.timeframes).get(self.history_native_tf)
+
+        # merged_1m: the history-priority 1m base every higher TF derives
+        # from. history_df wins on collision; tick-aggregated 1m fills in
+        # what history_df doesn't have. If history_native_tf isn't itself
+        # a configured display TF, history_df alone still serves as the
+        # roll-up base (nothing to merge it against).
+        merged_1m = None
+        if native_tf_seconds is not None:
+            tick_native = self._aggregate(ticks_df, native_tf_seconds, now)
+            merged_1m = (
+                self.gaps.merge_candles(history_df, tick_native)
+                if history_df is not None and not history_df.empty
+                else tick_native
+            )
+        elif history_df is not None and not history_df.empty:
+            merged_1m = history_df
+
         per_tf = {}
-        native_missing = []
-
         for tf_str, tf_seconds in self.timeframes:
-            local_df, _ = local_by_tf[tf_str]
-
-            fresh   = self._aggregate(ticks_df, tf_seconds, now)
-            candles = self.gaps.merge_candles(local_df, fresh)
-
             expected = self.gaps.expected_buckets(start_ts, now, tf_seconds)
-            missing  = self.gaps.find_missing(candles, expected)
-
-            per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
 
             if tf_str == self.history_native_tf:
-                native_missing = missing
-
-        return per_tf, native_missing
-
-    # ─────────────────────────────────────────────
-    # Per-symbol finalization (Phase 5) — merge history fill,
-    # derive-from-1m, save to ohlc. No DB calls in here at all — the
-    # history-db data was already fetched in one batch (Phase 4).
-    # ─────────────────────────────────────────────
-
-    def _finalize_symbol(self, symbol, per_tf, history_filled_df):
-        base_1m_candles = None
-
-        for tf_str, tf_seconds in self.timeframes:
-            state    = per_tf[tf_str]
-            candles  = state["candles"]
-            missing  = state["missing"]
-            expected = state["expected"]
-
-            # ── Step 1: history db direct match (native TF only) ───────
-            # history_filled_df, when present, is already this symbol's
-            # own rows only (each UNION ALL clause in
-            # _fetch_history_candles_batch carries its own symbol +
-            # WHERE timestamp = ANY(its own missing list)) — no further
-            # filtering needed here.
-            if (
-                missing
-                and tf_str == self.history_native_tf
-                and history_filled_df is not None
-                and not history_filled_df.empty
-            ):
-                candles = self.gaps.merge_candles(candles, history_filled_df)
-                print(
-                    f"[BACKFILL] {symbol} {tf_str}: "
-                    f"{len(history_filled_df)}/{len(missing)} gap candle(s) "
-                    f"filled from history db (direct match)",
-                    flush=True,
-                )
-                missing = self.gaps.find_missing(candles, expected)
-
-            # ── Step 2: derive from finalized 1m candles ────────────────
-            # Only applies to TFs above 1m, and only once 1m itself has
-            # been finalized (timeframes are processed smallest-first).
-            if missing and tf_seconds > 60 and base_1m_candles is not None:
-                derived = self.gaps.derive_from_1m(base_1m_candles, missing, tf_seconds)
+                candles = merged_1m if merged_1m is not None else self._aggregate(ticks_df, tf_seconds, now)
+            elif tf_seconds > 60 and merged_1m is not None and not merged_1m.empty:
+                derived     = self.gaps.derive_from_1m(merged_1m, expected, tf_seconds)
+                tick_direct = self._aggregate(ticks_df, tf_seconds, now)
+                candles     = self.gaps.merge_candles(derived, tick_direct)
                 if not derived.empty:
-                    candles = self.gaps.merge_candles(candles, derived)
                     print(
-                        f"[BACKFILL] {symbol} {tf_str}: "
-                        f"{len(derived)}/{len(missing)} gap candle(s) "
-                        f"derived from 1m data",
+                        f"[BACKFILL] {tf_str}: {len(derived)}/{len(expected)} "
+                        f"candle(s) built from history-db 1m data (priority "
+                        f"source)",
                         flush=True,
                     )
-                    missing = self.gaps.find_missing(candles, expected)
+            else:
+                candles = self._aggregate(ticks_df, tf_seconds, now)
+
+            missing = self.gaps.find_missing(candles, expected)
+            per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
+
+        return per_tf
+
+    # ─────────────────────────────────────────────
+    # Per-symbol finalization (Phase 4) — save to ohlc + report
+    # whatever's still missing after the history-priority merge in
+    # _aggregate_symbol_with_history(). No DB calls in here at all.
+    # ─────────────────────────────────────────────
+
+    def _finalize_symbol(self, symbol, per_tf):
+        for tf_str, tf_seconds in self.timeframes:
+            state   = per_tf[tf_str]
+            candles = state["candles"]
+            missing = state["missing"]
 
             if missing:
                 self.missing_counts[(symbol, tf_str)] = len(missing)
                 print(
                     f"[BACKFILL][WARN] {symbol} {tf_str}: "
                     f"{len(missing)} candle(s) still missing "
-                    f"(not in local parquet, main db, history db, or derivable from 1m)",
+                    f"(not in local tick cache, local history cache, main db, "
+                    f"or history db)",
                     flush=True,
-                )
-
-            if tf_seconds == 60:
-                base_1m_candles = candles.copy() if not candles.empty else pd.DataFrame(
-                    columns=["timestamp", "open", "high", "low", "close", "volume"]
                 )
 
             if candles.empty:
@@ -549,8 +759,8 @@ class BackfillManager:
     def _seed_recent_ticks_batch(self, symbols: list, existing_tables: set) -> dict:
         """
         Batched fallback path for symbols where no reusable ticks_df was
-        available from Phase 2 (i.e. local parquet already covered every
-        candle gap, so nothing was fetched for them). Each symbol still
+        available from Phase 2 (i.e. the local tick cache already covered
+        the full window, so nothing needed fetching for them). Each symbol still
         gets its own self-anchored subquery (own MAX(timestamp) - window,
         computed server-side), combined into chunked UNION ALL queries —
         replacing what used to be one query per symbol.
@@ -697,7 +907,7 @@ class BackfillManager:
         """
         fetch_starts: {symbol: start_ts} — symbols needing a main-db tick
         fetch, each with its own start time (already narrowed to just
-        what's missing beyond local parquet, in run()'s Phase 1).
+        what's missing beyond the local tick cache, in run()'s Phase 1).
 
         Returns {symbol: DataFrame} — same columns/session-filtering as
         the old per-symbol _fetch_ticks() used to return — but issued as
@@ -875,10 +1085,12 @@ class BackfillManager:
         return grouped.reset_index(drop=True)
 
     # ─────────────────────────────────────────────
-    # Fetch missing candles from the history DB (fallback) — BATCHED
+    # Fetch history-db candles for every symbol newer than what's
+    # already locally cached — BATCHED. Always run now (priority
+    # source), not just as a last-resort gap filler.
     # ─────────────────────────────────────────────
 
-    def _fetch_history_candles_batch(self, requests: dict, existing_tables: set) -> dict:
+    def _fetch_history_candles_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
         """
         market_history DB — confirmed against x9_data_fetcher's own
         BackfillManager/pg_writer.py: rows here are pre-built candles
@@ -889,22 +1101,24 @@ class BackfillManager:
         NO interval column at all (pg_writer's typed schema has none —
         there was never anything to tag "1m" vs "5m" with).
 
-        requests: {symbol: [missing_bucket_timestamps]} — already only
-        ever populated for tf_str == self.history_native_tf (see run()'s
-        Phase 3 / _aggregate_symbol) — coarser TFs are covered instead
-        by _finalize_symbol's separate "derive from finalized 1m" tier.
+        fetch_starts: {symbol: datetime} — mirrors _fetch_ticks_batch's
+        shape exactly: fetch everything from that point to now, instead
+        of a specific list of missing buckets, since history-db candles
+        are now always pulled in full (Phase 1h/2h) rather than only
+        for gaps tick-aggregation left behind.
 
-        Returns {symbol: DataFrame}, each already containing ONLY that
-        symbol's own requested rows (each UNION ALL clause carries its
-        own WHERE timestamp = ANY(its own missing list)) — no further
-        per-symbol filtering needed by the caller.
+        Returns {symbol: DataFrame[timestamp, open, high, low, close,
+        volume]}, timestamp as tz-aware Kolkata, ascending. Also caches
+        every fetched row into self.history_store (if configured) as a
+        side effect — same pattern _fetch_ticks_batch uses for
+        self.tick_writer.
         """
         out = {}
         conn = self._get_history_conn()
-        if conn is None or not requests:
+        if conn is None or not fetch_starts:
             return out
 
-        items = list(requests.items())
+        items = list(fetch_starts.items())
         skipped_no_table = []
 
         chunk_size = self.batch_size if self.batch_size > 0 else max(len(items), 1)
@@ -913,21 +1127,19 @@ class BackfillManager:
 
             clauses = []
             params  = []
-            for symbol, missing_buckets in chunk:
-                if not missing_buckets:
-                    continue
+            for symbol, start_ts in chunk:
                 safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
                 table = f"quote_{safe_sym}".lower()
                 if table not in existing_tables:
                     skipped_no_table.append(symbol)
                     continue
-                ms_list = [int(b.timestamp() * 1000) for b in missing_buckets]
+                start_ms = int(start_ts.timestamp() * 1000)
                 clauses.append(
                     f"SELECT %s AS symbol, timestamp, open, high, low, close, "
                     f"COALESCE(volume, 0) AS volume FROM {table} "
-                    f"WHERE timestamp = ANY(%s) AND open IS NOT NULL"
+                    f"WHERE timestamp >= %s AND open IS NOT NULL"
                 )
-                params.extend([symbol, ms_list])
+                params.extend([symbol, start_ms])
 
             if not clauses:
                 continue
@@ -959,16 +1171,39 @@ class BackfillManager:
                     pass
                 continue
 
+            print(
+                f"[BACKFILL] History chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received",
+                flush=True,
+            )
+
             if not rows:
                 continue
 
             df = pd.DataFrame(
                 rows, columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
             )
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
 
             for symbol, group in df.groupby("symbol"):
-                out[symbol] = group.drop(columns=["symbol"]).reset_index(drop=True)
+                g = group.drop(columns=["symbol"]).sort_values("timestamp").reset_index(drop=True)
+
+                # Cache these PG-fetched candles to the local history
+                # store BEFORE converting timestamp to a tz-aware
+                # Kolkata Timestamp — HistoryCandleStore wants raw ms
+                # ints, same convention as TickWriter.
+                if self.history_store is not None:
+                    cache_rows = [
+                        {
+                            "timestamp": int(row.timestamp),
+                            "open": row.open, "high": row.high,
+                            "low": row.low, "close": row.close,
+                            "volume": row.volume,
+                        }
+                        for row in g.itertuples(index=False)
+                    ]
+                    self.history_store.save_candles(symbol, cache_rows)
+
+                g["timestamp"] = pd.to_datetime(g["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+                out[symbol] = g
 
         if skipped_no_table:
             preview = ", ".join(skipped_no_table[:10])
@@ -979,6 +1214,11 @@ class BackfillManager:
                 flush=True,
             )
 
+        print(
+            f"[BACKFILL] Batched history-db fetch: {len(out)}/{len(fetch_starts)} "
+            f"symbol(s) returned data",
+            flush=True,
+        )
         return out
 
     # ─────────────────────────────────────────────
