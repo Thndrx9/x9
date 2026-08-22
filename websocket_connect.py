@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 import websockets
 
@@ -18,6 +18,7 @@ async def websocket_client(
     mode: str,
     depth_levels: int = 5,
     conn_log_dir: Optional[str] = None,
+    on_reconnect: Optional[Callable[[str, "datetime", "datetime"], Awaitable]] = None,
 ):
     """
     WebSocket connection only:
@@ -26,8 +27,16 @@ async def websocket_client(
     - forward incoming market_data packets to event_bus queue
 
     conn_log_dir: if set, DAY_STARTED / RECONNECTED / DISCONNECTED events are
-    written to the connection log for this connection. Pass this only for
-    the "Quote" mode connection — that's the one BackfillManager cares about.
+    written to the connection log for this connection, tagged with this
+    connection's own mode ("Quote" or "Depth") — both feeds pass this now,
+    so BackfillManager can derive gap windows for either independently.
+
+    on_reconnect: optional async callback, called (fire-and-forget, not
+    awaited here — so a slow heal never blocks the live feed) as
+    on_reconnect(mode_label, disconnect_dt, reconnect_dt) whenever this
+    connection comes back up after a REAL mid-session drop (never on the
+    day's first connect — there's nothing to heal then, since nothing
+    was ever missed).
     """
     if not ws_url:
         ws_url = DEFAULT_WS_URL
@@ -38,6 +47,9 @@ async def websocket_client(
     mode_label = str(mode).strip().title()
     print(f"[WS] Connecting to {ws_url} | mode={mode_label}", flush=True)
 
+    last_disconnect_at = None  # set when DISCONNECTED fires below; used to
+                                # compute the exact healed window on reconnect
+
     while True:
         try:
             async with websockets.connect(ws_url) as ws:
@@ -46,12 +58,18 @@ async def websocket_client(
 
                 if conn_log_dir:
                     now = now_kolkata()
-                    event = (
-                        "RECONNECTED"
-                        if connection_log.has_event_today(conn_log_dir, "DAY_STARTED", now)
-                        else "DAY_STARTED"
+                    is_reconnect = connection_log.has_event_today(
+                        conn_log_dir, "DAY_STARTED", now, mode=mode_label
                     )
+                    event = "RECONNECTED" if is_reconnect else "DAY_STARTED"
                     connection_log.log_event(conn_log_dir, event, now, mode=mode_label)
+
+                    if is_reconnect and on_reconnect is not None and last_disconnect_at is not None:
+                        # Fire-and-forget — the heal runs in the background
+                        # via asyncio.to_thread (see engine_runtime.py), the
+                        # live feed keeps flowing without waiting on it.
+                        asyncio.create_task(on_reconnect(mode_label, last_disconnect_at, now))
+                    last_disconnect_at = None
 
                 for inst in instruments:
                     payload = {
@@ -134,8 +152,9 @@ async def websocket_client(
             raise
         except Exception as exc:
             if conn_log_dir:
+                last_disconnect_at = now_kolkata()
                 connection_log.log_event(
-                    conn_log_dir, "DISCONNECTED", now_kolkata(),
+                    conn_log_dir, "DISCONNECTED", last_disconnect_at,
                     mode=mode_label, note=str(exc),
                 )
             print(f"[WS][ERROR] mode={mode_label} {exc}. Reconnecting in 2s...", flush=True)
@@ -148,14 +167,23 @@ async def run_market_data_feeds(
     ws_url: str | None = None,
     conn_log_dir: Optional[str] = None,
     depth_levels: int = 5,
+    on_reconnect: Optional[Callable[[str, "datetime", "datetime"], Awaitable]] = None,
 ):
     """
     Single entry point that owns BOTH the Quote and Depth connections.
 
-    - Quote connection: feeds market_data_queue, and is the only one
-      that writes to conn_log_dir (that log is what backfill/gap
-      detection cares about for pinpointing feed-outage windows).
-    - Depth connection: feeds depth_data_queue, no connection log.
+    - Quote connection: feeds market_data_queue, logs to conn_log_dir
+      with mode="Quote".
+    - Depth connection: feeds depth_data_queue, logs to conn_log_dir
+      with mode="Depth" — same connection_log.db, distinguished by the
+      `mode` column, so BackfillManager can derive gap windows for
+      either feed independently (they can drop/reconnect at different
+      times, unrelated to each other).
+
+    on_reconnect: passed through to both connections unchanged — see
+    websocket_client's docstring. Each connection calls it with its
+    own mode_label, so a Quote reconnect only ever triggers a Quote
+    heal and a Depth reconnect only ever triggers a Depth heal.
 
     Both connections retry independently forever (each has its own
     try/except + reconnect loop), so a Depth-side drop never affects
@@ -167,10 +195,13 @@ async def run_market_data_feeds(
             ws_url, api_key, instruments,
             mode="Quote",
             conn_log_dir=conn_log_dir,
+            on_reconnect=on_reconnect,
         ),
         websocket_client(
             ws_url, api_key, instruments,
             mode="Depth",
             depth_levels=depth_levels,
+            conn_log_dir=conn_log_dir,
+            on_reconnect=on_reconnect,
         ),
     )

@@ -15,10 +15,15 @@ class DepthStore:
 
     • Consumes depth_data_queue directly (websocket_connect.py routes
       Depth-mode ticks here, never through OHLCCollector/market_data_queue)
-    • Keeps a rolling RAM_WINDOW_MINUTES (default 30) window of history
-      per symbol — not just the single latest snapshot — pruned on
-      every update. Disk (via TickWriter, kind='depth') always keeps
-      the full history; this only bounds what stays resident in memory.
+    • Keeps a rolling DEPTH_RAM_WINDOW_MINUTES (default 30) window of
+      history per symbol — not just the single latest snapshot —
+      pruned on every update. Disk (via TickWriter, kind='depth')
+      always keeps the full history; this only bounds what stays
+      resident in memory. Deliberately its OWN env var, separate from
+      ohlc.py's RAM_WINDOW_MINUTES (candle retention) — they used to
+      share one setting, which meant tuning candle RAM retention would
+      silently also change how much depth history stays in memory,
+      and vice versa. Independent knobs now.
     • Forwards every update to TickWriter (SQLite-backed, shared with
       quote ticks) for persistence
 
@@ -35,7 +40,7 @@ class DepthStore:
         self.depth_history  = {}
         self.tick_writer     = tick_writer
         self._warned_shape   = False
-        self.ram_window_secs = int(os.getenv("RAM_WINDOW_MINUTES", "30")) * 60
+        self.ram_window_secs = int(os.getenv("DEPTH_RAM_WINDOW_MINUTES", "30")) * 60
 
     async def run(self):
         print("[DEPTH] Collector running", flush=True)
