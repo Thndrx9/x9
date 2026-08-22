@@ -3,13 +3,14 @@
 import os
 import re
 import math
+import json
 import psycopg2
 import pandas as pd
 from collections import deque
 from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
-from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata
+from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata, is_market_open
 from gap_detector import (
     GapDetector,
     compute_bucket,
@@ -132,6 +133,17 @@ class BackfillManager:
         # engine_runtime.py, optional. See tick_writer.py's HistoryCandleStore and this
         # class's Phase 1h/2h.
         self.history_store = getattr(ohlc, "history_store", None)
+        # Optional — see engine_runtime.py's wiring. Used only to seed
+        # DepthStore's RAM window right after depth backfill completes
+        # (see _run_depth_backfill's final step); None just means that
+        # seed step is skipped, DepthStore still fills in normally from
+        # live ticks, just starting empty instead of pre-warmed.
+        self.depth_store = getattr(ohlc, "depth_store", None)
+        # Directory for connection_log.db — set by engine_runtime.py via
+        # OHLCCollector. Optional: None just means gaps can't be
+        # cross-checked against confirmed disconnect windows, they're
+        # still detected/repaired via the tick-scan heuristic alone.
+        self.conn_log_dir = getattr(ohlc, "conn_log_dir", None)
         self.min_candles = int(os.getenv("MIN_CANDLES", "15"))
         self.timeframes  = self._load_timeframes()   # [(tf_str, tf_seconds), ...]
         self.conn        = self._connect()
@@ -203,6 +215,42 @@ class BackfillManager:
             print(f"[BACKFILL][ERROR] PostgreSQL connection failed: {exc}", flush=True)
             return None
 
+    def _is_connection_dead(self, exc: Exception) -> bool:
+        """
+        True if `exc` looks like the connection itself is gone (server
+        closed it, network drop, etc.) rather than a query-level
+        problem (bad SQL, statement_timeout, etc.) — the former is
+        worth reconnecting and retrying once; the latter isn't (retrying
+        a broken query on a fresh connection would just fail the same
+        way).
+        """
+        if isinstance(exc, (psycopg2.InterfaceError, psycopg2.OperationalError)):
+            return True
+        # psycopg2 sometimes surfaces a dead connection as a generic
+        # Error subclass depending on driver/OS — fall back to matching
+        # the message text for the common phrasings.
+        msg = str(exc).lower()
+        return any(s in msg for s in (
+            "server closed the connection",
+            "connection already closed",
+            "could not connect",
+            "terminating connection",
+            "connection reset",
+            "broken pipe",
+        ))
+
+    def _ensure_connected(self):
+        """
+        Reconnects self.conn if it's closed or unresponsive. Cheap to
+        call before any batch of queries — a no-op when the connection
+        is already fine (checks .closed first, avoiding a round trip in
+        the common case).
+        """
+        if self.conn is not None and not self.conn.closed:
+            return
+        print("[BACKFILL] Main-db connection is closed — reconnecting...", flush=True)
+        self.conn = self._connect()
+
     def _get_history_conn(self):
         """
         Lazily connects to the history DB (PG_HDBNAME) — cached after
@@ -215,7 +263,11 @@ class BackfillManager:
         without reconnecting.
         """
         if self.conn_history is not None:
-            return self.conn_history
+            if not self.conn_history.closed:
+                return self.conn_history
+            print("[BACKFILL] History-db connection is closed — reconnecting...", flush=True)
+            self.conn_history = None
+            self._history_connect_tried = False
         if self._history_connect_tried:
             return None
 
@@ -240,13 +292,24 @@ class BackfillManager:
             print(f"[BACKFILL][WARN] History DB connection failed: {exc}", flush=True)
             return None
 
-    def _load_existing_quote_tables(self, conn) -> set:
+    def _progress(self, label: str, current: int, total: int):
         """
-        One query: which quote_% tables actually exist in this db.
-        Needed BEFORE building any UNION ALL batch — Postgres fails the
-        entire batched query if even one clause references a table that
-        doesn't exist, so symbols without a table yet get filtered out
-        up front instead of blowing up the whole chunk.
+        Single in-place-updating progress line (like a progress bar) —
+        overwrites itself via carriage return instead of printing one
+        line per symbol. Prints a trailing newline once current==total
+        so the next phase's output starts on a fresh line.
+        """
+        end = "\n" if current >= total else ""
+        print(f"\r[BACKFILL] {label}: {current}/{total} symbols", end=end, flush=True)
+
+    def _load_existing_tables(self, conn, prefix: str = "quote") -> set:
+        """
+        One query: which <prefix>_% tables actually exist in this db
+        (prefix is "quote" or "depth"). Needed BEFORE building any
+        UNION ALL batch — Postgres fails the entire batched query if
+        even one clause references a table that doesn't exist, so
+        symbols without a table yet get filtered out up front instead
+        of blowing up the whole chunk.
         """
         if conn is None:
             return set()
@@ -254,18 +317,23 @@ class BackfillManager:
             cur = conn.cursor()
             cur.execute(
                 "SELECT tablename FROM pg_tables "
-                "WHERE schemaname='public' AND tablename LIKE 'quote_%'"
+                "WHERE schemaname='public' AND tablename LIKE %s",
+                (f"{prefix}_%",),
             )
             tables = {row[0] for row in cur.fetchall()}
             cur.close()
             return tables
         except Exception as exc:
-            print(f"[BACKFILL][ERROR] failed to list quote_ tables: {exc}", flush=True)
+            print(f"[BACKFILL][ERROR] failed to list {prefix}_ tables: {exc}", flush=True)
             try:
                 conn.rollback()
             except Exception:
                 pass
             return set()
+
+    def _load_existing_quote_tables(self, conn) -> set:
+        """Back-compat alias — see _load_existing_tables()."""
+        return self._load_existing_tables(conn, prefix="quote")
 
     # ─────────────────────────────────────────────
     # Entry point
@@ -280,8 +348,15 @@ class BackfillManager:
         start_ts = self._compute_lookback_start()
         now      = datetime.now(tz_kolkata)
 
+        if is_market_open(now):
+            mode = "market open"
+        elif is_trading_day(now.date()) and now.time() < MARKET_OPEN:
+            mode = "pre-market"
+        else:
+            mode = "market closed"
+
         print(
-            f"[BACKFILL] Starting | symbols={len(symbols)} "
+            f"[BACKFILL] Mode: {mode} | symbols={len(symbols)} "
             f"| TFs={tf_names} | from={start_ts.strftime('%Y-%m-%d %H:%M %Z')}",
             flush=True,
         )
@@ -313,19 +388,34 @@ class BackfillManager:
         # gaps larger than gap_threshold_secs (overnight/weekend/
         # holiday gaps between sessions are expected and never
         # flagged). If one's found, everything from just after it
-        # onward is purged from ticks.db and re-fetched from the main
-        # db instead of being trusted.
+        # onward is treated as untrusted and re-fetched from the main
+        # db — NOT deleted first. The re-fetch corrects any wrong rows
+        # in place via upsert (see tick_writer.py's unique-index/
+        # upsert change), and a separate phantom-row check afterward
+        # (once we know exactly what the main db returned for this
+        # range) removes only rows PROVABLY absent from the main db —
+        # see _phantom_row_check() below, called from Phase 4.
         start_ms = int(start_ts.timestamp() * 1000)
         now_ms   = int(now.timestamp() * 1000)
 
+        quote_outage_windows = []
+        if self.conn_log_dir:
+            try:
+                from gap_detector import connection_outage_windows
+                quote_outage_windows = connection_outage_windows(self.conn_log_dir, now.date(), "Quote")
+            except Exception as exc:
+                print(f"[BACKFILL][WARN] could not read connection log: {exc}", flush=True)
+
         symbol_state = {}
         gap_flagged = []
-        for inst in symbols:
+        confirmed_outage_count = 0
+        for i, inst in enumerate(symbols, start=1):
             symbol  = inst["symbol"]
             last_ms = self.tick_writer.max_ts(symbol) if self.tick_writer is not None else None
 
             cached_df       = pd.DataFrame()
             cached_until_ms = None
+            phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
 
             if last_ms is not None and last_ms >= start_ms:
                 cached_df = self._cached_ticks_df(symbol, start_ms, last_ms)
@@ -333,7 +423,22 @@ class BackfillManager:
 
                 if gap_ms is not None:
                     gap_flagged.append(symbol)
-                    self.tick_writer.delete_range(symbol, start_ms=gap_ms + 1, kind="quote")
+                    tail_df = cached_df[cached_df["timestamp"] > gap_ms]
+                    phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
+                    phantom_range = (gap_ms + 1, last_ms)
+
+                    if quote_outage_windows:
+                        from gap_detector import gap_matches_outage
+                        gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
+                        gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                        if gap_matches_outage(gap_start_dt, gap_end_dt, quote_outage_windows):
+                            confirmed_outage_count += 1
+
+                    # Trusted portion stays; the tail (after the gap)
+                    # is dropped from what we treat as cached here so
+                    # it gets re-fetched below — the row itself is
+                    # NOT deleted from SQLite, upsert corrects it once
+                    # the re-fetch lands.
                     cached_df = cached_df[cached_df["timestamp"] <= gap_ms].reset_index(drop=True)
                     cached_until_ms = gap_ms if not cached_df.empty else None
                 else:
@@ -344,19 +449,27 @@ class BackfillManager:
             symbol_state[symbol] = {
                 "cached_df": cached_df,
                 "cached_until_ms": cached_until_ms,
+                "phantom_range": phantom_range,
+                "phantom_local_ts": phantom_local_ts if phantom_range else None,
                 "fetch_start": (
                     datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
                     if fetch_start_ms < now_ms else None
                 ),
             }
 
+            self._progress("Checking local tick cache", i, len(symbols))
+
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
             more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
+            confirmed_note = (
+                f" ({confirmed_outage_count} confirmed against connection log)"
+                if quote_outage_windows else " (connection log not available to verify)"
+            )
             print(
                 f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
                 f"(>{self.gap_threshold_secs}s within a session) in their cached "
-                f"ticks — discarded the untrusted tail and will re-fetch it: "
+                f"ticks{confirmed_note} — will re-fetch and correct: "
                 f"{preview}{more}",
                 flush=True,
             )
@@ -378,7 +491,7 @@ class BackfillManager:
         # partial range there just gets topped up by the next fetch,
         # never duplicated.
         history_state = {}
-        for inst in symbols:
+        for i, inst in enumerate(symbols, start=1):
             symbol   = inst["symbol"]
             last_hms = self.history_store.max_ts(symbol) if self.history_store is not None else None
 
@@ -398,6 +511,8 @@ class BackfillManager:
                     if h_fetch_start_ms < now_ms else None
                 ),
             }
+
+            self._progress("Checking local history-candle cache", i, len(symbols))
 
         history_fully_covered = [s for s, st in history_state.items() if st["fetch_start"] is None]
         if history_fully_covered:
@@ -428,7 +543,16 @@ class BackfillManager:
         )
 
         # ── Phase 3: per-symbol aggregation, history-priority (pure pandas) ──
-        for inst in symbols:
+        # Aggregate totals only — no per-symbol lines. A single progress
+        # line updates in place; per-symbol tick/candle counts are summed
+        # into totals and reported once, after every symbol is done.
+        total_ticks = total_ticks_cached = total_ticks_fetched = 0
+        total_hist  = total_hist_cached  = total_hist_fetched  = 0
+        no_data_symbols = []
+        total_phantom_rows = 0
+        phantom_symbols = set()
+
+        for i, inst in enumerate(symbols, start=1):
             symbol    = inst["symbol"]
             state     = symbol_state[symbol]
             fresh_df  = batched_ticks.get(symbol, pd.DataFrame())
@@ -447,14 +571,32 @@ class BackfillManager:
 
             state["ticks_df"] = ticks_df
 
+            phantom_range    = state.get("phantom_range")
+            phantom_local_ts = state.get("phantom_local_ts")
+            if phantom_range and phantom_local_ts:
+                if not fresh_df.empty:
+                    in_range = fresh_df[
+                        (fresh_df["timestamp"] >= phantom_range[0])
+                        & (fresh_df["timestamp"] <= phantom_range[1])
+                    ]
+                    pg_confirmed_ts = set(int(t) for t in in_range["timestamp"])
+                else:
+                    pg_confirmed_ts = set()
+
+                phantom_ts = phantom_local_ts - pg_confirmed_ts
+                if phantom_ts:
+                    total_phantom_rows += len(phantom_ts)
+                    phantom_symbols.add(symbol)
+                    # wait=False — fire-and-forget, same reasoning as
+                    # the other tick_writer calls in this loop.
+                    self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
+
             if cached_df.empty and fresh_df.empty and state["fetch_start"] is not None:
-                print(f"[BACKFILL][WARN] {symbol}: no tick data in main db or local cache", flush=True)
+                no_data_symbols.append(symbol)
             elif not ticks_df.empty:
-                print(
-                    f"[BACKFILL] {symbol}: {len(ticks_df)} tick(s) total "
-                    f"({len(cached_df)} from local cache + {len(fresh_df)} fetched)",
-                    flush=True,
-                )
+                total_ticks         += len(ticks_df)
+                total_ticks_cached  += len(cached_df)
+                total_ticks_fetched += len(fresh_df)
 
             hstate     = history_state[symbol]
             fresh_hdf  = batched_history.get(symbol, pd.DataFrame())
@@ -472,20 +614,65 @@ class BackfillManager:
                 history_df = fresh_hdf
 
             if not history_df.empty:
-                print(
-                    f"[BACKFILL] {symbol}: {len(history_df)} history-db candle(s) "
-                    f"total ({len(cached_hdf)} from local cache + {len(fresh_hdf)} fetched) "
-                    f"— priority source for candle building",
-                    flush=True,
-                )
+                total_hist         += len(history_df)
+                total_hist_cached  += len(cached_hdf)
+                total_hist_fetched += len(fresh_hdf)
 
             per_tf = self._aggregate_symbol_with_history(ticks_df, history_df, start_ts, now)
             state["per_tf"] = per_tf
 
+            self._progress("Building candles", i, len(symbols))
+
+        if total_ticks:
+            print(
+                f"[BACKFILL] Tick data complete | {total_ticks} tick(s) total "
+                f"({total_ticks_cached} from local cache + {total_ticks_fetched} fetched)",
+                flush=True,
+            )
+        if total_hist:
+            print(
+                f"[BACKFILL] History-db candle data complete | {total_hist} candle(s) total "
+                f"({total_hist_cached} from local cache + {total_hist_fetched} fetched)",
+                flush=True,
+            )
+        if no_data_symbols:
+            preview = ", ".join(no_data_symbols[:10])
+            more = f" (+{len(no_data_symbols) - 10} more)" if len(no_data_symbols) - 10 > 0 else ""
+            print(
+                f"[BACKFILL][WARN] {len(no_data_symbols)}/{len(symbols)} symbol(s) had no "
+                f"tick data in main db or local cache: {preview}{more}",
+                flush=True,
+            )
+        if total_phantom_rows:
+            print(
+                f"[BACKFILL] Phantom-row check: {total_phantom_rows} row(s) removed "
+                f"across {len(phantom_symbols)} symbol(s) (locally cached but "
+                f"confirmed absent from main db)",
+                flush=True,
+            )
+
         # ── Phase 4: per-symbol save to ohlc + missing-bucket reporting ──
-        for inst in symbols:
+        zero_candle_counts = {}  # tf_str -> count of symbols with 0 candles
+        for i, inst in enumerate(symbols, start=1):
             symbol = inst["symbol"]
-            self._finalize_symbol(symbol, symbol_state[symbol]["per_tf"])
+            zero_tfs = self._finalize_symbol(symbol, symbol_state[symbol]["per_tf"])
+            for tf_str in zero_tfs:
+                zero_candle_counts[tf_str] = zero_candle_counts.get(tf_str, 0) + 1
+            self._progress("Saving candles", i, len(symbols))
+
+        total_missing = sum(self.missing_counts.values())
+        if total_missing:
+            print(
+                f"[BACKFILL][WARN] {total_missing} candle(s) still missing across "
+                f"{len(self.missing_counts)} symbol/TF pair(s) (not in local tick "
+                f"cache, local history cache, main db, or history db)",
+                flush=True,
+            )
+        for tf_str, count in zero_candle_counts.items():
+            print(
+                f"[BACKFILL][WARN] {tf_str}: {count}/{len(symbols)} symbol(s) had 0 candles aggregated",
+                flush=True,
+            )
 
         # ── Phase 5: tick-buffer seeding — reuse Phase 2 fetch, batch the rest ──
         window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
@@ -518,6 +705,8 @@ class BackfillManager:
             flush=True,
         )
 
+        self._run_depth_backfill(symbols, now)
+
         self._validate(symbols)
 
         try:
@@ -532,6 +721,247 @@ class BackfillManager:
                 pass
 
         print("[BACKFILL] Completed", flush=True)
+
+    # ─────────────────────────────────────────────
+    # Depth backfill — LOOKBACK IS INTENTIONALLY SHORTER THAN QUOTE:
+    # only the most recent trading day, not Quote's full multi-day
+    # min_candles-driven window. Depth rows are far heavier than Quote
+    # rows (reconstructed bids/asks, not a few flat scalars) and much
+    # higher frequency, so matching Quote's full lookback here was
+    # materializing multiple trading days of order-book data in RAM
+    # at once across every symbol — this cuts that down to one day's
+    # worth by design, not just as a memory workaround.
+    #
+    # Otherwise mirrors Quote's Phase 1/Phase 3 logic exactly: same
+    # gap→refetch→upsert-correct approach, same phantom-row check,
+    # just against depth_ tables and cross-checked against Depth-mode
+    # connection-log outage windows instead of Quote's. Depth never
+    # feeds candle building, so there's no Phase 3/4 candle step here.
+    # ─────────────────────────────────────────────
+
+    def _compute_depth_lookback_start(self, now) -> datetime:
+        """
+        Start of the most recent trading day (09:15 IST) — today's, if
+        today is itself a trading day (even before market open), else
+        the most recent prior trading day. This is deliberately NOT
+        the same window Quote uses (_compute_lookback_start) — see
+        the note above.
+        """
+        day = now.date()
+        while not is_trading_day(day):
+            day -= timedelta(days=1)
+        return datetime.combine(day, dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
+
+    def _run_depth_backfill(self, symbols, now):
+        if self.tick_writer is None or self.conn is None:
+            return
+
+        start_ts = self._compute_depth_lookback_start(now)
+        start_ms = int(start_ts.timestamp() * 1000)
+        now_ms   = int(now.timestamp() * 1000)
+
+        print(
+            f"[BACKFILL] Depth backfill starting | lookback: last 1 trading "
+            f"day (from={start_ts.strftime('%Y-%m-%d %H:%M %Z')})",
+            flush=True,
+        )
+
+        depth_outage_windows = []
+        if self.conn_log_dir:
+            try:
+                from gap_detector import connection_outage_windows
+                depth_outage_windows = connection_outage_windows(self.conn_log_dir, now.date(), "Depth")
+            except Exception as exc:
+                print(f"[BACKFILL][WARN] could not read connection log for depth: {exc}", flush=True)
+
+        # ── Phase D1: check local depth cache, flag gaps ──
+        depth_state = {}
+        fetch_starts = {}
+        gap_flagged = []
+        confirmed_outage_count = 0
+
+        for i, inst in enumerate(symbols, start=1):
+            symbol  = inst["symbol"]
+            last_ms = self.tick_writer.max_ts(symbol, kind="depth")
+
+            cached_until_ms = None
+            phantom_range   = None
+            phantom_local_ts = None
+
+            if last_ms is not None and last_ms >= start_ms:
+                cached_df = self._cached_depth_df(symbol, start_ms, last_ms)
+                gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
+
+                if gap_ms is not None:
+                    gap_flagged.append(symbol)
+                    tail_df = cached_df[cached_df["timestamp"] > gap_ms]
+                    phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
+                    phantom_range = (gap_ms + 1, last_ms)
+
+                    if depth_outage_windows:
+                        from gap_detector import gap_matches_outage
+                        gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
+                        gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                        if gap_matches_outage(gap_start_dt, gap_end_dt, depth_outage_windows):
+                            confirmed_outage_count += 1
+
+                    cached_until_ms = gap_ms
+                else:
+                    cached_until_ms = last_ms
+
+            fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
+            depth_state[symbol] = {
+                "phantom_range": phantom_range,
+                "phantom_local_ts": phantom_local_ts,
+            }
+            if fetch_start_ms < now_ms:
+                fetch_starts[symbol] = datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+
+            self._progress("Checking local depth cache", i, len(symbols))
+
+        if gap_flagged:
+            preview = ", ".join(gap_flagged[:10])
+            more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
+            confirmed_note = (
+                f" ({confirmed_outage_count} confirmed against connection log)"
+                if depth_outage_windows else " (connection log not available to verify)"
+            )
+            print(
+                f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
+                f"(>{self.gap_threshold_secs}s within a session) in their cached "
+                f"depth data{confirmed_note} — will re-fetch and correct: "
+                f"{preview}{more}",
+                flush=True,
+            )
+
+        if not fetch_starts:
+            print("[BACKFILL] Depth backfill: nothing to fetch — all symbols fully cached", flush=True)
+            return
+
+        # ── Phase D2: batched fetch from Postgres depth_<symbol> ──
+        # (also writes freshly fetched rows into local depth cache via
+        # enqueue_backfill_rows — see _fetch_depth_batch's docstring)
+        depth_existing_tables = self._load_existing_tables(self.conn, prefix="depth")
+        fetched = self._fetch_depth_batch(fetch_starts, depth_existing_tables)
+
+        # ── Phase D3: phantom-row check ──
+        total_phantom_rows = 0
+        phantom_symbols = set()
+        for symbol, state in depth_state.items():
+            phantom_range    = state.get("phantom_range")
+            phantom_local_ts = state.get("phantom_local_ts")
+            if not (phantom_range and phantom_local_ts):
+                continue
+
+            fetched_ts = fetched.get(symbol, set())
+            pg_confirmed_ts = {
+                t for t in fetched_ts
+                if phantom_range[0] <= t <= phantom_range[1]
+            }
+
+            phantom_ts = phantom_local_ts - pg_confirmed_ts
+            if phantom_ts:
+                total_phantom_rows += len(phantom_ts)
+                phantom_symbols.add(symbol)
+                self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="depth", wait=False)
+
+        if total_phantom_rows:
+            print(
+                f"[BACKFILL] Depth phantom-row check: {total_phantom_rows} row(s) "
+                f"removed across {len(phantom_symbols)} symbol(s) (locally cached "
+                f"but confirmed absent from main db)",
+                flush=True,
+            )
+
+        self._seed_depth_ram(symbols, now)
+
+        print(f"[BACKFILL] Depth backfill complete | {len(symbols)} symbol(s)", flush=True)
+
+    def _seed_depth_ram(self, symbols, now):
+        """
+        Pre-warm DepthStore's rolling RAM window (see depth_store.py,
+        DEPTH_RAM_WINDOW_MINUTES env var) from the now-corrected local
+        depth cache, right after backfill finishes. Without this,
+        DepthStore starts every restart with an EMPTY window and only
+        fills back up gradually as live ticks arrive — meaning
+        anything reading depth RAM history in the first
+        DEPTH_RAM_WINDOW_MINUTES after a restart would see less
+        history than it should, even though the correct data is
+        already sitting right there in SQLite.
+
+        No-op if depth_store wasn't wired in (see __init__) or if
+        tick_writer is unavailable.
+        """
+        if self.depth_store is None or self.tick_writer is None:
+            return
+
+        window_secs = self.depth_store.ram_window_secs
+        start_ms = int(now.timestamp() * 1000) - window_secs * 1000
+        end_ms   = int(now.timestamp() * 1000)
+
+        seeded_symbols = 0
+        seeded_snapshots = 0
+        for inst in symbols:
+            symbol = inst["symbol"]
+            rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="depth")
+            if not rows:
+                continue
+
+            history = self.depth_store.depth_history.setdefault(symbol, deque())
+            history.clear()  # backfill's version is authoritative — replace any partial live data
+            for r in rows:
+                try:
+                    parsed = json.loads(r["raw_json"]) if r.get("raw_json") else {}
+                except Exception:
+                    parsed = {}
+                history.append({
+                    "bids":      parsed.get("bids", []),
+                    "asks":      parsed.get("asks", []),
+                    "ltp":       r.get("ltp"),
+                    "timestamp": r["timestamp"],
+                })
+            seeded_symbols += 1
+            seeded_snapshots += len(rows)
+
+        print(
+            f"[BACKFILL] Depth RAM window seeded: {seeded_symbols}/{len(symbols)} "
+            f"symbol(s), {seeded_snapshots} snapshot(s) ({window_secs // 60:.0f} min window)",
+            flush=True,
+        )
+
+    # ─────────────────────────────────────────────
+    # Mid-session auto-heal — triggered by websocket_connect.py right
+    # after a RECONNECTED event (NOT the first connect of the day —
+    # there's nothing to heal then). Unlike run()'s full Phase 1-5
+    # pass, this is deliberately light: we already know EXACTLY when
+    # and why the gap happened (the reconnect event itself confirms
+    # it), so there's no need to re-scan every symbol's local cache
+    # for suspicious gaps first — just fetch that one known window
+    # from the main db and let upsert correct whatever's there.
+    #
+    # mode: "quote" or "depth" (lowercase) — only that one feed gets
+    # healed, matching whichever connection actually reconnected.
+    # ─────────────────────────────────────────────
+
+    def run_targeted_heal(self, symbols, mode: str, gap_start, gap_end):
+        if self.conn is None or not symbols:
+            return
+
+        fetch_starts = {inst["symbol"]: gap_start for inst in symbols}
+        print(
+            f"[BACKFILL] Mid-session auto-heal ({mode}): re-fetching "
+            f"{gap_start.strftime('%H:%M:%S')}\u2013{gap_end.strftime('%H:%M:%S')} IST "
+            f"for {len(symbols)} symbol(s)",
+            flush=True,
+        )
+
+        existing_tables = self._load_existing_tables(self.conn, prefix=mode)
+        if mode == "depth":
+            self._fetch_depth_batch(fetch_starts, existing_tables)
+        else:
+            self._fetch_ticks_batch(fetch_starts, existing_tables)
+
+        print(f"[BACKFILL] Mid-session auto-heal ({mode}) complete", flush=True)
 
     # ─────────────────────────────────────────────
     # Per-symbol aggregation (Phase 3) — pure pandas, no DB
@@ -553,6 +983,25 @@ class BackfillManager:
             return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty"])
+        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+        return df
+
+    def _cached_depth_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        """
+        Same idea as _cached_ticks_df but for the local depth_<symbol>
+        SQLite cache — used by the Depth backfill pass. raw_json (the
+        bids/asks snapshot) is kept as-is; only timestamp/ist_ts are
+        needed for gap detection, the raw_json is just carried through
+        for anything downstream that wants the actual order-book data.
+        """
+        if self.tick_writer is None:
+            return pd.DataFrame()
+
+        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="depth")
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "raw_json"])
         df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
         return df
 
@@ -664,13 +1113,6 @@ class BackfillManager:
                 derived     = self.gaps.derive_from_1m(merged_1m, expected, tf_seconds)
                 tick_direct = self._aggregate(ticks_df, tf_seconds, now)
                 candles     = self.gaps.merge_candles(derived, tick_direct)
-                if not derived.empty:
-                    print(
-                        f"[BACKFILL] {tf_str}: {len(derived)}/{len(expected)} "
-                        f"candle(s) built from history-db 1m data (priority "
-                        f"source)",
-                        flush=True,
-                    )
             else:
                 candles = self._aggregate(ticks_df, tf_seconds, now)
 
@@ -686,6 +1128,13 @@ class BackfillManager:
     # ─────────────────────────────────────────────
 
     def _finalize_symbol(self, symbol, per_tf):
+        """
+        Saves every aggregated candle to ohlc and tracks missing-bucket /
+        zero-candle counts on self for run() to report as one aggregate
+        summary afterward — no per-symbol/per-tf lines printed here.
+        """
+        zero_candle_tfs = []
+
         for tf_str, tf_seconds in self.timeframes:
             state   = per_tf[tf_str]
             candles = state["candles"]
@@ -693,16 +1142,9 @@ class BackfillManager:
 
             if missing:
                 self.missing_counts[(symbol, tf_str)] = len(missing)
-                print(
-                    f"[BACKFILL][WARN] {symbol} {tf_str}: "
-                    f"{len(missing)} candle(s) still missing "
-                    f"(not in local tick cache, local history cache, main db, "
-                    f"or history db)",
-                    flush=True,
-                )
 
             if candles.empty:
-                print(f"[BACKFILL][WARN] {symbol} {tf_str}: 0 candles aggregated", flush=True)
+                zero_candle_tfs.append(tf_str)
                 continue
 
             # itertuples() instead of iterrows() — same one-row-at-a-time
@@ -720,10 +1162,7 @@ class BackfillManager:
                     "volume":    float(row.volume),
                 })
 
-            print(
-                f"[BACKFILL] {symbol} {tf_str}: {len(candles)} closed candles loaded",
-                flush=True,
-            )
+        return zero_candle_tfs
 
     # ─────────────────────────────────────────────
     # Tick-buffer seeding (OHLCCollector.raw_ticks)
@@ -956,22 +1395,51 @@ class BackfillManager:
             )
 
             try:
+                self._ensure_connected()
+                if self.conn is None:
+                    raise psycopg2.OperationalError("no connection available")
                 cur = self.conn.cursor()
                 cur.execute(query, params)
                 rows = cur.fetchall()
                 cur.close()
             except Exception as exc:
-                batch_symbols = [s for s, _ in chunk]
-                print(
-                    f"[BACKFILL][ERROR] batched tick fetch failed for a chunk of "
-                    f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}): {exc}",
-                    flush=True,
-                )
-                try:
-                    self.conn.rollback()
-                except Exception:
-                    pass
-                continue
+                if self._is_connection_dead(exc):
+                    print(
+                        f"[BACKFILL][WARN] chunk {chunk_num}/{total_chunks}: "
+                        f"connection dropped ({exc}) — reconnecting and retrying "
+                        f"this chunk once",
+                        flush=True,
+                    )
+                    self.conn = self._connect()
+                    try:
+                        if self.conn is not None:
+                            cur = self.conn.cursor()
+                            cur.execute(query, params)
+                            rows = cur.fetchall()
+                            cur.close()
+                        else:
+                            raise psycopg2.OperationalError("reconnect failed")
+                    except Exception as exc2:
+                        batch_symbols = [s for s, _ in chunk]
+                        print(
+                            f"[BACKFILL][ERROR] batched tick fetch failed again after "
+                            f"reconnect for a chunk of {len(batch_symbols)} symbol(s) "
+                            f"(starting {batch_symbols[0]}): {exc2}",
+                            flush=True,
+                        )
+                        continue
+                else:
+                    batch_symbols = [s for s, _ in chunk]
+                    print(
+                        f"[BACKFILL][ERROR] batched tick fetch failed for a chunk of "
+                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}): {exc}",
+                        flush=True,
+                    )
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    continue
 
             print(f"[BACKFILL] Chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received", flush=True)
 
@@ -1018,6 +1486,203 @@ class BackfillManager:
 
         print(
             f"[BACKFILL] Batched main-db fetch: {len(out)}/{len(fetch_starts)} "
+            f"symbol(s) returned data",
+            flush=True,
+        )
+        return out
+
+    # ─────────────────────────────────────────────
+    # Fetch depth from PostgreSQL (main db) — BATCHED across symbols
+    #
+    # Mirrors _fetch_ticks_batch() above, but against depth_<symbol>
+    # tables, which have the full typed order-book column set (see
+    # pg_writer.py's _DEPTH_COLUMN_DEFS) instead of quote's handful of
+    # columns — buy0..buy4/sell0..sell4 × price/qty/orders. Those get
+    # reassembled here into the {"bids": [...], "asks": [...]} shape
+    # tick_writer.py's local depth storage already uses (matching what
+    # enqueue_live() writes for a live depth snapshot), so a backfilled
+    # depth row is indistinguishable from a live one once it's cached.
+    # ─────────────────────────────────────────────
+
+    # Column order must exactly match pg_writer.py's _DEPTH_COLUMN_DEFS
+    # ordering for buy/sell levels (side, level, field) — this is what
+    # lets the same positional-index reconstruction logic below work
+    # without needing pg_writer.py itself as a dependency.
+    _DEPTH_LEVEL_COLUMNS = tuple(
+        f"{side}{lvl}_{field}"
+        for side in ("buy", "sell")
+        for lvl in range(5)
+        for field in ("price", "qty", "orders")
+    )
+
+    def _fetch_depth_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
+        """
+        fetch_starts: {symbol: start_ts} — same shape as
+        _fetch_ticks_batch's parameter, just for depth_<symbol> tables.
+
+        Returns {symbol: set(timestamp_ms)} — ONLY timestamps, not the
+        full bids/asks payload (see the comment at the return-value
+        assignment below for why). The full reconstructed order-book
+        rows (bids/asks lists of {"price","quantity","orders"} dicts,
+        matching what enqueue_live() expects for kind="depth") are
+        built and handed to tick_writer.enqueue_backfill_rows() as
+        each chunk is processed, then allowed to go out of scope
+        immediately rather than being retained in this function's
+        return value.
+        """
+        out = {}
+        if self.conn is None or not fetch_starts:
+            return out
+
+        items = list(fetch_starts.items())
+        skipped_no_table = []
+
+        level_cols_sql = ", ".join(self._DEPTH_LEVEL_COLUMNS)
+
+        chunk_size = self.batch_size if self.batch_size > 0 else max(len(items), 1)
+        for i in range(0, len(items), chunk_size):
+            chunk = items[i:i + chunk_size]
+
+            clauses = []
+            params  = []
+            for symbol, start_ts in chunk:
+                safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
+                table = f"depth_{safe_sym}".lower()
+                if table not in existing_tables:
+                    skipped_no_table.append(symbol)
+                    continue
+                start_ms = int(start_ts.timestamp() * 1000)
+                clauses.append(
+                    f"SELECT %s AS symbol, timestamp, ltp, {level_cols_sql} "
+                    f"FROM {table} WHERE timestamp >= %s"
+                )
+                params.extend([symbol, start_ms])
+
+            if not clauses:
+                continue
+
+            query = " UNION ALL ".join(clauses) + " ORDER BY symbol, timestamp"
+
+            chunk_num = i // chunk_size + 1
+            total_chunks = (len(items) + chunk_size - 1) // chunk_size
+            print(
+                f"[BACKFILL] Fetching main-db depth: chunk {chunk_num}/{total_chunks} "
+                f"({len(clauses)} symbol(s))...",
+                flush=True,
+            )
+
+            try:
+                self._ensure_connected()
+                if self.conn is None:
+                    raise psycopg2.OperationalError("no connection available")
+                cur = self.conn.cursor()
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                cur.close()
+            except Exception as exc:
+                if self._is_connection_dead(exc):
+                    print(
+                        f"[BACKFILL][WARN] depth chunk {chunk_num}/{total_chunks}: "
+                        f"connection dropped ({exc}) — reconnecting and retrying "
+                        f"this chunk once",
+                        flush=True,
+                    )
+                    self.conn = self._connect()
+                    try:
+                        if self.conn is not None:
+                            cur = self.conn.cursor()
+                            cur.execute(query, params)
+                            rows = cur.fetchall()
+                            cur.close()
+                        else:
+                            raise psycopg2.OperationalError("reconnect failed")
+                    except Exception as exc2:
+                        batch_symbols = [s for s, _ in chunk]
+                        print(
+                            f"[BACKFILL][ERROR] batched depth fetch failed again after "
+                            f"reconnect for a chunk of {len(batch_symbols)} symbol(s) "
+                            f"(starting {batch_symbols[0]}): {exc2}",
+                            flush=True,
+                        )
+                        continue
+                else:
+                    batch_symbols = [s for s, _ in chunk]
+                    print(
+                        f"[BACKFILL][ERROR] batched depth fetch failed for a chunk of "
+                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}): {exc}",
+                        flush=True,
+                    )
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    continue
+
+            print(f"[BACKFILL] Depth chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received", flush=True)
+
+            if not rows:
+                continue
+
+            columns = ["symbol", "timestamp", "ltp"] + list(self._DEPTH_LEVEL_COLUMNS)
+            df = pd.DataFrame(rows, columns=columns)
+            df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+            df = df[is_market_hours_weekday_vectorized(df["ist_ts"])]
+
+            def _levels(row, side):
+                out_levels = []
+                for lvl in range(5):
+                    price = row.get(f"{side}{lvl}_price")
+                    if price is None:
+                        continue
+                    out_levels.append({
+                        "price":    price,
+                        "quantity": row.get(f"{side}{lvl}_qty"),
+                        "orders":   row.get(f"{side}{lvl}_orders"),
+                    })
+                return out_levels
+
+            for symbol, group in df.groupby("symbol"):
+                g = group.drop(columns=["symbol"]).reset_index(drop=True)
+                bulk_rows = []
+                for row in g.to_dict("records"):
+                    bulk_rows.append({
+                        "timestamp": int(row["timestamp"]),
+                        "ltp": row.get("ltp"),
+                        "bids": _levels(row, "buy"),
+                        "asks": _levels(row, "sell"),
+                    })
+
+                if self.tick_writer is not None:
+                    self.tick_writer.enqueue_backfill_rows(symbol, bulk_rows, kind="depth")
+
+                # Only ever accumulate timestamps in `out`, NOT the full
+                # bids/asks payload — the only caller (the phantom-row
+                # check in _run_depth_backfill) only reads timestamps.
+                # The heavy reconstructed order-book data (bulk_rows,
+                # just enqueued above) is deliberately left to go out
+                # of scope right here instead of being kept alive in
+                # `out` for the rest of the entire depth backfill run —
+                # depth rows are wide enough (10 nested dicts per row)
+                # that retaining them per-symbol across a full run was
+                # the main driver of the multi-GB RAM usage seen in
+                # practice. `out[symbol]` accumulates across chunks
+                # (a symbol can appear in more than one chunk), so
+                # union with anything already there instead of
+                # overwriting it.
+                new_ts = set(int(t) for t in g["timestamp"])
+                out[symbol] = out.get(symbol, set()) | new_ts
+
+        if skipped_no_table:
+            preview = ", ".join(skipped_no_table[:10])
+            more = f" (+{len(skipped_no_table) - 10} more)" if len(skipped_no_table) > 10 else ""
+            print(
+                f"[BACKFILL][WARN] {len(skipped_no_table)} symbol(s) skipped — "
+                f"no depth_ table found: {preview}{more}",
+                flush=True,
+            )
+
+        print(
+            f"[BACKFILL] Batched main-db depth fetch: {len(out)}/{len(fetch_starts)} "
             f"symbol(s) returned data",
             flush=True,
         )
@@ -1155,21 +1820,54 @@ class BackfillManager:
             )
 
             try:
+                conn = self._get_history_conn()
+                if conn is None:
+                    raise psycopg2.OperationalError("no history-db connection available")
                 cur = conn.cursor()
                 cur.execute(query, params)
                 rows = cur.fetchall()
                 cur.close()
             except Exception as exc:
-                print(
-                    f"[BACKFILL][WARN] batched history fetch failed for a chunk "
-                    f"of {len(chunk)} symbol(s): {exc}",
-                    flush=True,
-                )
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                continue
+                retried_ok = False
+                if self._is_connection_dead(exc):
+                    print(
+                        f"[BACKFILL][WARN] history chunk {chunk_num}/{total_chunks}: "
+                        f"connection dropped ({exc}) — reconnecting and retrying "
+                        f"this chunk once",
+                        flush=True,
+                    )
+                    self.conn_history = None
+                    self._history_connect_tried = False
+                    conn = self._get_history_conn()
+                    try:
+                        if conn is not None:
+                            cur = conn.cursor()
+                            cur.execute(query, params)
+                            rows = cur.fetchall()
+                            cur.close()
+                            retried_ok = True
+                        else:
+                            raise psycopg2.OperationalError("reconnect failed")
+                    except Exception as exc2:
+                        print(
+                            f"[BACKFILL][WARN] batched history fetch failed again "
+                            f"after reconnect for a chunk of {len(chunk)} symbol(s): {exc2}",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        f"[BACKFILL][WARN] batched history fetch failed for a chunk "
+                        f"of {len(chunk)} symbol(s): {exc}",
+                        flush=True,
+                    )
+
+                if not retried_ok:
+                    try:
+                        if conn is not None:
+                            conn.rollback()
+                    except Exception:
+                        pass
+                    continue
 
             print(
                 f"[BACKFILL] History chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received",

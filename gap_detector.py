@@ -173,6 +173,80 @@ def compute_bucket(ist_ts: datetime, tf_seconds: int) -> datetime:
     return compute_bucket_vectorized(s, tf_seconds).iloc[0].to_pydatetime()
 
 
+# ─────────────────────────────────────────────
+# Connection-log-derived outage windows
+#
+# The only I/O in this file — everything else in gap_detector.py is
+# pure in-memory logic (see GapDetector's docstring). Kept here rather
+# than in connection_log.py because it's conceptually "what counts as
+# missing," the same question GapDetector answers for candle buckets,
+# just answered from a different, more authoritative source (the
+# logged connect/disconnect history) instead of a heuristic scan of
+# the tick data itself.
+# ─────────────────────────────────────────────
+
+def connection_outage_windows(conn_log_dir: str, day, mode: str):
+    """
+    Reads connection_log.db for `day` and `mode` ("Quote" or "Depth")
+    and returns a list of (disconnect_dt, reconnect_dt) tz-aware
+    datetime tuples — confirmed feed-outage windows for that mode.
+
+    Pairing: a window opens at each DISCONNECTED event and closes at
+    the next RECONNECTED/DAY_STARTED event for the SAME mode. If the
+    log ends with an unmatched DISCONNECTED (feed still down, or the
+    process died before logging a reconnect), the window is returned
+    with reconnect_dt=None — callers should treat "now" as the
+    effective end in that case.
+
+    Returns [] if the log is empty/missing for that day/mode — this
+    is expected and NOT an error (e.g. asking about a day before this
+    feature existed, or a mode that never dropped).
+    """
+    import connection_log
+
+    events = connection_log.get_events_for_day(conn_log_dir, day)
+    mode_events = [(event, ts_ms) for event, ts_ms, m in events if m == mode]
+
+    windows = []
+    open_disconnect_ms = None
+
+    for event, ts_ms in mode_events:
+        if event == "DISCONNECTED":
+            if open_disconnect_ms is None:
+                open_disconnect_ms = ts_ms
+            # a second DISCONNECTED before any reconnect shouldn't
+            # normally happen — keep the earlier (true) start time
+        elif event in ("RECONNECTED", "DAY_STARTED"):
+            if open_disconnect_ms is not None:
+                windows.append((open_disconnect_ms, ts_ms))
+                open_disconnect_ms = None
+
+    if open_disconnect_ms is not None:
+        windows.append((open_disconnect_ms, None))
+
+    result = []
+    for start_ms, end_ms in windows:
+        start_dt = datetime.fromtimestamp(start_ms / 1000, tz=tz_kolkata)
+        end_dt = datetime.fromtimestamp(end_ms / 1000, tz=tz_kolkata) if end_ms is not None else None
+        result.append((start_dt, end_dt))
+    return result
+
+
+def gap_matches_outage(gap_start: datetime, gap_end: datetime, outage_windows: list) -> bool:
+    """
+    True if [gap_start, gap_end] overlaps ANY logged outage window —
+    i.e. this gap is a CONFIRMED real disconnect, not just a heuristic
+    guess from sparse tick timestamps. An open-ended window
+    (reconnect_dt=None — feed still down / never logged a reconnect)
+    is treated as extending to "now" for this comparison.
+    """
+    for w_start, w_end in outage_windows:
+        effective_end = w_end if w_end is not None else datetime.max.replace(tzinfo=w_start.tzinfo)
+        if gap_start <= effective_end and gap_end >= w_start:
+            return True
+    return False
+
+
 class GapDetector:
     """
     GapDetector — PURE LOGIC, NO DB / NO I/O

@@ -37,6 +37,13 @@ CONN_LOG_DIR = os.getenv("CONN_LOG_DIR", "connection_logs")
 # How many trading days of local SQLite tick history to retain (pruned
 # at market close / on shutdown — see TickWriter.prune_older_than_days).
 TICK_CACHE_RETENTION_DAYS = int(os.getenv("TICK_CACHE_RETENTION_DAYS", "3"))
+# Depth's local cache only ever needs to cover what backfill actually
+# looks back over — see BackfillManager._compute_depth_lookback_start
+# (1 trading day, deliberately much shorter than quote's window since
+# depth rows are far heavier). Keeping depth data locally any longer
+# than this is pure wasted disk with no corresponding use, so it gets
+# its own, separate, much shorter retention setting.
+DEPTH_CACHE_RETENTION_DAYS = int(os.getenv("DEPTH_CACHE_RETENTION_DAYS", "1"))
 
 
 def _next_market_open(dt: datetime) -> datetime:
@@ -161,8 +168,15 @@ async def run_engine(enable_trading: bool):
     # Local SQLite cache for candles fetched from the history (fallback)
     # DB — see tick_writer.py's HistoryCandleStore. Same folder as the tick cache.
     history_store    = HistoryCandleStore(base_dir="tickdata")
-    ohlc             = OHLCCollector(tick_writer=tick_writer, history_store=history_store)
+    ohlc             = OHLCCollector(tick_writer=tick_writer, history_store=history_store, conn_log_dir=CONN_LOG_DIR)
     depth_store      = DepthStore(tick_writer=tick_writer)
+    # Let BackfillManager seed the RAM-window (see DepthStore's
+    # DEPTH_RAM_WINDOW_MINUTES) from freshly backfilled/corrected local
+    # data right after depth backfill completes — otherwise the window
+    # starts empty on every restart and only fills gradually as live
+    # ticks arrive, leaving up to DEPTH_RAM_WINDOW_MINUTES of "no
+    # history yet" right when it's most needed (right after a restart).
+    ohlc.depth_store = depth_store
     indicators       = IndicatorEngine(ohlc)
     prev_candle_guard = PreviousCandleGuard(ohlc)
     signal_generator  = SignalGenerator(ohlc) if enable_trading else None
@@ -185,12 +199,49 @@ async def run_engine(enable_trading: bool):
                 indicators.update(s["symbol"])
             await asyncio.sleep(1)
 
+    async def _on_reconnect(mode_label: str, disconnect_dt, reconnect_dt):
+        """
+        Fired by websocket_connect.py right after a REAL mid-session
+        reconnect (never the day's first connect). Runs a small,
+        targeted backfill for just [disconnect_dt, reconnect_dt] —
+        NOT a full re-scan — for whichever feed actually reconnected
+        (mode_label is "Quote" or "Depth", independently).
+
+        The actual DB work is synchronous (psycopg2/sqlite3), so it's
+        offloaded to a thread — this coroutine itself never blocks the
+        event loop, meaning the live feed keeps flowing normally while
+        the heal runs in the background.
+        """
+        mode = mode_label.lower()
+
+        def _heal():
+            from backfill_manager import BackfillManager
+            backfill = BackfillManager(ohlc)
+            try:
+                backfill.run_targeted_heal(symbols, mode, disconnect_dt, reconnect_dt)
+            finally:
+                try:
+                    backfill.conn.close()
+                except Exception:
+                    pass
+                if backfill.conn_history is not None:
+                    try:
+                        backfill.conn_history.close()
+                    except Exception:
+                        pass
+
+        try:
+            await asyncio.to_thread(_heal)
+        except Exception as exc:
+            print(f"[BACKFILL][WARN] mid-session auto-heal ({mode_label}) failed: {exc}", flush=True)
+
     def start_live_tasks():
         tasks.append(asyncio.create_task(
             run_market_data_feeds(
                 api_key, symbols,
                 conn_log_dir=CONN_LOG_DIR,
                 depth_levels=int(os.getenv("DEPTH_LEVELS", "5")),
+                on_reconnect=_on_reconnect,
             )
         ))
         tasks.append(asyncio.create_task(ohlc.run()))
@@ -301,6 +352,6 @@ async def run_engine(enable_trading: bool):
     # fires from _auto_stop_after_close() or SIGINT/SIGTERM either way)
     # — trim the local tick cache back down to the retention window
     # before closing the writer out.
-    tick_writer.prune_older_than_days(TICK_CACHE_RETENTION_DAYS)
+    tick_writer.prune_older_than_days(TICK_CACHE_RETENTION_DAYS, DEPTH_CACHE_RETENTION_DAYS)
     tick_writer.shutdown()
     print("[SYSTEM] Shutdown complete", flush=True)

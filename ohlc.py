@@ -91,12 +91,16 @@ class OHLCCollector:
 
     _WRITER_LOCK = False
 
-    def __init__(self, base_dir="ohlcdata", tick_writer=None, history_store=None):
+    def __init__(self, base_dir="ohlcdata", tick_writer=None, history_store=None, conn_log_dir=None):
         if OHLCCollector._WRITER_LOCK:
             raise RuntimeError("[OHLC][FATAL] Multiple OHLCCollector instances detected")
         OHLCCollector._WRITER_LOCK = True
 
         self.base_dir = base_dir
+        # Passed through to BackfillManager so it can cross-check
+        # detected gaps against confirmed disconnect windows in
+        # connection_log.db (see gap_detector.connection_outage_windows).
+        self.conn_log_dir = conn_log_dir
 
         # ── Load configured timeframes from env ───────────────────────
         tf_env = os.getenv("TIMEFRAMES", "1m,5m")
@@ -225,6 +229,12 @@ class OHLCCollector:
         from backfill_manager import BackfillManager
         backfill = BackfillManager(self)
         backfill.run(symbols)
+
+        print(
+            f"[CANDLE] Candle building complete | {len(symbols)} symbol(s) | "
+            f"live updates running",
+            flush=True,
+        )
 
         self._backfilled       = True
         self.backfill_complete = True
