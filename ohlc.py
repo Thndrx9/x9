@@ -179,6 +179,59 @@ class OHLCCollector:
         self._append_ram(symbol, timeframe, candle)
         self.parquet_writer.enqueue(symbol, timeframe, candle)
 
+    def save_candles_bulk(self, symbol, timeframe, candles_df):
+        """
+        Same effect as calling save_candle() once per row of
+        candles_df, but O(N) instead of O(N^2) on BOTH the RAM side and
+        the disk side — this is what BackfillManager._finalize_symbol()
+        uses instead of looping save_candle() per historical candle.
+
+        RAM side: builds the merged/deduped series in one pass (a dict
+        keyed by timestamp) instead of _append_ram()'s per-call linear
+        scan for an existing same-timestamp row — that scan is fine for
+        one live tick at a time, but re-scanning the whole growing
+        series for every one of a few hundred historical candles adds
+        up.
+
+        Disk side: delegates to parquet_writer.enqueue_bulk(), which
+        does one read-merge-write for the whole batch instead of one
+        per candle — see that method's docstring for why the per-candle
+        version was the dominant cost of slow candle building.
+        """
+        if candles_df is None or candles_df.empty:
+            return
+
+        key = (symbol, timeframe)
+        with self._ram_lock:
+            if key not in self._ensured_parquet:
+                self.parquet_writer.ensure_file(symbol, timeframe)
+                self._ensured_parquet.add(key)
+
+            store = self.ohlc_data.get(timeframe)
+            if store is not None:
+                series = store.setdefault(symbol, [])
+                by_ts = {pd.Timestamp(r["timestamp"]): r for r in series}
+                for row in candles_df.itertuples(index=False):
+                    ts = pd.Timestamp(row.timestamp)
+                    by_ts[ts] = {
+                        "timestamp": ts,
+                        "open":      float(row.open),
+                        "high":      float(row.high),
+                        "low":       float(row.low),
+                        "close":     float(row.close),
+                        "volume":    float(row.volume),
+                    }
+                merged = sorted(by_ts.values(), key=lambda r: r["timestamp"])
+
+                tf_seconds = self._tf_seconds_map.get(timeframe)
+                if tf_seconds and merged:
+                    cutoff = merged[-1]["timestamp"] - timedelta(seconds=self._retention_secs(tf_seconds))
+                    merged = [r for r in merged if r["timestamp"] >= cutoff]
+
+                store[symbol] = merged
+
+        self.parquet_writer.enqueue_bulk(symbol, timeframe, candles_df)
+
     def _retention_secs(self, tf_seconds: int) -> int:
         """max(flat RAM window, enough seconds for MIN_CANDLES) for this TF."""
         return max(self.ram_window_secs, self.min_candles * tf_seconds)

@@ -3,7 +3,6 @@
 import os
 import re
 import math
-import json
 import psycopg2
 import pandas as pd
 from collections import deque
@@ -11,6 +10,7 @@ from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
 from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata, is_market_open
+from tick_writer import DEPTH_LEVEL_COLUMNS
 from gap_detector import (
     GapDetector,
     compute_bucket,
@@ -873,6 +873,19 @@ class BackfillManager:
                 flush=True,
             )
 
+        # Wait for every depth row fetched above to actually be written
+        # to disk before reading it back for RAM seeding — fetching and
+        # enqueueing finishes fast, but the writer thread (SQLite,
+        # single-threaded) can lag well behind. Without this wait,
+        # _seed_depth_ram's read_ticks() call races the writer thread
+        # and finds nothing yet, which is exactly why "Depth RAM window
+        # seeded: 0/N symbols" was showing up even on a successful
+        # fetch — and why fetched-but-unwritten depth data was still
+        # sitting in RAM (in the write queue) well after this function
+        # printed "complete".
+        if self.tick_writer is not None:
+            self.tick_writer.flush_and_wait()
+
         self._seed_depth_ram(symbols, now)
 
         print(f"[BACKFILL] Depth backfill complete | {len(symbols)} symbol(s)", flush=True)
@@ -910,13 +923,35 @@ class BackfillManager:
             history = self.depth_store.depth_history.setdefault(symbol, deque())
             history.clear()  # backfill's version is authoritative — replace any partial live data
             for r in rows:
-                try:
-                    parsed = json.loads(r["raw_json"]) if r.get("raw_json") else {}
-                except Exception:
-                    parsed = {}
+                # rows come back flat (buy0_price/buy0_qty/... columns,
+                # same shape as PG) — reassemble into the nested
+                # bids/asks list-of-dicts DepthStore's in-RAM consumers
+                # (best_bid_ask, get_history, etc.) expect. This is the
+                # ONLY place that reconstruction happens now — once per
+                # symbol at startup, not per-row on the backfill hot path.
+                bids = []
+                for lvl in range(5):
+                    price = r.get(f"buy{lvl}_price")
+                    if price is None:
+                        continue
+                    bids.append({
+                        "price": price,
+                        "quantity": r.get(f"buy{lvl}_qty"),
+                        "orders": r.get(f"buy{lvl}_orders"),
+                    })
+                asks = []
+                for lvl in range(5):
+                    price = r.get(f"sell{lvl}_price")
+                    if price is None:
+                        continue
+                    asks.append({
+                        "price": price,
+                        "quantity": r.get(f"sell{lvl}_qty"),
+                        "orders": r.get(f"sell{lvl}_orders"),
+                    })
                 history.append({
-                    "bids":      parsed.get("bids", []),
-                    "asks":      parsed.get("asks", []),
+                    "bids":      bids,
+                    "asks":      asks,
                     "ltp":       r.get("ltp"),
                     "timestamp": r["timestamp"],
                 })
@@ -989,10 +1024,11 @@ class BackfillManager:
     def _cached_depth_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """
         Same idea as _cached_ticks_df but for the local depth_<symbol>
-        SQLite cache — used by the Depth backfill pass. raw_json (the
-        bids/asks snapshot) is kept as-is; only timestamp/ist_ts are
-        needed for gap detection, the raw_json is just carried through
-        for anything downstream that wants the actual order-book data.
+        SQLite cache — used by the Depth backfill pass purely for gap
+        detection, which only needs timestamp/ist_ts. The full flat
+        level columns come back from read_ticks() too but aren't
+        needed here, so they're dropped immediately rather than kept
+        around in this DataFrame.
         """
         if self.tick_writer is None:
             return pd.DataFrame()
@@ -1001,7 +1037,7 @@ class BackfillManager:
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "raw_json"])
+        df = pd.DataFrame([{"timestamp": r["timestamp"], "ltp": r.get("ltp")} for r in rows])
         df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
         return df
 
@@ -1147,20 +1183,14 @@ class BackfillManager:
                 zero_candle_tfs.append(tf_str)
                 continue
 
-            # itertuples() instead of iterrows() — same one-row-at-a-time
-            # save_candle() calls (its per-symbol upsert/sort logic in
-            # ohlc.py is unchanged), just avoids the per-row pandas Series
-            # construction that iterrows() does, which is pure overhead here
-            # since we only read scalar fields off each row.
-            for row in candles.itertuples(index=False):
-                self.ohlc.save_candle(symbol, tf_str, {
-                    "timestamp": row.timestamp,
-                    "open":      float(row.open),
-                    "high":      float(row.high),
-                    "low":       float(row.low),
-                    "close":     float(row.close),
-                    "volume":    float(row.volume),
-                })
+            # Bulk save — ONE call for the whole symbol/timeframe's
+            # candle set instead of one save_candle() call per row.
+            # save_candle() (still used for live ticks) triggers a full
+            # parquet read+rewrite EVERY call; looping it here meant N
+            # historical candles cost O(N^2) file I/O — the dominant
+            # cost of backfill's candle-building phase. save_candles_bulk()
+            # does one read-merge-write for the entire batch instead.
+            self.ohlc.save_candles_bulk(symbol, tf_str, candles)
 
         return zero_candle_tfs
 
@@ -1505,15 +1535,12 @@ class BackfillManager:
     # ─────────────────────────────────────────────
 
     # Column order must exactly match pg_writer.py's _DEPTH_COLUMN_DEFS
-    # ordering for buy/sell levels (side, level, field) — this is what
-    # lets the same positional-index reconstruction logic below work
-    # without needing pg_writer.py itself as a dependency.
-    _DEPTH_LEVEL_COLUMNS = tuple(
-        f"{side}{lvl}_{field}"
-        for side in ("buy", "sell")
-        for lvl in range(5)
-        for field in ("price", "qty", "orders")
-    )
+    # ordering for buy/sell levels (side, level, field) — imported from
+    # tick_writer.py (DEPTH_LEVEL_COLUMNS) so there's one single source
+    # of truth for this column list, since the local depth_<symbol>
+    # SQLite cache now uses the exact same flat column layout instead
+    # of a raw_json blob.
+    _DEPTH_LEVEL_COLUMNS = DEPTH_LEVEL_COLUMNS
 
     def _fetch_depth_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
         """
@@ -1628,47 +1655,32 @@ class BackfillManager:
             df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
             df = df[is_market_hours_weekday_vectorized(df["ist_ts"])]
 
-            def _levels(row, side):
-                out_levels = []
-                for lvl in range(5):
-                    price = row.get(f"{side}{lvl}_price")
-                    if price is None:
-                        continue
-                    out_levels.append({
-                        "price":    price,
-                        "quantity": row.get(f"{side}{lvl}_qty"),
-                        "orders":   row.get(f"{side}{lvl}_orders"),
-                    })
-                return out_levels
-
             for symbol, group in df.groupby("symbol"):
-                g = group.drop(columns=["symbol"]).reset_index(drop=True)
-                bulk_rows = []
-                for row in g.to_dict("records"):
-                    bulk_rows.append({
-                        "timestamp": int(row["timestamp"]),
-                        "ltp": row.get("ltp"),
-                        "bids": _levels(row, "buy"),
-                        "asks": _levels(row, "sell"),
-                    })
+                g = group.drop(columns=["symbol", "ist_ts"]).reset_index(drop=True)
+
+                # Rows are handed to tick_writer AS-IS from PG — same
+                # flat buy0_price/buy0_qty/.../sell4_orders columns,
+                # no bids/asks reconstruction into nested dicts and no
+                # JSON encoding. That reconstruction (10 dicts/row) used
+                # to be the main driver of depth backfill's RAM usage;
+                # now depth rows cost the same "just numbers" memory a
+                # quote row does. Nested bids/asks shape is only ever
+                # built where something in RAM actually needs it (see
+                # _seed_depth_ram), not on this hot fetch/write path.
+                bulk_rows = g.to_dict("records")
 
                 if self.tick_writer is not None:
                     self.tick_writer.enqueue_backfill_rows(symbol, bulk_rows, kind="depth")
 
                 # Only ever accumulate timestamps in `out`, NOT the full
-                # bids/asks payload — the only caller (the phantom-row
-                # check in _run_depth_backfill) only reads timestamps.
-                # The heavy reconstructed order-book data (bulk_rows,
-                # just enqueued above) is deliberately left to go out
-                # of scope right here instead of being kept alive in
-                # `out` for the rest of the entire depth backfill run —
-                # depth rows are wide enough (10 nested dicts per row)
-                # that retaining them per-symbol across a full run was
-                # the main driver of the multi-GB RAM usage seen in
-                # practice. `out[symbol]` accumulates across chunks
-                # (a symbol can appear in more than one chunk), so
-                # union with anything already there instead of
-                # overwriting it.
+                # depth payload — the only caller (the phantom-row check
+                # in _run_depth_backfill) only reads timestamps. Kept
+                # deliberately separate from bulk_rows (which goes out
+                # of scope right here) rather than retained in `out` for
+                # the rest of the entire depth backfill run.
+                # `out[symbol]` accumulates across chunks (a symbol can
+                # appear in more than one chunk), so union with anything
+                # already there instead of overwriting it.
                 new_ts = set(int(t) for t in g["timestamp"])
                 out[symbol] = out.get(symbol, set()) | new_ts
 

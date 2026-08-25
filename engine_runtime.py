@@ -162,9 +162,12 @@ async def run_engine(enable_trading: bool):
         return
     api_key = os.getenv("API_KEY")
 
-    # Single local SQLite tick cache, shared by quote ticks (via ohlc)
-    # and depth snapshots (via depth_store) — see tick_writer.py.
-    tick_writer      = TickWriter(base_dir="tickdata")
+    # Local tick cache, shared by quote ticks (via ohlc) and depth
+    # snapshots (via depth_store) — see tick_writer.py. Backend is
+    # SQLite by default; set TICK_WRITER_BACKEND=postgres in .env to
+    # use a local PostgreSQL instance instead — TickWriter() itself
+    # picks the right implementation, nothing here needs to branch.
+    tick_writer = TickWriter(base_dir="tickdata")
     # Local SQLite cache for candles fetched from the history (fallback)
     # DB — see tick_writer.py's HistoryCandleStore. Same folder as the tick cache.
     history_store    = HistoryCandleStore(base_dir="tickdata")
@@ -207,6 +210,17 @@ async def run_engine(enable_trading: bool):
         NOT a full re-scan — for whichever feed actually reconnected
         (mode_label is "Quote" or "Depth", independently).
 
+        Holds tick_writer's gate for the duration — same reasoning as
+        the startup CASE 1/2 backfill: live ticks for this mode keep
+        arriving the whole time the heal's own catch-up rows are being
+        fetched and written, and without the hold those live ticks
+        could land on disk BEFORE the (earlier-timestamped) catch-up
+        rows the heal is still fetching, putting them out of order.
+        release() is reference-counted specifically so this is safe
+        even if Quote's and Depth's heals overlap (both connections
+        dropping around the same time is a real scenario, not an edge
+        case) — see SQLiteTickWriter.release()'s docstring.
+
         The actual DB work is synchronous (psycopg2/sqlite3), so it's
         offloaded to a thread — this coroutine itself never blocks the
         event loop, meaning the live feed keeps flowing normally while
@@ -230,10 +244,16 @@ async def run_engine(enable_trading: bool):
                     except Exception:
                         pass
 
+        tick_writer.hold()
         try:
             await asyncio.to_thread(_heal)
         except Exception as exc:
             print(f"[BACKFILL][WARN] mid-session auto-heal ({mode_label}) failed: {exc}", flush=True)
+        finally:
+            # Always release, even on failure — otherwise a failed heal
+            # would leave this mode's live ticks buffering in RAM
+            # forever, never actually reaching disk.
+            tick_writer.release()
 
     def start_live_tasks():
         tasks.append(asyncio.create_task(

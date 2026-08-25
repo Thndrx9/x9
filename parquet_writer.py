@@ -29,6 +29,28 @@ class ParquetWriter:
     def enqueue(self, symbol, timeframe, candle):
         self._queue.put((symbol, timeframe, dict(candle)))
 
+    def enqueue_bulk(self, symbol, timeframe, candles_df):
+        """
+        Queues an ENTIRE batch of candles (a DataFrame with timestamp/
+        open/high/low/close/volume columns) as ONE item, written with a
+        single read-existing + merge + write cycle — not one per
+        candle. This is the path backfill's _finalize_symbol() uses.
+
+        Without this, saving N historical candles for one symbol/
+        timeframe meant N separate _write_one() calls, and EVERY one of
+        those reads the WHOLE existing file and rewrites the WHOLE
+        file — so writing N candles cost O(1+2+...+N) = O(N^2) file
+        I/O instead of O(N). For a real backfill (hundreds of candles
+        per symbol, ~200 symbols, 2 timeframes), that quadratic blowup
+        was the dominant cost of "candle building" being slow — not
+        the pandas aggregation math itself. One bulk write per symbol/
+        timeframe instead makes this genuinely O(N): one read, one
+        merge, one write, no matter how many candles are in the batch.
+        """
+        if candles_df is None or candles_df.empty:
+            return
+        self._queue.put((symbol, timeframe, candles_df))
+
     def ensure_file(self, symbol, timeframe):
         """
         Ensure parquet file exists for symbol/timeframe.
@@ -49,7 +71,10 @@ class ParquetWriter:
             except queue.Empty:
                 continue
             try:
-                self._write_one(symbol, timeframe, candle)
+                if isinstance(candle, pd.DataFrame):
+                    self._write_bulk(symbol, timeframe, candle)
+                else:
+                    self._write_one(symbol, timeframe, candle)
             finally:
                 self._queue.task_done()
 
@@ -104,6 +129,45 @@ class ParquetWriter:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
         self._empty_frame().to_parquet(tmp, engine="pyarrow", index=False)
+        os.replace(tmp, path)
+
+    def _write_bulk(self, symbol, timeframe, candles_df):
+        """
+        Same merge/sort/dedupe/atomic-write logic as _write_one(), but
+        ONE read of the existing file and ONE write, for the WHOLE
+        batch — see enqueue_bulk()'s docstring for why this matters.
+        """
+        path = os.path.join(self.base_dir, symbol, f"{timeframe}.parquet")
+        self._ensure_parquet_file(path)
+
+        required = ["timestamp", "open", "high", "low", "close", "volume"]
+        missing = [c for c in required if c not in candles_df.columns]
+        if missing:
+            return
+
+        df_new = candles_df[required].copy()
+        df_new["timestamp"] = self._normalize_to_ist(df_new["timestamp"])
+        df_new = df_new.dropna(subset=["timestamp"])
+        if df_new.empty:
+            return
+
+        if os.path.exists(path):
+            df_old = self._read_existing(path)
+            if not df_old.empty and "timestamp" in df_old.columns:
+                df_old = df_old[required].copy()
+                df_old["timestamp"] = self._normalize_to_ist(df_old["timestamp"])
+                df_old = df_old.dropna(subset=["timestamp"])
+                df = pd.concat([df_old, df_new], ignore_index=True) if not df_old.empty else df_new
+            else:
+                df = df_new
+        else:
+            df = df_new
+
+        df = df.sort_values("timestamp")
+        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+
+        tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        df.to_parquet(tmp, engine="pyarrow", index=False)
         os.replace(tmp, path)
 
     def _write_one(self, symbol, timeframe, candle):
