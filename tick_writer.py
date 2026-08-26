@@ -1232,45 +1232,75 @@ class PostgresTickWriter:
     method names, same argument shapes, same return shapes (read_ticks()
     returns the identical flat-dict format).
 
-    Unlike SQLiteTickWriter, this runs a POOL of writer threads
-    (WRITER_POOL_SIZE, default 9, overridable via PG_LOCAL_WRITER_THREADS)
-    instead of one — Postgres's MVCC lets genuinely concurrent writes to
-    DIFFERENT tables proceed without blocking each other, unlike SQLite's
-    single file-level write lock, so a pool is a real throughput lever
-    here in a way it wouldn't be for the SQLite backend.
+    ── Live writer: a single dedicated thread, not sharded ──────────────
+    Live tick volume is naturally rate-limited by the market feed itself
+    (unlike backfill's "dump months of history at once" pattern), so it
+    doesn't need Postgres's MVCC-driven cross-table concurrency the way
+    bulk backfill throughput does — one thread comfortably keeps up.
+    Live ticks for EVERY symbol flow through one queue (self._live_queue),
+    one dedicated thread (_run_live()), one connection. Ordering per
+    symbol is trivially guaranteed (single thread, natural queue order) —
+    simpler than the shard-hash scheme below, which now exists purely
+    for bulk/backfill throughput.
 
-    ── Ordering guarantee, still intact ────────────────────────────────
-    Every symbol is routed to exactly ONE shard for its entire lifetime
-    (via a deterministic hash — see _shard_for()), so all of one symbol's
-    rows — live and backfilled alike — always pass through the SAME
-    queue, processed by the SAME single thread, in arrival order. That's
-    the same ordering guarantee SQLiteTickWriter's single writer gives
-    you; sharding by symbol never lets two writers race on the same
-    table, so a symbol's ticks can never land out of order OR in another
-    symbol's table (the destination table name is computed from the
-    row's own `symbol` field regardless of which shard processes it —
-    sharding only decides WHICH thread handles a row, never WHERE it's
-    written).
+    ── Bulk writer pool: still sharded ──────────────────────────────────
+    Every symbol is routed to exactly ONE bulk shard for its entire
+    lifetime (via a deterministic hash — see _shard_for()), so all of
+    one symbol's BACKFILL rows always pass through the SAME queue,
+    processed by the SAME single thread, in arrival order. Postgres's
+    MVCC lets genuinely concurrent writes to DIFFERENT tables proceed
+    without blocking each other, unlike SQLite's single file-level write
+    lock, so a pool is a real throughput lever here — this is where it
+    actually matters, unlike the live path above.
 
-    hold()/release() still gate ALL symbols together (one shared
-    _held flag/buffer) — release() re-routes each buffered item to its
-    own symbol's shard when draining, same ordering guarantee applies.
+    ── Live vs. backfill tables ─────────────────────────────────────────
+    Unlike SQLiteTickWriter, live and backfilled ticks are written into
+    physically SEPARATE tables — quote_<symbol>_live / quote_<symbol>_backfill
+    (and depth_<symbol>_live / depth_<symbol>_backfill) — see table_name().
+    _flush_live() always targets the "_live" table, _flush_bulk() (fed by
+    enqueue_backfill_rows(), always called via BackfillManager) always
+    targets the "_backfill" table.
+
+    This removes the ordering race hold()/release() used to guard
+    against: that gate existed only because live and backfilled rows
+    used to share ONE table's timeline, so a live tick landing before an
+    earlier-timestamped historical row (still in flight from Postgres)
+    would have corrupted max_ts()'s "what's already cached" resume-point
+    logic. With separate tables there's no shared timeline to corrupt —
+    live ticks can be written the instant they arrive, with zero wait on
+    backfill. hold()/release() are kept as no-ops purely so this class
+    stays a drop-in replacement for SQLiteTickWriter (which still needs
+    them) — callers (engine_runtime.py) don't need to know or care which
+    backend is active.
+
+    Read methods (max_ts(), read_ticks(), delete_range(),
+    delete_timestamps()) default to source="backfill", matching what
+    BackfillManager's own cache-check / gap-detection / resume-point
+    logic actually needs — it must only ever see its own backfilled
+    history, never live ticks, or it could wrongly conclude a date range
+    is already covered and silently skip re-fetching a real gap. Pass
+    source="live" explicitly for anything that needs the live table
+    instead, or read both tables and UNION them for a combined
+    live+backfill view (e.g. building candles from full tick history).
 
     ── RAM ceiling kept from multiplying by pool size ──────────────────
-    QUEUE_MAXSIZE and COMMIT_MAX_ROWS are both divided by the pool size
-    (see __init__) so the AGGREGATE worst-case backlog across every
-    shard stays roughly where a single writer's ceiling was, instead of
-    silently multiplying by 9x just because there are 9 queues/9 open
-    transactions now.
+    BULK_QUEUE_MAXSIZE and COMMIT_MAX_ROWS (bulk side) are divided by
+    the bulk pool size (see __init__) so the AGGREGATE worst-case bulk
+    backlog across every shard stays roughly where a single writer's
+    ceiling was, instead of silently multiplying by 9x just because
+    there are 9 bulk queues/9 open transactions now. LIVE_QUEUE_MAXSIZE
+    is NOT divided — there's only one live queue now, so it gets the
+    full ceiling.
 
-    ── Cross-shard maintenance ops ──────────────────────────────────────
-    flush_and_wait() fans a barrier out to every shard and waits for all
-    of them. build_pending_indexes()/prune_older_than_days() are DB-wide
-    operations (not per-symbol), so they call flush_and_wait() first
-    (ensuring every shard's pending work is durable), then run once
-    against shard 0's connection only — no need to run them once per
-    shard, any single connection can CREATE INDEX / DELETE across every
-    table in the database.
+    ── Cross-pool maintenance ops ────────────────────────────────────────
+    flush_and_wait() fans a barrier out to every bulk shard AND the
+    live queue, waiting for all of them. build_pending_indexes()/
+    prune_older_than_days() are DB-wide operations (not per-symbol), so
+    they call flush_and_wait() first (ensuring every shard's AND the
+    live thread's pending work is durable), then run once against bulk
+    shard 0's connection only — no need to run them once per
+    shard/thread, any single connection can CREATE INDEX / DELETE across
+    every table in the database.
     """
 
     BATCH_SIZE       = 100
@@ -1294,37 +1324,27 @@ class PostgresTickWriter:
 
         self.pool_size = max(1, int(os.getenv("PG_LOCAL_WRITER_THREADS", str(self.WRITER_POOL_SIZE))))
 
-        # Divided by pool size so the AGGREGATE ceiling across every
-        # shard's queue/open-transaction stays close to what a single
-        # writer's ceiling was — see class docstring's "RAM ceiling"
-        # section. Floored so a large pool_size can't shrink either
-        # value to something degenerate (e.g. a queue that can't even
+        # Divided by BULK pool size only — see class docstring's "RAM
+        # ceiling" section. Floored so a large pool_size can't shrink
+        # this to something degenerate (e.g. a queue that can't even
         # hold one bulk chunk).
-        #
-        # LIVE and BULK get entirely SEPARATE queues per shard, not one
-        # shared queue — a bulk catch-up job (e.g. mid-session auto-heal
-        # after a websocket reconnect) can enqueue thousands of rows in
-        # a tight loop, and with a shared queue that traffic fills every
-        # available slot far faster than live ticks can claim one,
-        # starving live data even though live ticks matter more
-        # (missing a live tick is a real gap; a catch-up job finishing a
-        # few seconds later than ideal is not). Giving live its own
-        # dedicated queue means a busy bulk job can never crowd it out.
         self._bulk_queue_maxsize_per_shard = max(4, self.BULK_QUEUE_MAXSIZE // self.pool_size)
-        self._live_queue_maxsize_per_shard = max(10, self.LIVE_QUEUE_MAXSIZE // self.pool_size)
         self._commit_max_rows_per_shard    = max(1_000, self.COMMIT_MAX_ROWS // self.pool_size)
 
         self._bulk_queues = [queue.Queue(maxsize=self._bulk_queue_maxsize_per_shard) for _ in range(self.pool_size)]
-        self._live_queues = [queue.Queue(maxsize=self._live_queue_maxsize_per_shard) for _ in range(self.pool_size)]
+        # Single dedicated live queue/thread — not sharded, not divided
+        # across pool_size. See class docstring's "Live writer" section.
+        self._live_queue = queue.Queue(maxsize=self.LIVE_QUEUE_MAXSIZE)
         self._stop   = threading.Event()
 
-        self._gate_lock   = threading.Lock()
-        self._hold_count   = 0
-        self._held_buffer = []
+        # No hold/release buffering state — see class docstring's "Live
+        # vs. backfill tables" section. hold()/release() below are kept
+        # as no-ops purely for drop-in compatibility with
+        # SQLiteTickWriter, which still needs the gate.
 
-        # Per-shard state — each dict is only ever mutated by its OWN
-        # shard thread (inside _run(shard_idx)), so no locking is
-        # needed for any of these; get_metrics() only READS them.
+        # Per-BULK-shard state — each dict is only ever mutated by its
+        # OWN shard thread (inside _run_bulk(shard_idx)), so no locking
+        # is needed for any of these; get_metrics() only READS them.
         self._shard_state = [
             {
                 "known_tables":         set(),
@@ -1340,8 +1360,23 @@ class PostgresTickWriter:
             for _ in range(self.pool_size)
         ]
 
-        # SHARED across shards (a table can only ever be created by the
-        # one shard that owns its symbol, but build_pending_indexes()
+        # Live thread's own state — same shape as one bulk shard's, but
+        # a single dict since there's only one live thread. Only ever
+        # mutated by _run_live(); get_metrics() only reads it.
+        self._live_state = {
+            "known_tables":         set(),
+            "pending_commit_rows":  0,
+            "txn_started_at":       None,
+            "rows_written_total":   0,
+            "commits_total":        0,
+            "commit_time_total":    0.0,
+            "last_commit_duration": 0.0,
+            "last_commit_rows":     0,
+            "last_txn_duration":    0.0,
+        }
+
+        # SHARED across bulk shards (a table can only ever be created by
+        # the one shard that owns its symbol, but build_pending_indexes()
         # needs to see every shard's pending tables, not just shard 0's)
         # — writes are rare (once per symbol, at first table creation),
         # so a simple lock is more than sufficient, no contention risk.
@@ -1349,9 +1384,9 @@ class PostgresTickWriter:
         self._pending_index_lock   = threading.Lock()
 
         # Detected ONCE, up front, via a single throwaway connection —
-        # not per-shard — so every shard agrees on whether this is a
-        # fresh db, and so 9 threads don't all independently race to
-        # query pg_tables at startup.
+        # not per-shard — so every shard/thread agrees on whether this
+        # is a fresh db, and so nothing independently races to query
+        # pg_tables at startup.
         self._is_fresh_db = self._detect_fresh_db()
 
         self._metrics_started_at = time.time()
@@ -1365,9 +1400,13 @@ class PostgresTickWriter:
             # loop variable" bug. threading.Thread(args=(i,)) binds the
             # value of i at Thread-creation time, so each thread gets
             # its own correct, fixed shard index.
-            t = threading.Thread(target=self._run, name=f"pg-writer-{i}", args=(i,), daemon=True)
+            t = threading.Thread(target=self._run_bulk, name=f"pg-bulk-writer-{i}", args=(i,), daemon=True)
             t.start()
             self._threads.append(t)
+
+        self._live_thread = threading.Thread(target=self._run_live, name="pg-live-writer", daemon=True)
+        self._live_thread.start()
+        self._threads.append(self._live_thread)
 
     def _detect_fresh_db(self) -> bool:
         conn = None
@@ -1404,13 +1443,8 @@ class PostgresTickWriter:
     # ─────────────────────────────────────────────
 
     def enqueue_live(self, symbol: str, kind: str, snapshot: dict):
-        item = (symbol, kind, dict(snapshot))
-        with self._gate_lock:
-            if self._hold_count > 0:
-                self._held_buffer.append(item)
-                return
         try:
-            self._live_queues[self._shard_for(symbol)].put_nowait(("live", *item))
+            self._live_queue.put_nowait(("live", symbol, kind, dict(snapshot)))
         except queue.Full:
             self._dropped_live_ticks += 1
             if self._dropped_live_ticks == 1 or self._dropped_live_ticks % 500 == 0:
@@ -1421,8 +1455,11 @@ class PostgresTickWriter:
                 )
 
     def hold(self):
-        with self._gate_lock:
-            self._hold_count += 1
+        """No-op — live and backfill write to separate tables now, so
+        there's no ordering race left to guard against. Kept only so
+        this class stays a drop-in replacement for SQLiteTickWriter
+        (which still needs a real gate) — see class docstring."""
+        pass
 
     # Back-compat alias, matching TickWriter's — nothing in this repo
     # currently calls it, kept only so PostgresTickWriter is a true
@@ -1431,25 +1468,8 @@ class PostgresTickWriter:
         self.enqueue_live(symbol, "depth", snapshot)
 
     def release(self):
-        """Reference-counted — see SQLiteTickWriter.release()'s
-        docstring for why (concurrent Quote/Depth mid-session heals can
-        both hold the gate at once)."""
-        with self._gate_lock:
-            self._hold_count = max(0, self._hold_count - 1)
-            if self._hold_count > 0:
-                return
-            buffered = self._held_buffer
-            self._held_buffer = []
-        for symbol, kind, snapshot in buffered:
-            try:
-                self._live_queues[self._shard_for(symbol)].put_nowait(("live", symbol, kind, snapshot))
-            except queue.Full:
-                self._dropped_live_ticks += 1
-                print(
-                    f"[PG_LOCAL_WRITER][WARN] LIVE queue full during release() — "
-                    f"dropped a buffered live tick for {symbol}",
-                    flush=True,
-                )
+        """No-op — see hold()."""
+        pass
 
     # ─────────────────────────────────────────────
     # Bulk catch-up ingestion — same signature as
@@ -1471,15 +1491,14 @@ class PostgresTickWriter:
 
     def flush_and_wait(self, timeout: float = 120):
         """
-        Fans a barrier out to EVERY shard's BOTH queues (live and bulk)
-        and waits for all of them — guarantees everything queued before
-        this call, on either queue, is committed by the time it
-        returns. Since shards run concurrently, the real wall-clock
-        cost is bounded by the slowest shard, not the sum of all of
-        them.
+        Fans a barrier out to every BULK shard's queue AND the single
+        live queue, and waits for all of them — guarantees everything
+        queued before this call, on any of them, is committed by the
+        time it returns. They run concurrently, so the real wall-clock
+        cost is bounded by the slowest one, not the sum of all of them.
         """
         events = []
-        for q in list(self._bulk_queues) + list(self._live_queues):
+        for q in list(self._bulk_queues) + [self._live_queue]:
             done = threading.Event()
             q.put(("barrier", done))
             events.append(done)
@@ -1502,18 +1521,18 @@ class PostgresTickWriter:
             print(f"[PG_LOCAL_WRITER][WARN] build_pending_indexes timed out after {timeout}s", flush=True)
         return done.is_set()
 
-    def delete_range(self, symbol: str, start_ms: int, end_ms=None, kind: str = "quote", timeout: float = 30):
+    def delete_range(self, symbol: str, start_ms: int, end_ms=None, kind: str = "quote", source: str = "backfill", timeout: float = 30):
         done = threading.Event()
-        self._bulk_queues[self._shard_for(symbol)].put(("delete_range", symbol, start_ms, end_ms, kind, done))
+        self._bulk_queues[self._shard_for(symbol)].put(("delete_range", symbol, start_ms, end_ms, kind, source, done))
         if not done.wait(timeout=timeout):
             print(f"[PG_LOCAL_WRITER][WARN] delete_range({symbol}) timed out", flush=True)
 
-    def delete_timestamps(self, symbol: str, timestamps, kind: str = "quote", wait: bool = True, timeout: float = 30):
+    def delete_timestamps(self, symbol: str, timestamps, kind: str = "quote", source: str = "backfill", wait: bool = True, timeout: float = 30):
         timestamps = [int(t) for t in timestamps]
         if not timestamps:
             return
         done = threading.Event()
-        self._bulk_queues[self._shard_for(symbol)].put(("delete_timestamps", symbol, timestamps, kind, done))
+        self._bulk_queues[self._shard_for(symbol)].put(("delete_timestamps", symbol, timestamps, kind, source, done))
         if wait:
             if not done.wait(timeout=timeout):
                 print(f"[PG_LOCAL_WRITER][WARN] delete_timestamps({symbol}) timed out", flush=True)
@@ -1533,11 +1552,14 @@ class PostgresTickWriter:
 
     def get_metrics(self) -> dict:
         elapsed = max(time.time() - self._metrics_started_at, 1e-9)
-        rows_written_total = sum(s["rows_written_total"] for s in self._shard_state)
-        commits_total       = sum(s["commits_total"] for s in self._shard_state)
-        commit_time_total   = sum(s["commit_time_total"] for s in self._shard_state)
+        bulk_rows_written  = sum(s["rows_written_total"] for s in self._shard_state)
+        bulk_commits_total = sum(s["commits_total"] for s in self._shard_state)
+        bulk_commit_time   = sum(s["commit_time_total"] for s in self._shard_state)
+        rows_written_total = bulk_rows_written + self._live_state["rows_written_total"]
+        commits_total       = bulk_commits_total + self._live_state["commits_total"]
+        commit_time_total   = bulk_commit_time + self._live_state["commit_time_total"]
         bulk_queue_depth = sum(q.qsize() for q in self._bulk_queues)
-        live_queue_depth = sum(q.qsize() for q in self._live_queues)
+        live_queue_depth = self._live_queue.qsize()
         return {
             "pool_size":            self.pool_size,
             "queue_depth":          bulk_queue_depth + live_queue_depth,
@@ -1549,10 +1571,17 @@ class PostgresTickWriter:
             "avg_commit_secs":      (commit_time_total / commits_total) if commits_total else 0.0,
             "pending_index_tables": len(self._pending_index_tables),
             "dropped_live_ticks":   self._dropped_live_ticks,
-            "per_shard": [
+            "live": {
+                "queue_depth":        live_queue_depth,
+                "rows_written_total": self._live_state["rows_written_total"],
+                "commits_total":      self._live_state["commits_total"],
+                "last_commit_secs":   self._live_state["last_commit_duration"],
+                "last_commit_rows":   self._live_state["last_commit_rows"],
+                "last_txn_secs":      self._live_state["last_txn_duration"],
+            },
+            "per_bulk_shard": [
                 {
                     "bulk_queue_depth":   self._bulk_queues[i].qsize(),
-                    "live_queue_depth":   self._live_queues[i].qsize(),
                     "rows_written_total": s["rows_written_total"],
                     "commits_total":      s["commits_total"],
                     "last_commit_secs":   s["last_commit_duration"],
@@ -1583,14 +1612,17 @@ class PostgresTickWriter:
     # unaffected by sharding
     # ─────────────────────────────────────────────
 
-    def table_name(self, symbol: str, kind: str) -> str:
-        return f"{kind}_{_safe_symbol(symbol)}"
+    def table_name(self, symbol: str, kind: str, source: str = "backfill") -> str:
+        """source: 'live' or 'backfill' — see class docstring's "Live vs.
+        backfill tables" section for why these are physically separate."""
+        return f"{kind}_{_safe_symbol(symbol)}_{source}"
 
-    def read_ticks(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote"):
+    def read_ticks(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote", source: str = "backfill"):
         """Same return shape as TickWriter.read_ticks(): list of dicts,
         {"timestamp","ltp","qty"} for quote, {"timestamp","ltp",
-        <DEPTH_LEVEL_COLUMNS...>} for depth."""
-        table = self.table_name(symbol, kind)
+        <DEPTH_LEVEL_COLUMNS...>} for depth. source defaults to
+        "backfill" — see class docstring."""
+        table = self.table_name(symbol, kind, source)
         if kind == "depth":
             select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
         else:
@@ -1624,8 +1656,19 @@ class PostgresTickWriter:
             print(f"[PG_LOCAL_WRITER][WARN] read_ticks({symbol}) failed: {exc}", flush=True)
             return []
 
-    def max_ts(self, symbol: str, kind: str = "quote"):
-        table = self.table_name(symbol, kind)
+    def read_ticks_combined(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote"):
+        """Live + backfill tables UNIONed and re-sorted by timestamp —
+        for consumers that want the full tick history regardless of
+        which table a row happens to live in (e.g. building candles
+        from raw ticks). BackfillManager's own cache-check should NOT
+        use this — it needs read_ticks(source="backfill") specifically,
+        see class docstring."""
+        live     = self.read_ticks(symbol, start_ms, end_ms, kind, source="live")
+        backfill = self.read_ticks(symbol, start_ms, end_ms, kind, source="backfill")
+        return sorted(live + backfill, key=lambda r: r["timestamp"])
+
+    def max_ts(self, symbol: str, kind: str = "quote", source: str = "backfill"):
+        table = self.table_name(symbol, kind, source)
         try:
             conn = psycopg2.connect(**self._params)
             try:
@@ -1646,10 +1689,11 @@ class PostgresTickWriter:
 
     # ─────────────────────────────────────────────
     # Writer thread internals — every method below takes an explicit
-    # `state` dict (this shard's own self._shard_state[shard_idx]) or
-    # `shard_idx` where needed. No locking anywhere in here: each
-    # shard's state dict, connection, and batch are touched by exactly
-    # one thread for that shard's entire lifetime.
+    # `state` dict (a bulk shard's own self._shard_state[shard_idx], or
+    # self._live_state for the single live thread) and/or a worker
+    # label for logging. No locking anywhere in here: each worker's
+    # state dict, connection, and batch are touched by exactly one
+    # thread for that worker's entire lifetime.
     # ─────────────────────────────────────────────
 
     def _connect(self):
@@ -1731,7 +1775,7 @@ class PostgresTickWriter:
             ts_ms = snapshot.get("timestamp")
             if ts_ms is None:
                 continue
-            table = self.table_name(symbol, kind)
+            table = self.table_name(symbol, kind, "live")
             bucket = rows_by_table.setdefault(table, (kind, []))
             if kind == "depth":
                 flat = {}
@@ -1748,7 +1792,7 @@ class PostgresTickWriter:
         return n
 
     def _flush_bulk(self, conn, symbol, rows_in, kind, state) -> int:
-        table = self.table_name(symbol, kind)
+        table = self.table_name(symbol, kind, "backfill")
         rows = []
         if kind == "depth":
             for r in rows_in:
@@ -1765,8 +1809,8 @@ class PostgresTickWriter:
         self._ensure_table(conn, table, kind, state)
         return self._insert(conn, table, kind, rows)
 
-    def _delete_range(self, conn, symbol, start_ms, end_ms, kind):
-        table = self.table_name(symbol, kind)
+    def _delete_range(self, conn, symbol, start_ms, end_ms, kind, source):
+        table = self.table_name(symbol, kind, source)
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
         if not cur.fetchone():
@@ -1780,8 +1824,8 @@ class PostgresTickWriter:
         if n:
             print(f"[PG_LOCAL_WRITER] Deleted {n} row(s) from {table}", flush=True)
 
-    def _delete_timestamps(self, conn, symbol, timestamps, kind):
-        table = self.table_name(symbol, kind)
+    def _delete_timestamps(self, conn, symbol, timestamps, kind, source):
+        table = self.table_name(symbol, kind, source)
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
         if not cur.fetchone():
@@ -1819,29 +1863,35 @@ class PostgresTickWriter:
             flush=True,
         )
 
-    def _commit_if_due(self, conn, state, shard_idx: int, force: bool = False):
+    def _commit_if_due(self, conn, state, worker_label, commit_max_rows: int, force: bool = False):
         """
         Returns the connection to use going forward — usually the same
         `conn` passed in, but a FRESH one if the commit failed and had
         to reconnect. Callers must always do `conn = self._commit_if_due(...)`
         and keep using the returned value, never the original variable.
 
+        worker_label is just for log messages (a bulk shard index or
+        "live"). commit_max_rows is that worker's own threshold — bulk
+        shards use self._commit_max_rows_per_shard (aggregate budget
+        divided across the pool), the live thread uses the full
+        self.COMMIT_MAX_ROWS (it's the only live writer, no dividing).
+
         Without a try/except here, ANY commit failure (a transient
         network blip, a Postgres-side timeout, a dropped connection)
-        would propagate straight out of _run()'s while loop and kill
-        this shard's thread silently — a daemon thread with no
-        supervisor to notice or restart it. From that point on this
-        shard's queue never drains again: enqueue_backfill_rows() for
-        every symbol mapped to this dead shard blocks forever on a full
-        queue, and whatever's already queued sits in RAM permanently.
-        That's a real, previously-unhandled path to exactly the
-        "fetched data but RAM never comes back down" symptom.
+        would propagate straight out of the run loop and kill this
+        worker's thread silently — a daemon thread with no supervisor
+        to notice or restart it. From that point on this worker's
+        queue never drains again: enqueue_backfill_rows()/enqueue_live()
+        for every symbol mapped to it blocks forever on a full queue,
+        and whatever's already queued sits in RAM permanently. That's a
+        real, previously-unhandled path to exactly the "fetched data
+        but RAM never comes back down" symptom.
         """
         if state["pending_commit_rows"] == 0:
             return conn
         due = (
             force
-            or state["pending_commit_rows"] >= self._commit_max_rows_per_shard
+            or state["pending_commit_rows"] >= commit_max_rows
             or (state["txn_started_at"] is not None and time.time() - state["txn_started_at"] >= self.COMMIT_MAX_SECS)
         )
         if not due:
@@ -1852,7 +1902,7 @@ class PostgresTickWriter:
         except Exception as exc:
             lost_rows = state["pending_commit_rows"]
             print(
-                f"[PG_LOCAL_WRITER][ERROR] shard {shard_idx} commit failed "
+                f"[PG_LOCAL_WRITER][ERROR] {worker_label} commit failed "
                 f"({lost_rows} row(s) in this transaction lost): {exc} — reconnecting",
                 flush=True,
             )
@@ -1860,12 +1910,12 @@ class PostgresTickWriter:
                 conn.close()
             except Exception:
                 pass
-            # Reconnect so this shard keeps working instead of being
+            # Reconnect so this worker keeps working instead of being
             # permanently wedged — the rows in the failed transaction
             # are gone (never buffered separately for retry, same
             # trade-off SQLiteTickWriter makes on an insert failure),
-            # but every symbol mapped to this shard keeps flowing
-            # instead of hanging forever on a dead queue.
+            # but every symbol mapped to it keeps flowing instead of
+            # hanging forever on a dead queue.
             conn = self._connect()
             state["pending_commit_rows"] = 0
             state["txn_started_at"] = None
@@ -1888,112 +1938,119 @@ class PostgresTickWriter:
         state["pending_commit_rows"] += n
         state["rows_written_total"]  += n
 
-    def _run(self, shard_idx: int):
-        live_q = self._live_queues[shard_idx]
+    def _run_bulk(self, shard_idx: int):
+        """
+        One of self.pool_size bulk shard threads. Handles ONLY backfill
+        rows (enqueue_backfill_rows()) plus the DB-wide admin ops
+        (prune/delete/barrier/build_indexes) that piggyback on shard 0's
+        connection — see class docstring. Live ticks never flow through
+        here anymore (see _run_live()), so there's no batch-accumulation
+        or live/bulk priority juggling left to do — just drain bulk_q.
+        """
         bulk_q = self._bulk_queues[shard_idx]
         state  = self._shard_state[shard_idx]
+        label  = f"bulk shard {shard_idx}"
+
+        conn = self._connect()
+        try:
+            while True:
+                stopping = self._stop.is_set() and bulk_q.empty()
+                if stopping:
+                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                    break
+
+                try:
+                    item = bulk_q.get(timeout=0.25)
+                except queue.Empty:
+                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+                    continue
+
+                try:
+                    kind0 = item[0]
+                    if kind0 == "bulk":
+                        _, symbol, rows, kind = item
+                        self._note_inserted(self._flush_bulk(conn, symbol, rows, kind, state), state)
+                    elif kind0 == "prune":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, n_trading_days, done_event = item
+                        self._prune_tables(conn, n_trading_days)
+                        done_event.set()
+                    elif kind0 == "delete_range":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, symbol, start_ms, end_ms, kind, source, done_event = item
+                        self._delete_range(conn, symbol, start_ms, end_ms, kind, source)
+                        done_event.set()
+                    elif kind0 == "delete_timestamps":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, symbol, timestamps, kind, source, done_event = item
+                        self._delete_timestamps(conn, symbol, timestamps, kind, source)
+                        done_event.set()
+                    elif kind0 == "barrier":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, done_event = item
+                        done_event.set()
+                    elif kind0 == "build_indexes":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        self._build_pending_indexes(conn)
+                        _, done_event = item
+                        done_event.set()
+
+                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+
+                except Exception as exc:
+                    # Catch-all safety net — see _run_live()'s matching
+                    # block for why this must never let the thread die.
+                    print(
+                        f"[PG_LOCAL_WRITER][ERROR] {label} hit an unexpected "
+                        f"error, reconnecting and continuing: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = self._connect()
+                    state["pending_commit_rows"] = 0
+                    state["txn_started_at"] = None
+        finally:
+            conn.close()
+
+    def _run_live(self):
+        """
+        Single dedicated live writer thread — see class docstring's
+        "Live writer" section for why one thread is enough here (unlike
+        bulk backfill, live volume is naturally rate-limited by the
+        market feed). Every symbol's live ticks flow through the one
+        queue this drains, batched the same way the old combined loop
+        batched them (BATCH_SIZE / BATCH_MAX_SECS), just without any
+        bulk-priority juggling since bulk never shows up here.
+        """
+        live_q = self._live_queue
+        state  = self._live_state
+        label  = "live writer"
 
         conn = self._connect()
         batch = []
         last_batch_flush = time.time()
-        loop_count = 0
         try:
             while True:
-                stopping = self._stop.is_set() and live_q.empty() and bulk_q.empty()
+                stopping = self._stop.is_set() and live_q.empty()
                 if not batch and stopping:
-                    conn = self._commit_if_due(conn, state, shard_idx, force=True)
+                    conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=True)
                     break
 
-                loop_count += 1
-                item = None
-                if loop_count % 20 == 0:
-                    # Periodic bulk-priority check — pure "live always
-                    # wins" could otherwise starve bulk indefinitely
-                    # under sustained heavy live traffic (live refilling
-                    # just fast enough to never be empty at the check
-                    # moment). Every 20th iteration, give bulk first
-                    # crack instead, guaranteeing it always makes
-                    # progress even during a busy live session.
-                    try:
-                        item = bulk_q.get_nowait()
-                    except queue.Empty:
-                        try:
-                            item = live_q.get_nowait()
-                        except queue.Empty:
-                            item = None
-                else:
-                    # LIVE checked first, non-blocking. The fallback
-                    # wait on bulk uses a SHORT timeout (not 0.25s) —
-                    # blocking on bulk for any longer means this thread
-                    # stops checking live_q entirely for that whole
-                    # window. Live ticks don't arrive perfectly evenly
-                    # spaced — a brief gap (live_q momentarily empty)
-                    # followed by a burst (several ticks landing close
-                    # together, e.g. quote+depth for busy symbols) is
-                    # completely normal. A 250ms blind spot was enough
-                    # for a burst to overflow the live queue with
-                    # nothing draining it — this was happening
-                    # continuously, independent of any bulk/backfill
-                    # activity, which is why drops kept climbing across
-                    # every shard even with no heavy backfill running.
-                    try:
-                        item = live_q.get_nowait()
-                    except queue.Empty:
-                        try:
-                            item = bulk_q.get(timeout=0.02)
-                        except queue.Empty:
-                            item = None
+                try:
+                    item = live_q.get(timeout=0.25)
+                except queue.Empty:
+                    item = None
 
                 try:
-                    if item is not None and item[0] == "bulk":
+                    if item is not None and item[0] == "barrier":
                         if batch:
                             self._note_inserted(self._flush_live(conn, batch, state), state)
                             batch = []
                             last_batch_flush = time.time()
-                        _, symbol, rows, kind = item
-                        self._note_inserted(self._flush_bulk(conn, symbol, rows, kind, state), state)
-                    elif item is not None and item[0] == "prune":
-                        if batch:
-                            self._note_inserted(self._flush_live(conn, batch, state), state)
-                            batch = []
-                            last_batch_flush = time.time()
-                        conn = self._commit_if_due(conn, state, shard_idx, force=True)
-                        _, n_trading_days, done_event = item
-                        self._prune_tables(conn, n_trading_days)
-                        done_event.set()
-                    elif item is not None and item[0] == "delete_range":
-                        if batch:
-                            self._note_inserted(self._flush_live(conn, batch, state), state)
-                            batch = []
-                            last_batch_flush = time.time()
-                        conn = self._commit_if_due(conn, state, shard_idx, force=True)
-                        _, symbol, start_ms, end_ms, kind, done_event = item
-                        self._delete_range(conn, symbol, start_ms, end_ms, kind)
-                        done_event.set()
-                    elif item is not None and item[0] == "delete_timestamps":
-                        if batch:
-                            self._note_inserted(self._flush_live(conn, batch, state), state)
-                            batch = []
-                            last_batch_flush = time.time()
-                        conn = self._commit_if_due(conn, state, shard_idx, force=True)
-                        _, symbol, timestamps, kind, done_event = item
-                        self._delete_timestamps(conn, symbol, timestamps, kind)
-                        done_event.set()
-                    elif item is not None and item[0] == "barrier":
-                        if batch:
-                            self._note_inserted(self._flush_live(conn, batch, state), state)
-                            batch = []
-                            last_batch_flush = time.time()
-                        conn = self._commit_if_due(conn, state, shard_idx, force=True)
-                        _, done_event = item
-                        done_event.set()
-                    elif item is not None and item[0] == "build_indexes":
-                        if batch:
-                            self._note_inserted(self._flush_live(conn, batch, state), state)
-                            batch = []
-                            last_batch_flush = time.time()
-                        conn = self._commit_if_due(conn, state, shard_idx, force=True)
-                        self._build_pending_indexes(conn)
+                        conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=True)
                         _, done_event = item
                         done_event.set()
                     elif item is not None:
@@ -2009,25 +2066,20 @@ class PostgresTickWriter:
                         batch = []
                         last_batch_flush = time.time()
 
-                    conn = self._commit_if_due(conn, state, shard_idx, force=stopping)
+                    conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=stopping)
 
                 except Exception as exc:
                     # Catch-all safety net: _insert()/_commit_if_due()
                     # already handle the failures they can anticipate,
                     # but this guarantees NOTHING unexpected can kill
-                    # this thread outright. A dead shard thread means
-                    # its queue never drains again — every symbol
-                    # mapped to it would block forever on
-                    # enqueue_backfill_rows() and its queued data would
-                    # sit in RAM permanently. Reconnecting and dropping
-                    # whatever event/done_event was in-flight (if any)
-                    # is a far better outcome than a silently wedged
-                    # shard — any waiter on that done_event will simply
-                    # time out and log a warning instead of hanging
-                    # forever, which is the existing, already-handled
-                    # behavior for a timeout.
+                    # this thread outright. A dead live thread means
+                    # enqueue_live() blocks/drops for EVERY symbol
+                    # (there's only one live thread now, not 9 shards
+                    # to fall back on) — reconnecting and dropping
+                    # whatever was in-flight is a far better outcome
+                    # than a permanently wedged live writer.
                     print(
-                        f"[PG_LOCAL_WRITER][ERROR] shard {shard_idx} hit an unexpected "
+                        f"[PG_LOCAL_WRITER][ERROR] {label} hit an unexpected "
                         f"error, reconnecting and continuing: {exc}",
                         flush=True,
                     )
