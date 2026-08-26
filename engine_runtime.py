@@ -29,6 +29,10 @@ load_dotenv()
 # with the WebSocket (can't afford to block that close to open)
 PARALLEL_BACKFILL_THRESHOLD_SECS = 60
 
+# Mid-session auto-heal retry tuning — see _on_reconnect()'s docstring.
+_HEAL_MAX_ATTEMPTS       = 3
+_HEAL_RETRY_BACKOFF_SECS = 3   # attempt N waits N * this many seconds before retrying
+
 # Where DAY_STARTED / RECONNECTED / DISCONNECTED events get logged for
 # the Quote-mode websocket connection (the one backfill/gap-detection
 # cares about for figuring out when the feed actually dropped).
@@ -55,23 +59,35 @@ def _next_market_open(dt: datetime) -> datetime:
         day += timedelta(days=1)
 
 
-async def _run_backfill_safe(ohlc, symbols):
+async def _run_backfill_safe(ohlc, symbols, backfill_lock: asyncio.Lock):
     """
     Wraps ensure_backfill_async so a failure is actually visible.
     Without this, an exception inside a fire-and-forget asyncio.Task
     (like the parallel-backfill task below) is silently swallowed and
     only surfaces much later as an unhelpful "exception was never
     retrieved" warning — or never at all.
+
+    Holds backfill_lock for the duration of the actual fetch — see
+    run_engine()'s "Backfill/heal serialization" note just above where
+    the lock is created. Without this, a mid-session auto-heal firing
+    while this is still running competes with it for the GIL and for
+    main-db Postgres connections — both synchronous, CPU-heavy fetches
+    running concurrently is exactly what caused a websocket ping-timeout
+    disconnect in practice (the GIL starvation delayed keepalive
+    responses), which is the very thing the heal exists to recover
+    from. Serializing them means a heal simply waits its turn instead
+    of racing an in-flight backfill.
     """
     try:
-        await ohlc.ensure_backfill_async(symbols)
+        async with backfill_lock:
+            await ohlc.ensure_backfill_async(symbols)
     except Exception:
         import traceback
         print("[BACKFILL][FATAL] Backfill task crashed:", flush=True)
         traceback.print_exc()
 
 
-async def _run_backfill_and_release(ohlc, symbols, tick_writer):
+async def _run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock: asyncio.Lock):
     """
     Same as _run_backfill_safe(), plus releasing tick_writer's
     hold/release gate afterward. Used when backfill runs in PARALLEL
@@ -84,12 +100,12 @@ async def _run_backfill_and_release(ohlc, symbols, tick_writer):
     flushes that buffer in the correct order and resumes direct writes.
     """
     try:
-        await _run_backfill_safe(ohlc, symbols)
+        await _run_backfill_safe(ohlc, symbols, backfill_lock)
     finally:
         tick_writer.release()
 
 
-async def _catchup_and_release(ohlc, symbols, tick_writer):
+async def _catchup_and_release(ohlc, symbols, tick_writer, backfill_lock: asyncio.Lock):
     """
     Standalone pre-live catch-up: fetches whatever PG ticks landed
     since the local SQLite tick cache's last row and writes them
@@ -98,11 +114,15 @@ async def _catchup_and_release(ohlc, symbols, tick_writer):
     completed earlier (while the market was closed, no live ticks
     existed yet) — this only needs to cover the short gap between then
     and the websocket actually going live.
+
+    Also holds backfill_lock — see _run_backfill_safe()'s docstring for
+    why any DB-heavy backfill/heal work needs to be serialized.
     """
     try:
         from backfill_manager import BackfillManager
         backfill = BackfillManager(ohlc)
-        await asyncio.to_thread(backfill.cache_recent_ticks_to_sqlite, symbols)
+        async with backfill_lock:
+            await asyncio.to_thread(backfill.cache_recent_ticks_to_sqlite, symbols)
     except Exception:
         import traceback
         print("[TICK_CACHE][WARN] pre-live catch-up fetch failed:", flush=True)
@@ -196,6 +216,17 @@ async def run_engine(enable_trading: bool):
 
     tasks = []
 
+    # Serializes every synchronous, DB-heavy backfill/heal operation
+    # (startup backfill, pre-live catch-up, mid-session auto-heal) so
+    # at most one runs at a time — see _run_backfill_safe()'s docstring
+    # for why running them concurrently is a real problem (GIL
+    # contention between synchronous psycopg2/pandas work in different
+    # threads was the actual cause of a websocket ping-timeout
+    # disconnect in practice, and a heal firing to recover from that
+    # disconnect while the original backfill is still in flight only
+    # compounds the same contention right when it matters most).
+    backfill_lock = asyncio.Lock()
+
     async def indicator_loop():
         while not stop_event.is_set():
             for s in symbols:
@@ -219,14 +250,30 @@ async def run_engine(enable_trading: bool):
         release() is reference-counted specifically so this is safe
         even if Quote's and Depth's heals overlap (both connections
         dropping around the same time is a real scenario, not an edge
-        case) — see SQLiteTickWriter.release()'s docstring.
+        case) — see SQLiteTickWriter.release()'s docstring. (On the
+        Postgres backend hold/release are no-ops — see tick_writer.py's
+        PostgresTickWriter docstring — since live/backfill write to
+        separate tables there; kept here so this code works unchanged
+        on either backend.)
 
         The actual DB work is synchronous (psycopg2/sqlite3), so it's
         offloaded to a thread — this coroutine itself never blocks the
         event loop, meaning the live feed keeps flowing normally while
         the heal runs in the background.
+
+        Retries up to _HEAL_MAX_ATTEMPTS times with a short backoff
+        before giving up — a failed heal used to just print one [WARN]
+        and vanish, permanently losing that exact disconnect window
+        with nothing but a log line as evidence. Each attempt (and any
+        retry) acquires backfill_lock, so a heal never runs concurrently
+        with an in-flight startup backfill/catch-up — see
+        _run_backfill_safe()'s docstring for why that matters (GIL
+        contention between concurrent synchronous DB fetches was the
+        original trigger for the disconnect this heal is responding
+        to).
         """
         mode = mode_label.lower()
+        window_label = f"{disconnect_dt.strftime('%H:%M:%S')}–{reconnect_dt.strftime('%H:%M:%S')} IST"
 
         def _heal():
             from backfill_manager import BackfillManager
@@ -246,9 +293,34 @@ async def run_engine(enable_trading: bool):
 
         tick_writer.hold()
         try:
-            await asyncio.to_thread(_heal)
-        except Exception as exc:
-            print(f"[BACKFILL][WARN] mid-session auto-heal ({mode_label}) failed: {exc}", flush=True)
+            for attempt in range(1, _HEAL_MAX_ATTEMPTS + 1):
+                try:
+                    async with backfill_lock:
+                        await asyncio.to_thread(_heal)
+                    break  # success — stop retrying
+                except Exception as exc:
+                    if attempt < _HEAL_MAX_ATTEMPTS:
+                        backoff = _HEAL_RETRY_BACKOFF_SECS * attempt
+                        print(
+                            f"[BACKFILL][WARN] mid-session auto-heal ({mode_label}) "
+                            f"attempt {attempt}/{_HEAL_MAX_ATTEMPTS} failed for "
+                            f"{window_label}: {exc} — retrying in {backoff}s",
+                            flush=True,
+                        )
+                        await asyncio.sleep(backoff)
+                    else:
+                        # Exhausted every retry — this window is now
+                        # PERMANENTLY unhealed unless someone notices
+                        # this line and re-runs a targeted fetch for it
+                        # by hand. [ERROR], not [WARN], and the exact
+                        # window spelled out, on purpose — this should
+                        # not be easy to miss in the log.
+                        print(
+                            f"[BACKFILL][ERROR] mid-session auto-heal ({mode_label}) "
+                            f"failed after {_HEAL_MAX_ATTEMPTS} attempts — gap "
+                            f"{window_label} is UNHEALED: {exc}",
+                            flush=True,
+                        )
         finally:
             # Always release, even on failure — otherwise a failed heal
             # would leave this mode's live ticks buffering in RAM
@@ -309,7 +381,7 @@ async def run_engine(enable_trading: bool):
         # (see _run_backfill_and_release's docstring).
         tick_writer.hold()
         start_live_tasks()
-        tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer)))
+        tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
     else:
         next_open      = _next_market_open(now)
@@ -323,12 +395,12 @@ async def run_engine(enable_trading: bool):
             )
             tick_writer.hold()
             start_live_tasks()
-            tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer)))
+            tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
         else:
             # Market is closed and not imminent — block until backfill finishes
             print("[SYSTEM] Market closed — running backfill first.", flush=True)
-            await _run_backfill_safe(ohlc, symbols)
+            await _run_backfill_safe(ohlc, symbols, backfill_lock)
             print("[SYSTEM] Backfill complete — waiting for market to open.", flush=True)
 
             ws_start     = next_open - timedelta(seconds=30)
@@ -355,7 +427,7 @@ async def run_engine(enable_trading: bool):
                 # whatever landed in PG since backfill finished.
                 tick_writer.hold()
                 start_live_tasks()
-                tasks.append(asyncio.create_task(_catchup_and_release(ohlc, symbols, tick_writer)))
+                tasks.append(asyncio.create_task(_catchup_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
     await stop_event.wait()
 
