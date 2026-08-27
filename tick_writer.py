@@ -411,17 +411,35 @@ class SQLiteTickWriter:
     # Reads (used by BackfillManager to know where to resume a catch-up fetch)
     # ─────────────────────────────────────────────
 
-    def max_ts(self, symbol: str, kind: str = "quote"):
+    def open_read_connection(self):
+        """Open a connection suitable for passing as conn= to max_ts()/
+        read_ticks() across repeated calls (e.g. a per-symbol loop).
+        Caller owns it and must close it when done. Mirrors
+        PostgresTickWriter.open_read_connection() so backend-agnostic
+        callers like BackfillManager don't need to know which backend
+        is active."""
+        return sqlite3.connect(self._db_path(), timeout=5)
+
+    def max_ts(self, symbol: str, kind: str = "quote", conn=None):
         """Most recent ts_ms already cached for symbol in quote_<symbol>
         (or depth_<symbol> if kind='depth'), or None. Opens its own
-        short-lived read connection — infrequent, off the hot path, so
-        no need to share the writer thread's connection."""
+        short-lived read connection by default — infrequent, off the
+        hot path, so no need to share the writer thread's connection.
+        A local sqlite3.connect() is cheap (no network round-trip), so
+        this doesn't need the same per-call-cost fix as
+        PostgresTickWriter.max_ts() — the conn= param exists purely so
+        callers that don't know which backend they're talking to (e.g.
+        BackfillManager's Phase 1 loop) can pass one uniformly; a
+        caller-supplied conn is reused and left open, otherwise a
+        fresh one is opened and closed here as before."""
         path = self._db_path()
         if not os.path.exists(path):
             return None
         table = self.table_name(symbol, kind)
+        own_conn = conn is None
         try:
-            conn = sqlite3.connect(path, timeout=5)
+            if own_conn:
+                conn = sqlite3.connect(path, timeout=5)
             try:
                 exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -430,13 +448,49 @@ class SQLiteTickWriter:
                     return None
                 row = conn.execute(f"SELECT MAX(ts_ms) FROM {table}").fetchone()
             finally:
-                conn.close()
+                if own_conn:
+                    conn.close()
             return int(row[0]) if row and row[0] is not None else None
         except Exception as exc:
             print(f"[TICK_WRITER][WARN] max_ts({symbol}) failed: {exc}", flush=True)
             return None
 
-    def read_ticks(self, symbol: str, start_ms: int = None, end_ms: int = None, kind: str = "quote"):
+    def max_ts_batch(self, symbols: list, kind: str = "quote", conn=None) -> dict:
+        """Batched version of max_ts() for interface parity with
+        PostgresTickWriter.max_ts_batch(). SQLite has no per-call
+        network round-trip to save, so this is just a loop over
+        max_ts() reusing conn if given — the batching win is entirely
+        on the Postgres side; this exists so BackfillManager's Phase 1
+        loop can call the same method name regardless of backend."""
+        own_conn = conn is None
+        if own_conn:
+            conn = self.open_read_connection()
+        try:
+            return {s: self.max_ts(s, kind=kind, conn=conn) for s in symbols}
+        finally:
+            if own_conn:
+                conn.close()
+
+    def read_ticks_batch(self, symbol_ranges: dict, kind: str = "quote", conn=None) -> dict:
+        """Batched version of read_ticks() for interface parity with
+        PostgresTickWriter.read_ticks_batch(). symbol_ranges:
+        {symbol: (start_ms, end_ms)}. SQLite has no network round-trip
+        to save, so this is just a loop reusing conn — exists purely so
+        BackfillManager's Phase 1 loop can call one method name
+        regardless of backend."""
+        own_conn = conn is None
+        if own_conn:
+            conn = self.open_read_connection()
+        try:
+            return {
+                s: self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, conn=conn)
+                for s, (start_ms, end_ms) in symbol_ranges.items()
+            }
+        finally:
+            if own_conn:
+                conn.close()
+
+    def read_ticks(self, symbol: str, start_ms: int = None, end_ms: int = None, kind: str = "quote", conn=None):
         """
         Read back cached rows for symbol from quote_<symbol> (or
         depth_<symbol> if kind='depth'), optionally bounded by
@@ -450,7 +504,12 @@ class SQLiteTickWriter:
         (flat buy0_price/buy0_qty/.../sell4_orders, same names as the
         PG source table) for kind='depth'. Empty list if the table
         doesn't exist or nothing matches. Opens its own short-lived
-        read connection — not on the hot write path.
+        read connection by default — not on the hot write path, and a
+        local sqlite3.connect() has no network cost, so this doesn't
+        need PostgresTickWriter's per-call fix. conn= exists purely
+        for interface parity with PostgresTickWriter.read_ticks() so
+        backend-agnostic callers can pass one uniformly; if given, it's
+        reused and left open instead of opened/closed here.
         """
         path = self._db_path()
         if not os.path.exists(path):
@@ -470,8 +529,10 @@ class SQLiteTickWriter:
             params.append(int(end_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
+        own_conn = conn is None
         try:
-            conn = sqlite3.connect(path, timeout=5)
+            if own_conn:
+                conn = sqlite3.connect(path, timeout=5)
             try:
                 exists = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -483,7 +544,8 @@ class SQLiteTickWriter:
                     params,
                 ).fetchall()
             finally:
-                conn.close()
+                if own_conn:
+                    conn.close()
             out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty"])
             return [dict(zip(out_cols, r)) for r in rows]
         except Exception as exc:
@@ -1319,6 +1381,14 @@ class PostgresTickWriter:
     # defense-in-depth, not the primary fix.
     WRITER_POOL_SIZE = 9        # overridable via PG_LOCAL_WRITER_THREADS
 
+    # Statement timeout (ms) applied to open_read_connection()'s
+    # connection — see that method's docstring. This connection is only
+    # used for background cache-check queries (max_ts_batch/
+    # read_ticks_batch), never anything latency-sensitive, so it's set
+    # generously rather than inheriting a tight server-side default
+    # meant for normal query traffic.
+    _BACKGROUND_STATEMENT_TIMEOUT_MS = 120_000
+
     def __init__(self):
         self._params = auto_setup()
 
@@ -1617,11 +1687,20 @@ class PostgresTickWriter:
         backfill tables" section for why these are physically separate."""
         return f"{kind}_{_safe_symbol(symbol)}_{source}"
 
-    def read_ticks(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote", source: str = "backfill"):
+    def read_ticks(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote",
+                    source: str = "backfill", conn=None):
         """Same return shape as TickWriter.read_ticks(): list of dicts,
         {"timestamp","ltp","qty"} for quote, {"timestamp","ltp",
         <DEPTH_LEVEL_COLUMNS...>} for depth. source defaults to
-        "backfill" — see class docstring."""
+        "backfill" — see class docstring.
+
+        conn: optional pre-opened psycopg2 connection to reuse instead
+        of opening a fresh one. Callers making many calls back-to-back
+        (e.g. a per-symbol cache-check loop) should open one connection
+        up front and pass it in here to avoid paying TCP/auth setup
+        cost per call — see max_ts() below, same pattern. When conn is
+        passed in, this method never closes it; that's the caller's
+        responsibility."""
         table = self.table_name(symbol, kind, source)
         if kind == "depth":
             select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
@@ -1637,8 +1716,10 @@ class PostgresTickWriter:
             params.append(int(end_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
+        own_conn = conn is None
         try:
-            conn = psycopg2.connect(**self._params)
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
             try:
                 cur = conn.cursor()
                 cur.execute(
@@ -1649,11 +1730,29 @@ class PostgresTickWriter:
                 cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}{where} ORDER BY ts_ms", params)
                 rows = cur.fetchall()
             finally:
-                conn.close()
+                if own_conn:
+                    conn.close()
             out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty"])
             return [dict(zip(out_cols, r)) for r in rows]
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] read_ticks({symbol}) failed: {exc}", flush=True)
+            if conn is not None and not own_conn:
+                # This is a shared connection the caller will keep using
+                # (e.g. read_ticks_batch's bisection base case) — this
+                # whole call is read-only, so a full rollback can't lose
+                # any committed work, and it's required here: without
+                # it, the failed statement leaves the connection's
+                # transaction "aborted", and EVERY later query on it —
+                # including just creating a SAVEPOINT for an unrelated
+                # sibling chunk — fails too, cascading a single genuine
+                # timeout into a total batch failure. Confirmed in
+                # testing: one slow/large table's query timing out here
+                # otherwise took down every other symbol's result in
+                # the same read_ticks_batch() call.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             return []
 
     def read_ticks_combined(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote"):
@@ -1667,10 +1766,47 @@ class PostgresTickWriter:
         backfill = self.read_ticks(symbol, start_ms, end_ms, kind, source="backfill")
         return sorted(live + backfill, key=lambda r: r["timestamp"])
 
-    def max_ts(self, symbol: str, kind: str = "quote", source: str = "backfill"):
-        table = self.table_name(symbol, kind, source)
+    def open_read_connection(self):
+        """Open a connection suitable for passing as conn= to max_ts()/
+        read_ticks() across repeated calls (e.g. a per-symbol loop),
+        so the caller pays the TCP-handshake-plus-auth cost once
+        instead of once per call. Caller owns it and must close it
+        when done.
+
+        Sets a generous statement_timeout on this connection —
+        read_ticks_batch()'s UNION ALL queries can legitimately scan a
+        lot of data across many symbols/tables at once, and this
+        connection is only ever used for background cache-check work
+        (never anything user-facing), so there's no reason to inherit
+        whatever tight server-side default statement_timeout is
+        configured for normal query traffic. Without this, a batch
+        query that's merely SLOW (not actually stuck) gets cancelled by
+        Postgres, which used to trigger a fallback to per-symbol
+        queries for the whole chunk — recreating the exact per-symbol
+        slowdown this batching was meant to fix."""
+        conn = psycopg2.connect(**self._params)
         try:
-            conn = psycopg2.connect(**self._params)
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._BACKGROUND_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] could not raise statement_timeout on read connection: {exc}", flush=True)
+        return conn
+
+    def max_ts(self, symbol: str, kind: str = "quote", source: str = "backfill", conn=None):
+        """conn: optional pre-opened psycopg2 connection to reuse. Without
+        it, every call pays a fresh TCP handshake + Postgres auth
+        negotiation — fine for one-off calls, but ruinous in a tight
+        per-symbol loop (e.g. BackfillManager's Phase 1 cache-check,
+        which calls this once per symbol for ~199 symbols). Callers
+        doing that should open one connection up front, pass it in
+        here on every iteration, and close it themselves once the loop
+        is done. When conn is passed in, this method never closes it."""
+        table = self.table_name(symbol, kind, source)
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
             try:
                 cur = conn.cursor()
                 cur.execute(
@@ -1682,10 +1818,296 @@ class PostgresTickWriter:
                 row = cur.fetchone()
                 return row[0] if row else None
             finally:
-                conn.close()
+                if own_conn:
+                    conn.close()
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+            if conn is not None and not own_conn:
+                # Same reasoning as read_ticks()'s except block — a
+                # shared connection must be rolled back on failure or
+                # every later query on it (even in unrelated chunks)
+                # fails too. Read-only call, so nothing is lost.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             return None
+
+    def max_ts_batch(self, symbols: list, kind: str = "quote", source: str = "backfill", conn=None) -> dict:
+        """Batched version of max_ts() for a whole symbol list — returns
+        {symbol: last_ts_ms_or_None}.
+
+        max_ts() called once per symbol in a Python loop still costs one
+        network round-trip per call even with a shared connection (199
+        round-trips for 199 symbols, each a real TCP send/recv even on
+        localhost). This does it in ~2 round-trips total regardless of
+        symbol count:
+
+          1. One "which of these tables exist" query using
+             tablename = ANY(%s) instead of 199 single-table checks.
+          2. One UNION ALL query — one `SELECT %s AS symbol,
+             MAX(ts_ms) AS max_ts FROM {table}` branch per EXISTING
+             table — executed as a single statement, chunked at
+             _BATCH_CHUNK_SIZE branches per query to keep individual
+             statements from growing unreasonably large with very big
+             symbol lists.
+
+        Table names are still interpolated directly (table_name() /
+        _safe_symbol() restrict to alnum+underscore already, same as
+        every other method here); the symbol label in each branch is
+        passed as a %s parameter, not interpolated, so it can't affect
+        the query even if a symbol ever contained unexpected characters.
+
+        ── One bad table must not blank out everyone else ──────────────
+        If ANY branch in a UNION ALL chunk fails (e.g. one symbol's
+        table has a corrupt/mismatched column type), Postgres aborts
+        the WHOLE transaction on that connection — every later query on
+        that same connection then fails too with "current transaction
+        is aborted" until a rollback happens. Since this method is
+        called with one shared connection reused across the whole
+        cache-check loop, a single broken symbol could otherwise poison
+        every OTHER symbol's result for the rest of the run (verified:
+        one corrupt table among 20 healthy ones made all 20 come back
+        as "no cached data", not just the bad one) — BackfillManager
+        would then think it needs to re-fetch everything for symbols
+        that were actually fine, and depending on timing that can leave
+        a symbol's live feed running before its backfill has caught up.
+
+        Each chunk therefore runs inside its own SAVEPOINT: if the
+        chunk's UNION ALL fails, we roll back to the savepoint (which
+        un-poisons the connection without needing a new one) and retry
+        that chunk's symbols ONE AT A TIME via max_ts(), so only the
+        genuinely broken symbol(s) get logged as failed — every healthy
+        symbol in that chunk still gets its real answer.
+        """
+        if not symbols:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
+        result = {s: None for s in symbols}
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                # Step 1: which tables actually exist — one round-trip.
+                # Wrapped in its own savepoint too: it's low-risk (just
+                # reading pg_tables, not touching per-symbol table
+                # content) but costs nothing to protect the same way.
+                cur.execute("SAVEPOINT sp_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_exist_check")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                # Step 2: one UNION ALL query per chunk for MAX(ts_ms)
+                # across every existing table, each chunk isolated by
+                # its own savepoint so a bad table in one chunk can't
+                # affect other chunks OR other symbols in the same chunk.
+                _BATCH_CHUNK_SIZE = 150
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches = []
+                    params = []
+                    for s in chunk:
+                        branches.append(f"SELECT %s AS symbol, MAX(ts_ms) AS max_ts FROM {table_by_symbol[s]}")
+                        params.append(s)
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_batch_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, max_ts in cur.fetchall():
+                            result[sym] = max_ts
+                        cur.execute("RELEASE SAVEPOINT sp_batch_chunk")
+                    except Exception as exc:
+                        # Un-poison the connection first, THEN fall back
+                        # — falling back without this rollback is what
+                        # made every symbol in the chunk look empty.
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_batch_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] max_ts_batch chunk failed ({exc}); "
+                            f"falling back to per-symbol checks for this chunk ({len(chunk)} symbols) "
+                            f"so only the actually-broken symbol(s) are affected",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            result[s] = self.max_ts(s, kind=kind, source=source, conn=conn)
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] max_ts_batch failed: {exc}", flush=True)
+            # Last-resort fallback if something broke before/outside the
+            # per-chunk handling above (e.g. the connection itself is
+            # bad) — a fresh connection per symbol here since the shared
+            # one may be unusable.
+            for s in symbols:
+                if result[s] is None:
+                    result[s] = self.max_ts(s, kind=kind, source=source, conn=None)
+        return result
+
+    def _read_ticks_chunk_with_bisection(self, cur, chunk, table_by_symbol, symbol_ranges,
+                                          select_cols_sql, out_cols, result, conn, depth=0):
+        """Try one UNION ALL chunk; on failure (including a statement
+        timeout — a chunk that's just SLOW, not necessarily broken),
+        split it in half and retry each half instead of immediately
+        collapsing to a full per-symbol loop for the WHOLE chunk.
+
+        Why this matters: falling all the way back to N individual
+        queries for a merely-slow-but-otherwise-fine chunk recreates
+        exactly the per-symbol round-trip cost this batching exists to
+        avoid — confirmed in production, where a 150-symbol chunk hit
+        statement_timeout and the resulting per-symbol fallback caused
+        the same live-queue-overflow this whole change was meant to
+        fix. Bisecting means only the genuinely problematic symbol(s)
+        (if any — timeouts are often just "this much data takes this
+        long", not a broken table) end up paying the per-symbol cost;
+        everything else in the chunk still benefits from batching at a
+        smaller size.
+
+        Bottoms out at per-symbol reads once a "chunk" is down to a
+        single symbol — that's the only case truly equivalent to the
+        old fully-unbatched behavior, and only for whichever symbol(s)
+        actually need it.
+        """
+        if len(chunk) == 1:
+            s = chunk[0]
+            start_ms, end_ms = symbol_ranges[s]
+            result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, conn=conn)
+            return
+
+        branches, params = [], []
+        for s in chunk:
+            start_ms, end_ms = symbol_ranges[s]
+            branches.append(
+                f"SELECT %s AS symbol, {select_cols_sql} FROM {table_by_symbol[s]} "
+                f"WHERE ts_ms >= %s AND ts_ms <= %s"
+            )
+            params.extend([s, int(start_ms), int(end_ms)])
+        query = " UNION ALL ".join(branches) + " ORDER BY symbol, ts_ms"
+
+        savepoint = f"sp_rt_chunk_{depth}_{len(chunk)}"
+        cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cur.execute(query, params)
+            for row in cur.fetchall():
+                sym = row[0]
+                result[sym].append(dict(zip(out_cols, row[1:])))
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            mid = len(chunk) // 2
+            print(
+                f"[PG_LOCAL_WRITER][WARN] read_ticks_batch chunk of {len(chunk)} symbol(s) "
+                f"failed ({exc}); bisecting into {mid} + {len(chunk) - mid} and retrying "
+                f"rather than falling back to {len(chunk)} individual queries",
+                flush=True,
+            )
+            self._read_ticks_chunk_with_bisection(
+                cur, chunk[:mid], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn, depth + 1
+            )
+            self._read_ticks_chunk_with_bisection(
+                cur, chunk[mid:], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn, depth + 1
+            )
+
+    def read_ticks_batch(self, symbol_ranges: dict, kind: str = "quote", source: str = "backfill",
+                          conn=None) -> dict:
+        """Batched version of read_ticks() for multiple symbols at once —
+        symbol_ranges: {symbol: (start_ms, end_ms)}. Returns
+        {symbol: [row_dict, ...]} — same row shape read_ticks() returns.
+
+        This is the read_ticks() twin of max_ts_batch() above, and for
+        the same reason: a per-symbol loop calling read_ticks() for
+        ~199 symbols does ~199 real network round-trips even with a
+        shared connection — and unlike max_ts (a single MAX() scalar),
+        each read_ticks() call pulls back a symbol's FULL cached tick
+        range, so on a live system (most symbols already have cached
+        data) this is actually the heavier of the two per-symbol costs,
+        not max_ts. Collapses to ~2 round-trips total via the same
+        two-step pattern: one existence check with tablename = ANY(%s),
+        then one UNION ALL per chunk — each branch tagged with its own
+        symbol as a bound %s parameter so results can be split back out
+        per symbol after fetching.
+
+        Same savepoint-per-chunk isolation as max_ts_batch(): one bad
+        table can't blank out every other symbol's results — see that
+        method's docstring for the full explanation of why that
+        matters when reusing one shared connection.
+        """
+        if not symbol_ranges:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbol_ranges}
+        result = {s: [] for s in symbol_ranges}
+
+        if kind == "depth":
+            select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+        else:
+            select_cols = ["ts_ms", "ltp", "qty"]
+        out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty"])
+        select_cols_sql = ", ".join(select_cols)
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_rt_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_rt_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_rt_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                # Chunk size kept smaller than max_ts_batch's — each
+                # branch here pulls back a symbol's FULL cached tick
+                # range (potentially thousands of rows), not a single
+                # scalar, so a 150-symbol chunk can be a genuinely large
+                # query. Confirmed in production: 150-symbol chunks were
+                # hitting Postgres's statement_timeout and cancelling
+                # the whole chunk.
+                _BATCH_CHUNK_SIZE = 40
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    self._read_ticks_chunk_with_bisection(
+                        cur, chunk, table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn
+                    )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] read_ticks_batch failed: {exc}", flush=True)
+            for s, (start_ms, end_ms) in symbol_ranges.items():
+                if not result[s]:
+                    result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, source=source, conn=None)
+        return result
 
     # ─────────────────────────────────────────────
     # Writer thread internals — every method below takes an explicit

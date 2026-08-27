@@ -157,6 +157,14 @@ class BackfillManager:
         # is actually present (crash mid-write, a failed insert batch,
         # etc.) — see run()'s Phase 1 and _first_suspicious_gap_ms().
         self.gap_threshold_secs = int(os.getenv("TICK_CACHE_GAP_THRESHOLD_SECS", "180"))
+        # Populated by _fetch_ticks_batch()/_fetch_depth_batch() each run —
+        # symbols whose main-db re-fetch chunk genuinely failed (network/
+        # connection error), as opposed to symbols confirmed to have zero
+        # new rows. See run()'s phantom-row cleanup for why this
+        # distinction matters — treating a failed fetch as "confirmed
+        # empty" was deleting real cached ticks whenever the confirming
+        # re-fetch itself happened to fail.
+        self._last_fetch_failed_symbols = set()
 
         # History (fallback) DB — only connected lazily, on first gap found
         self.conn_history           = None
@@ -409,55 +417,99 @@ class BackfillManager:
         symbol_state = {}
         gap_flagged = []
         confirmed_outage_count = 0
-        for i, inst in enumerate(symbols, start=1):
-            symbol  = inst["symbol"]
-            last_ms = self.tick_writer.max_ts(symbol) if self.tick_writer is not None else None
 
-            cached_df       = pd.DataFrame()
-            cached_until_ms = None
-            phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
+        # Three levels of batching now, all aimed at the same 199-symbol
+        # loop:
+        #  1. One connection reused for the whole loop instead of a
+        #     fresh psycopg2.connect() per symbol.
+        #  2. max_ts_batch() replaces 199 sequential single-symbol
+        #     round-trips with ~2 round-trips total.
+        #  3. read_ticks_batch() does the same for the full-tick-range
+        #     read that used to happen per-symbol via _cached_ticks_df()
+        #     for every symbol that already has cached data — on a live
+        #     system that's most/all symbols, and each of those reads
+        #     pulls back a symbol's WHOLE cached range (not just a
+        #     scalar like max_ts), making this the heavier of the two
+        #     per-symbol costs in practice. Confirmed via live logs:
+        #     even after (2), Phase 1 was still crawling through
+        #     "17/199, 20/199, 27/199..." one slow symbol at a time
+        #     while the live queue overflowed — this was why.
+        cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
+        try:
+            all_symbol_names = [inst["symbol"] for inst in symbols]
+            last_ms_by_symbol = (
+                self.tick_writer.max_ts_batch(all_symbol_names, conn=cache_check_conn)
+                if self.tick_writer is not None else {}
+            )
 
-            if last_ms is not None and last_ms >= start_ms:
-                cached_df = self._cached_ticks_df(symbol, start_ms, last_ms)
-                gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
-
-                if gap_ms is not None:
-                    gap_flagged.append(symbol)
-                    tail_df = cached_df[cached_df["timestamp"] > gap_ms]
-                    phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
-                    phantom_range = (gap_ms + 1, last_ms)
-
-                    if quote_outage_windows:
-                        from gap_detector import gap_matches_outage
-                        gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
-                        gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
-                        if gap_matches_outage(gap_start_dt, gap_end_dt, quote_outage_windows):
-                            confirmed_outage_count += 1
-
-                    # Trusted portion stays; the tail (after the gap)
-                    # is dropped from what we treat as cached here so
-                    # it gets re-fetched below — the row itself is
-                    # NOT deleted from SQLite, upsert corrects it once
-                    # the re-fetch lands.
-                    cached_df = cached_df[cached_df["timestamp"] <= gap_ms].reset_index(drop=True)
-                    cached_until_ms = gap_ms if not cached_df.empty else None
-                else:
-                    cached_until_ms = last_ms
-
-            fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
-
-            symbol_state[symbol] = {
-                "cached_df": cached_df,
-                "cached_until_ms": cached_until_ms,
-                "phantom_range": phantom_range,
-                "phantom_local_ts": phantom_local_ts if phantom_range else None,
-                "fetch_start": (
-                    datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
-                    if fetch_start_ms < now_ms else None
-                ),
+            # Every symbol with cached data covering [start_ms, last_ms]
+            # needs its full tick range read for gap detection — fetch
+            # ALL of them in one batched call instead of one per symbol.
+            ranges_needed = {
+                s: (start_ms, last_ms_by_symbol[s])
+                for s in all_symbol_names
+                if last_ms_by_symbol.get(s) is not None and last_ms_by_symbol[s] >= start_ms
             }
+            cached_rows_by_symbol = (
+                self.tick_writer.read_ticks_batch(ranges_needed, conn=cache_check_conn)
+                if self.tick_writer is not None and ranges_needed else {}
+            )
 
-            self._progress("Checking local tick cache", i, len(symbols))
+            for i, inst in enumerate(symbols, start=1):
+                symbol  = inst["symbol"]
+                last_ms = last_ms_by_symbol.get(symbol)
+
+                cached_df       = pd.DataFrame()
+                cached_until_ms = None
+                phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
+
+                if last_ms is not None and last_ms >= start_ms:
+                    cached_df = self._ticks_rows_to_df(cached_rows_by_symbol.get(symbol, []))
+                    gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
+
+                    if gap_ms is not None:
+                        gap_flagged.append(symbol)
+                        tail_df = cached_df[cached_df["timestamp"] > gap_ms]
+                        phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
+                        phantom_range = (gap_ms + 1, last_ms)
+
+                        if quote_outage_windows:
+                            from gap_detector import gap_matches_outage
+                            gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
+                            gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                            if gap_matches_outage(gap_start_dt, gap_end_dt, quote_outage_windows):
+                                confirmed_outage_count += 1
+
+                        # Trusted portion stays; the tail (after the gap)
+                        # is dropped from what we treat as cached here so
+                        # it gets re-fetched below — the row itself is
+                        # NOT deleted from SQLite, upsert corrects it once
+                        # the re-fetch lands.
+                        cached_df = cached_df[cached_df["timestamp"] <= gap_ms].reset_index(drop=True)
+                        cached_until_ms = gap_ms if not cached_df.empty else None
+                    else:
+                        cached_until_ms = last_ms
+
+                fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
+
+                symbol_state[symbol] = {
+                    "cached_df": cached_df,
+                    "cached_until_ms": cached_until_ms,
+                    "phantom_range": phantom_range,
+                    "phantom_local_ts": phantom_local_ts if phantom_range else None,
+                    "fetch_start": (
+                        datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+                        if fetch_start_ms < now_ms else None
+                    ),
+                }
+
+                self._progress("Checking local tick cache", i, len(symbols))
+        finally:
+            if cache_check_conn is not None:
+                try:
+                    cache_check_conn.close()
+                except Exception as exc:
+                    print(f"[BACKFILL][WARN] closing cache-check connection failed: {exc}", flush=True)
 
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
@@ -574,21 +626,41 @@ class BackfillManager:
             phantom_range    = state.get("phantom_range")
             phantom_local_ts = state.get("phantom_local_ts")
             if phantom_range and phantom_local_ts:
-                if not fresh_df.empty:
+                if symbol in self._last_fetch_failed_symbols:
+                    # The confirming re-fetch for this symbol never
+                    # actually reached main db this run (chunk failed) —
+                    # we have NO information about whether these
+                    # timestamps are real or not, so we must NOT delete
+                    # them. They stay in the local table exactly as
+                    # before; cached_df already excludes them from
+                    # ticks_df above, so nothing untrusted gets used
+                    # either. Phase 1 will re-detect the same suspicious
+                    # gap next run and try the confirming fetch again —
+                    # this only resolves once that fetch actually
+                    # succeeds.
+                    pass
+                elif not fresh_df.empty:
                     in_range = fresh_df[
                         (fresh_df["timestamp"] >= phantom_range[0])
                         & (fresh_df["timestamp"] <= phantom_range[1])
                     ]
                     pg_confirmed_ts = set(int(t) for t in in_range["timestamp"])
+                    phantom_ts = phantom_local_ts - pg_confirmed_ts
+                    if phantom_ts:
+                        total_phantom_rows += len(phantom_ts)
+                        phantom_symbols.add(symbol)
+                        # wait=False — fire-and-forget, same reasoning as
+                        # the other tick_writer calls in this loop.
+                        self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
                 else:
-                    pg_confirmed_ts = set()
-
-                phantom_ts = phantom_local_ts - pg_confirmed_ts
-                if phantom_ts:
+                    # fresh_df IS genuinely empty here — the fetch
+                    # succeeded (symbol not in failed set) and main db
+                    # confirmed zero rows in phantom_range, so every
+                    # locally-cached phantom timestamp really is fake.
+                    # Safe to delete all of them.
+                    phantom_ts = phantom_local_ts
                     total_phantom_rows += len(phantom_ts)
                     phantom_symbols.add(symbol)
-                    # wait=False — fire-and-forget, same reasoning as
-                    # the other tick_writer calls in this loop.
                     self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
 
             if cached_df.empty and fresh_df.empty and state["fetch_start"] is not None:
@@ -780,44 +852,72 @@ class BackfillManager:
         gap_flagged = []
         confirmed_outage_count = 0
 
-        for i, inst in enumerate(symbols, start=1):
-            symbol  = inst["symbol"]
-            last_ms = self.tick_writer.max_ts(symbol, kind="depth")
+        # Same fix as Phase 1's quote cache-check loop above: reuse one
+        # connection, batch max_ts lookups via max_ts_batch(), AND batch
+        # the full-range cache reads via read_ticks_batch() instead of
+        # one round-trip per symbol for each.
+        depth_cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
+        try:
+            all_symbol_names = [inst["symbol"] for inst in symbols]
+            last_ms_by_symbol = (
+                self.tick_writer.max_ts_batch(all_symbol_names, kind="depth", conn=depth_cache_check_conn)
+                if self.tick_writer is not None else {}
+            )
 
-            cached_until_ms = None
-            phantom_range   = None
-            phantom_local_ts = None
-
-            if last_ms is not None and last_ms >= start_ms:
-                cached_df = self._cached_depth_df(symbol, start_ms, last_ms)
-                gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
-
-                if gap_ms is not None:
-                    gap_flagged.append(symbol)
-                    tail_df = cached_df[cached_df["timestamp"] > gap_ms]
-                    phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
-                    phantom_range = (gap_ms + 1, last_ms)
-
-                    if depth_outage_windows:
-                        from gap_detector import gap_matches_outage
-                        gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
-                        gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
-                        if gap_matches_outage(gap_start_dt, gap_end_dt, depth_outage_windows):
-                            confirmed_outage_count += 1
-
-                    cached_until_ms = gap_ms
-                else:
-                    cached_until_ms = last_ms
-
-            fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
-            depth_state[symbol] = {
-                "phantom_range": phantom_range,
-                "phantom_local_ts": phantom_local_ts,
+            ranges_needed = {
+                s: (start_ms, last_ms_by_symbol[s])
+                for s in all_symbol_names
+                if last_ms_by_symbol.get(s) is not None and last_ms_by_symbol[s] >= start_ms
             }
-            if fetch_start_ms < now_ms:
-                fetch_starts[symbol] = datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+            cached_rows_by_symbol = (
+                self.tick_writer.read_ticks_batch(ranges_needed, kind="depth", conn=depth_cache_check_conn)
+                if self.tick_writer is not None and ranges_needed else {}
+            )
 
-            self._progress("Checking local depth cache", i, len(symbols))
+            for i, inst in enumerate(symbols, start=1):
+                symbol  = inst["symbol"]
+                last_ms = last_ms_by_symbol.get(symbol)
+
+                cached_until_ms = None
+                phantom_range   = None
+                phantom_local_ts = None
+
+                if last_ms is not None and last_ms >= start_ms:
+                    cached_df = self._depth_rows_to_df(cached_rows_by_symbol.get(symbol, []))
+                    gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
+
+                    if gap_ms is not None:
+                        gap_flagged.append(symbol)
+                        tail_df = cached_df[cached_df["timestamp"] > gap_ms]
+                        phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
+                        phantom_range = (gap_ms + 1, last_ms)
+
+                        if depth_outage_windows:
+                            from gap_detector import gap_matches_outage
+                            gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
+                            gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                            if gap_matches_outage(gap_start_dt, gap_end_dt, depth_outage_windows):
+                                confirmed_outage_count += 1
+
+                        cached_until_ms = gap_ms
+                    else:
+                        cached_until_ms = last_ms
+
+                fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
+                depth_state[symbol] = {
+                    "phantom_range": phantom_range,
+                    "phantom_local_ts": phantom_local_ts,
+                }
+                if fetch_start_ms < now_ms:
+                    fetch_starts[symbol] = datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+
+                self._progress("Checking local depth cache", i, len(symbols))
+        finally:
+            if depth_cache_check_conn is not None:
+                try:
+                    depth_cache_check_conn.close()
+                except Exception as exc:
+                    print(f"[BACKFILL][WARN] closing depth cache-check connection failed: {exc}", flush=True)
 
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
@@ -851,6 +951,13 @@ class BackfillManager:
             phantom_range    = state.get("phantom_range")
             phantom_local_ts = state.get("phantom_local_ts")
             if not (phantom_range and phantom_local_ts):
+                continue
+
+            if symbol in self._last_fetch_failed_symbols:
+                # Same reasoning as the quote-phase phantom check above:
+                # the confirming re-fetch for this symbol never actually
+                # reached main db this run, so we have no basis to
+                # delete anything — leave it for next run to retry.
                 continue
 
             fetched_ts = fetched.get(symbol, set())
@@ -1002,26 +1109,48 @@ class BackfillManager:
     # Per-symbol aggregation (Phase 3) — pure pandas, no DB
     # ─────────────────────────────────────────────
 
-    def _cached_ticks_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    def _ticks_rows_to_df(self, rows: list) -> pd.DataFrame:
+        """Shape a raw read_ticks()-style row list into the DataFrame
+        _cached_ticks_df() used to build directly — factored out so the
+        batched read_ticks_batch() path (which already has the rows
+        fetched) can build the same shape without a redundant DB call."""
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty"])
+        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+        return df
+
+    def _depth_rows_to_df(self, rows: list) -> pd.DataFrame:
+        """Same as _ticks_rows_to_df but for depth rows (timestamp/ltp
+        only — gap detection doesn't need the flat level columns)."""
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame([{"timestamp": r["timestamp"], "ltp": r.get("ltp")} for r in rows])
+        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+        return df
+
+    def _cached_ticks_df(self, symbol: str, start_ms: int, end_ms: int, conn=None) -> pd.DataFrame:
         """
         Read symbol's already-cached quote ticks back out of ticks.db
         (TickWriter) for [start_ms, end_ms], shaped into the same
         columns _fetch_ticks_batch()'s output uses (timestamp, ltp,
         qty, ist_ts) so it can be concatenated directly with freshly
         fetched rows before aggregation.
+
+        conn: optional pre-opened connection to pass through to
+        tick_writer.read_ticks() — see Phase 1's cache-check loop,
+        which opens one connection for the whole loop instead of one
+        per symbol. Prefer read_ticks_batch() + _ticks_rows_to_df() for
+        multiple symbols at once — this single-symbol path still does
+        one full network round-trip per call.
         """
         if self.tick_writer is None:
             return pd.DataFrame()
 
-        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="quote")
-        if not rows:
-            return pd.DataFrame()
+        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="quote", conn=conn)
+        return self._ticks_rows_to_df(rows)
 
-        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty"])
-        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-        return df
-
-    def _cached_depth_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    def _cached_depth_df(self, symbol: str, start_ms: int, end_ms: int, conn=None) -> pd.DataFrame:
         """
         Same idea as _cached_ticks_df but for the local depth_<symbol>
         SQLite cache — used by the Depth backfill pass purely for gap
@@ -1029,17 +1158,17 @@ class BackfillManager:
         level columns come back from read_ticks() too but aren't
         needed here, so they're dropped immediately rather than kept
         around in this DataFrame.
+
+        conn: optional pre-opened connection, passed through to
+        tick_writer.read_ticks() — see Phase D1's cache-check loop.
+        Prefer read_ticks_batch() + _depth_rows_to_df() for multiple
+        symbols at once.
         """
         if self.tick_writer is None:
             return pd.DataFrame()
 
-        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="depth")
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame([{"timestamp": r["timestamp"], "ltp": r.get("ltp")} for r in rows])
-        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-        return df
+        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="depth", conn=conn)
+        return self._depth_rows_to_df(rows)
 
     def _cached_history_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """
@@ -1383,8 +1512,20 @@ class BackfillManager:
         one UNION ALL query covering every symbol by default
         (BACKFILL_BATCH_SIZE=0), instead of one round trip per symbol.
         This is the main lever: ~200 symbols → 1 query instead of ~200.
+
+        Also sets self._last_fetch_failed_symbols to the set of symbols
+        whose chunk genuinely failed to query main db this call (network
+        drop, connection error, etc.) — as opposed to symbols that were
+        successfully queried and confirmed to have zero new rows. The
+        caller (run()'s phantom-row cleanup) needs this distinction: a
+        symbol simply absent from the returned dict is ambiguous between
+        "confirmed empty" and "we never got an answer", and treating a
+        failed fetch as confirmed-empty was deleting real cached ticks
+        whenever the confirming re-fetch itself happened to fail — see
+        run()'s phantom-cleanup block for the full explanation.
         """
         out = {}
+        self._last_fetch_failed_symbols = set()
         if self.conn is None or not fetch_starts:
             return out
 
@@ -1451,18 +1592,24 @@ class BackfillManager:
                             raise psycopg2.OperationalError("reconnect failed")
                     except Exception as exc2:
                         batch_symbols = [s for s, _ in chunk]
+                        self._last_fetch_failed_symbols.update(batch_symbols)
                         print(
                             f"[BACKFILL][ERROR] batched tick fetch failed again after "
                             f"reconnect for a chunk of {len(batch_symbols)} symbol(s) "
-                            f"(starting {batch_symbols[0]}): {exc2}",
+                            f"(starting {batch_symbols[0]}) — these symbols' phantom-row "
+                            f"cleanup (if any) will be SKIPPED this run rather than "
+                            f"treated as confirmed-empty: {exc2}",
                             flush=True,
                         )
                         continue
                 else:
                     batch_symbols = [s for s, _ in chunk]
+                    self._last_fetch_failed_symbols.update(batch_symbols)
                     print(
                         f"[BACKFILL][ERROR] batched tick fetch failed for a chunk of "
-                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}): {exc}",
+                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}) — "
+                        f"these symbols' phantom-row cleanup (if any) will be SKIPPED "
+                        f"this run rather than treated as confirmed-empty: {exc}",
                         flush=True,
                     )
                     try:
@@ -1556,8 +1703,13 @@ class BackfillManager:
         each chunk is processed, then allowed to go out of scope
         immediately rather than being retained in this function's
         return value.
+        Also sets self._last_fetch_failed_symbols the same way
+        _fetch_ticks_batch does — see that method's docstring and
+        run()'s phantom-row cleanup for why this distinction (confirmed
+        empty vs. never actually asked) matters.
         """
         out = {}
+        self._last_fetch_failed_symbols = set()
         if self.conn is None or not fetch_starts:
             return out
 
@@ -1625,18 +1777,24 @@ class BackfillManager:
                             raise psycopg2.OperationalError("reconnect failed")
                     except Exception as exc2:
                         batch_symbols = [s for s, _ in chunk]
+                        self._last_fetch_failed_symbols.update(batch_symbols)
                         print(
                             f"[BACKFILL][ERROR] batched depth fetch failed again after "
                             f"reconnect for a chunk of {len(batch_symbols)} symbol(s) "
-                            f"(starting {batch_symbols[0]}): {exc2}",
+                            f"(starting {batch_symbols[0]}) — these symbols' phantom-row "
+                            f"cleanup (if any) will be SKIPPED this run rather than "
+                            f"treated as confirmed-empty: {exc2}",
                             flush=True,
                         )
                         continue
                 else:
                     batch_symbols = [s for s, _ in chunk]
+                    self._last_fetch_failed_symbols.update(batch_symbols)
                     print(
                         f"[BACKFILL][ERROR] batched depth fetch failed for a chunk of "
-                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}): {exc}",
+                        f"{len(batch_symbols)} symbol(s) (starting {batch_symbols[0]}) — "
+                        f"these symbols' phantom-row cleanup (if any) will be SKIPPED "
+                        f"this run rather than treated as confirmed-empty: {exc}",
                         flush=True,
                     )
                     try:
