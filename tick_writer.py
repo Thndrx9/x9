@@ -69,6 +69,43 @@ DEPTH_LEVEL_COLUMNS = tuple(
     for field in ("price", "qty", "orders")
 )
 
+# quote_<symbol> extra columns — everything PostgreSQL's quote_<symbol>
+# table has beyond the original (ts_ms, ltp, qty) trio backfill_manager.py
+# used to select. Kept as ADDITIONAL columns rather than replacing
+# ts_ms/ltp/qty so every existing reader (gap detection, RAM seeding,
+# candle building — all of which key off ltp/qty by name) keeps working
+# unchanged; this just widens what also gets written/read alongside them.
+# Name-for-name match with the PG source table (see backfill_manager.py's
+# BackfillManager docstring: "timestamp BIGINT, ingest_ns BIGINT, ltp
+# DOUBLE PRECISION, ltt BIGINT, volume BIGINT, open/high/low/close DOUBLE
+# PRECISION, last_quantity BIGINT, oi BIGINT, upper_circuit/lower_circuit
+# DOUBLE PRECISION").
+QUOTE_EXTRA_COLUMNS = (
+    "ingest_ns", "ltt", "volume", "open", "high", "low", "close",
+    "last_quantity", "oi", "upper_circuit", "lower_circuit",
+)
+
+# SQLite/Postgres column type for each QUOTE_EXTRA_COLUMNS entry, in the
+# same order — BIGINT-ish fields as INTEGER, everything else as
+# REAL/DOUBLE PRECISION.
+_QUOTE_EXTRA_INT_COLUMNS = {"ingest_ns", "ltt", "volume", "last_quantity", "oi"}
+
+# Exact column set/order for PostgresTickWriter's LOCAL quote_<symbol>
+# table specifically — column-for-column identical to the source AWS
+# Postgres quote_<symbol> table (timestamp, ingest_ns, ltp, ltt, volume,
+# open, high, low, close, last_quantity, oi, upper_circuit,
+# lower_circuit). No "id" primary key, no "ts_ms"/"qty" aliases, nothing
+# extra — deliberately NOT a superset the way SQLiteTickWriter's schema
+# is (see QUOTE_EXTRA_COLUMNS above), per explicit request that the
+# local Postgres cache mirror the source table exactly. "qty" is still
+# derived on READ (from last_quantity) so existing consumers that expect
+# a "qty" key from read_ticks() keep working unchanged — that's an
+# application-level dict key, not a stored column.
+PG_LOCAL_QUOTE_COLUMNS = (
+    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "open", "high",
+    "low", "close", "last_quantity", "oi", "upper_circuit", "lower_circuit",
+)
+
 
 def _flatten_depth_levels(levels, side):
     """levels: list of up to 5 {"price","quantity"/"qty","orders"} dicts
@@ -90,7 +127,11 @@ class SQLiteTickWriter:
     """
     SQLite-backed tick writer — dedicated background thread, one DB
     file per base_dir. Two tables PER SYMBOL:
-        quote_<symbol>  (ts_ms, ltp, qty)
+        quote_<symbol>  (ts_ms, ltp, qty, ingest_ns, ltt, volume, open,
+                          high, low, close, last_quantity, oi,
+                          upper_circuit, lower_circuit) — full column
+                          parity with PostgreSQL's quote_<symbol> layout
+                          (see QUOTE_EXTRA_COLUMNS)
         depth_<symbol>  (ts_ms, ltp, buy0_price, buy0_qty, buy0_orders, ...,
                           sell4_price, sell4_qty, sell4_orders) — flat
                           columns matching PostgreSQL's depth_<symbol>
@@ -822,12 +863,17 @@ class SQLiteTickWriter:
                 )
             """)
         else:
+            extra_cols_sql = ",\n                    ".join(
+                f"{c} {'INTEGER' if c in _QUOTE_EXTRA_INT_COLUMNS else 'REAL'}"
+                for c in QUOTE_EXTRA_COLUMNS
+            )
             conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {table} (
                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
                     ts_ms    INTEGER NOT NULL,
                     ltp      REAL,
-                    qty      REAL
+                    qty      REAL,
+                    {extra_cols_sql}
                 )
             """)
         # On a brand-new/empty ticks.db, defer this table's index until
@@ -1024,7 +1070,10 @@ class SQLiteTickWriter:
                     + tuple(flat[c] for c in DEPTH_LEVEL_COLUMNS)
                 )
             else:
-                bucket[1].append((int(ts_ms), snapshot.get("ltp"), snapshot.get("qty")))
+                bucket[1].append(
+                    (int(ts_ms), snapshot.get("ltp"), snapshot.get("qty"))
+                    + tuple(snapshot.get(c) for c in QUOTE_EXTRA_COLUMNS)
+                )
 
         n = 0
         for table, (kind, rows) in rows_by_table.items():
@@ -1053,7 +1102,10 @@ class SQLiteTickWriter:
                 ts_ms = r.get("timestamp")
                 if ts_ms is None:
                     continue
-                rows.append((int(ts_ms), r.get("ltp"), r.get("qty")))
+                rows.append(
+                    (int(ts_ms), r.get("ltp"), r.get("qty"))
+                    + tuple(r.get(c) for c in QUOTE_EXTRA_COLUMNS)
+                )
         self._ensure_table(conn, table, kind)
         return self._insert(conn, table, kind, rows)
 
@@ -1076,8 +1128,8 @@ class SQLiteTickWriter:
             cols = "ts_ms, ltp, " + ", ".join(DEPTH_LEVEL_COLUMNS)
             placeholders = ", ".join("?" * (2 + len(DEPTH_LEVEL_COLUMNS)))
         else:
-            cols = "ts_ms, ltp, qty"
-            placeholders = "?, ?, ?"
+            cols = "ts_ms, ltp, qty, " + ", ".join(QUOTE_EXTRA_COLUMNS)
+            placeholders = ", ".join("?" * (3 + len(QUOTE_EXTRA_COLUMNS)))
         sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
         try:
             for start in range(0, len(rows), self.INSERT_PAGE_SIZE):
@@ -1702,17 +1754,18 @@ class PostgresTickWriter:
         passed in, this method never closes it; that's the caller's
         responsibility."""
         table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
         if kind == "depth":
             select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
         else:
-            select_cols = ["ts_ms", "ltp", "qty"]
+            select_cols = list(PG_LOCAL_QUOTE_COLUMNS)
 
         clauses, params = [], []
         if start_ms is not None:
-            clauses.append("ts_ms >= %s")
+            clauses.append(f"{time_col} >= %s")
             params.append(int(start_ms))
         if end_ms is not None:
-            clauses.append("ts_ms <= %s")
+            clauses.append(f"{time_col} <= %s")
             params.append(int(end_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
@@ -1727,13 +1780,25 @@ class PostgresTickWriter:
                 )
                 if not cur.fetchone():
                     return []
-                cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}{where} ORDER BY ts_ms", params)
+                cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}{where} ORDER BY {time_col}", params)
                 rows = cur.fetchall()
             finally:
                 if own_conn:
                     conn.close()
-            out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty"])
-            return [dict(zip(out_cols, r)) for r in rows]
+            if kind == "depth":
+                out_cols = ["timestamp", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+                return [dict(zip(out_cols, r)) for r in rows]
+            # Column names already match desired output keys 1:1 (see
+            # PG_LOCAL_QUOTE_COLUMNS) — just add a derived "qty" key
+            # (from last_quantity) for backward compatibility with
+            # every existing consumer that expects one, since "qty" is
+            # no longer a stored column in this backend's quote table.
+            out = []
+            for r in rows:
+                d = dict(zip(PG_LOCAL_QUOTE_COLUMNS, r))
+                d["qty"] = d["last_quantity"] if d.get("last_quantity") is not None else 0
+                out.append(d)
+            return out
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] read_ticks({symbol}) failed: {exc}", flush=True)
             if conn is not None and not own_conn:
@@ -1803,6 +1868,7 @@ class PostgresTickWriter:
         here on every iteration, and close it themselves once the loop
         is done. When conn is passed in, this method never closes it."""
         table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
         own_conn = conn is None
         try:
             if own_conn:
@@ -1814,7 +1880,7 @@ class PostgresTickWriter:
                 )
                 if not cur.fetchone():
                     return None
-                cur.execute(f"SELECT MAX(ts_ms) FROM {table}")
+                cur.execute(f"SELECT MAX({time_col}) FROM {table}")
                 row = cur.fetchone()
                 return row[0] if row else None
             finally:
@@ -1885,6 +1951,7 @@ class PostgresTickWriter:
 
         table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
         result = {s: None for s in symbols}
+        time_col = self._time_col(kind)
 
         own_conn = conn is None
         try:
@@ -1924,7 +1991,7 @@ class PostgresTickWriter:
                     branches = []
                     params = []
                     for s in chunk:
-                        branches.append(f"SELECT %s AS symbol, MAX(ts_ms) AS max_ts FROM {table_by_symbol[s]}")
+                        branches.append(f"SELECT %s AS symbol, MAX({time_col}) AS max_ts FROM {table_by_symbol[s]}")
                         params.append(s)
                     query = " UNION ALL ".join(branches)
 
@@ -1962,7 +2029,8 @@ class PostgresTickWriter:
         return result
 
     def _read_ticks_chunk_with_bisection(self, cur, chunk, table_by_symbol, symbol_ranges,
-                                          select_cols_sql, out_cols, result, conn, depth=0):
+                                          select_cols_sql, out_cols, result, conn, time_col="ts_ms",
+                                          kind="quote", source="backfill", depth=0):
         """Try one UNION ALL chunk; on failure (including a statement
         timeout — a chunk that's just SLOW, not necessarily broken),
         split it in half and retry each half instead of immediately
@@ -1988,7 +2056,7 @@ class PostgresTickWriter:
         if len(chunk) == 1:
             s = chunk[0]
             start_ms, end_ms = symbol_ranges[s]
-            result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, conn=conn)
+            result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, source=source, conn=conn)
             return
 
         branches, params = [], []
@@ -1996,10 +2064,10 @@ class PostgresTickWriter:
             start_ms, end_ms = symbol_ranges[s]
             branches.append(
                 f"SELECT %s AS symbol, {select_cols_sql} FROM {table_by_symbol[s]} "
-                f"WHERE ts_ms >= %s AND ts_ms <= %s"
+                f"WHERE {time_col} >= %s AND {time_col} <= %s"
             )
             params.extend([s, int(start_ms), int(end_ms)])
-        query = " UNION ALL ".join(branches) + " ORDER BY symbol, ts_ms"
+        query = " UNION ALL ".join(branches) + f" ORDER BY symbol, {time_col}"
 
         savepoint = f"sp_rt_chunk_{depth}_{len(chunk)}"
         cur.execute(f"SAVEPOINT {savepoint}")
@@ -2019,10 +2087,12 @@ class PostgresTickWriter:
                 flush=True,
             )
             self._read_ticks_chunk_with_bisection(
-                cur, chunk[:mid], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn, depth + 1
+                cur, chunk[:mid], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                time_col, kind, source, depth + 1
             )
             self._read_ticks_chunk_with_bisection(
-                cur, chunk[mid:], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn, depth + 1
+                cur, chunk[mid:], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                time_col, kind, source, depth + 1
             )
 
     def read_ticks_batch(self, symbol_ranges: dict, kind: str = "quote", source: str = "backfill",
@@ -2054,12 +2124,14 @@ class PostgresTickWriter:
 
         table_by_symbol = {s: self.table_name(s, kind, source) for s in symbol_ranges}
         result = {s: [] for s in symbol_ranges}
+        time_col = self._time_col(kind)
 
         if kind == "depth":
             select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+            out_cols    = ["timestamp", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
         else:
-            select_cols = ["ts_ms", "ltp", "qty"]
-        out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty"])
+            select_cols = list(PG_LOCAL_QUOTE_COLUMNS)
+            out_cols    = list(PG_LOCAL_QUOTE_COLUMNS)
         select_cols_sql = ", ".join(select_cols)
 
         own_conn = conn is None
@@ -2097,7 +2169,8 @@ class PostgresTickWriter:
                 for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
                     chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
                     self._read_ticks_chunk_with_bisection(
-                        cur, chunk, table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn
+                        cur, chunk, table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                        time_col=time_col, kind=kind, source=source,
                     )
             finally:
                 if own_conn:
@@ -2107,6 +2180,18 @@ class PostgresTickWriter:
             for s, (start_ms, end_ms) in symbol_ranges.items():
                 if not result[s]:
                     result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, source=source, conn=None)
+
+        # The UNION ALL fast path above returns raw stored columns
+        # (bypassing read_ticks()'s per-row dict building), so — same
+        # as read_ticks() — derive "qty" from last_quantity here too,
+        # for every quote row that came back that way. Rows that fell
+        # back to read_ticks() (bisection base case, or the top-level
+        # except above) already have "qty" set.
+        if kind != "depth":
+            for rows in result.values():
+                for d in rows:
+                    if "qty" not in d:
+                        d["qty"] = d["last_quantity"] if d.get("last_quantity") is not None else 0
         return result
 
     # ─────────────────────────────────────────────
@@ -2122,6 +2207,16 @@ class PostgresTickWriter:
         conn = psycopg2.connect(**self._params)
         conn.autocommit = False
         return conn
+
+    @staticmethod
+    def _time_col(kind: str) -> str:
+        """Column name holding the per-row timestamp: "timestamp" for
+        quote (exact match with the source Postgres schema — see
+        PG_LOCAL_QUOTE_COLUMNS), "ts_ms" for depth (unchanged local
+        naming, since depth wasn't part of the "match the source
+        exactly" request — its local schema already matches the source
+        depth_<symbol> table's flat level columns name-for-name)."""
+        return "ts_ms" if kind == "depth" else "timestamp"
 
     def _ensure_table(self, conn, table: str, kind: str, state: dict):
         if table in state["known_tables"]:
@@ -2145,12 +2240,17 @@ class PostgresTickWriter:
                 )
             """)
         else:
+            # Exact column-for-column match with the source AWS Postgres
+            # quote_<symbol> table (see PG_LOCAL_QUOTE_COLUMNS) — no id,
+            # no ts_ms/qty aliases, nothing extra.
+            extra_col_defs_sql = ",\n                ".join(
+                f"{c} {'BIGINT' if c in _QUOTE_EXTRA_INT_COLUMNS else 'DOUBLE PRECISION'}"
+                for c in PG_LOCAL_QUOTE_COLUMNS[1:]  # everything but "timestamp" itself
+            )
             cur.execute(f"""
                 CREATE UNLOGGED TABLE IF NOT EXISTS {table} (
-                    id    BIGSERIAL PRIMARY KEY,
-                    ts_ms BIGINT NOT NULL,
-                    ltp   DOUBLE PRECISION,
-                    qty   DOUBLE PRECISION
+                    timestamp BIGINT NOT NULL,
+                    {extra_col_defs_sql}
                 )
             """)
 
@@ -2158,7 +2258,7 @@ class PostgresTickWriter:
             with self._pending_index_lock:
                 self._pending_index_tables.add(table)
         else:
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}(ts_ms)")
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}({self._time_col(kind)})")
         conn.commit()
         state["known_tables"].add(table)
 
@@ -2170,7 +2270,12 @@ class PostgresTickWriter:
             return
         cur = conn.cursor()
         for table in tables:
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}(ts_ms)")
+            # kind isn't tracked alongside pending table names, so infer
+            # it from the table-name prefix (table_name() always builds
+            # names as "{kind}_{symbol}_{source}") to pick the right
+            # timestamp column — "ts_ms" for depth, "timestamp" for quote.
+            time_col = "ts_ms" if table.startswith("depth_") else "timestamp"
+            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}({time_col})")
         conn.commit()
 
     def _insert(self, conn, table, kind, rows) -> int:
@@ -2179,7 +2284,7 @@ class PostgresTickWriter:
         if kind == "depth":
             cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
         else:
-            cols = ["ts_ms", "ltp", "qty"]
+            cols = list(PG_LOCAL_QUOTE_COLUMNS)
         sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
         try:
             cur = conn.cursor()
@@ -2205,7 +2310,10 @@ class PostgresTickWriter:
                 flat.update(_flatten_depth_levels(snapshot.get("asks", []), "sell"))
                 bucket[1].append((int(ts_ms), snapshot.get("ltp")) + tuple(flat[c] for c in DEPTH_LEVEL_COLUMNS))
             else:
-                bucket[1].append((int(ts_ms), snapshot.get("ltp"), snapshot.get("qty")))
+                bucket[1].append(tuple(
+                    int(ts_ms) if col == "timestamp" else snapshot.get(col)
+                    for col in PG_LOCAL_QUOTE_COLUMNS
+                ))
 
         n = 0
         for table, (kind, rows) in rows_by_table.items():
@@ -2227,20 +2335,24 @@ class PostgresTickWriter:
                 ts_ms = r.get("timestamp")
                 if ts_ms is None:
                     continue
-                rows.append((int(ts_ms), r.get("ltp"), r.get("qty")))
+                rows.append(tuple(
+                    int(ts_ms) if col == "timestamp" else r.get(col)
+                    for col in PG_LOCAL_QUOTE_COLUMNS
+                ))
         self._ensure_table(conn, table, kind, state)
         return self._insert(conn, table, kind, rows)
 
     def _delete_range(self, conn, symbol, start_ms, end_ms, kind, source):
         table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
         if not cur.fetchone():
             return
         if end_ms is not None:
-            cur.execute(f"DELETE FROM {table} WHERE ts_ms >= %s AND ts_ms <= %s", (start_ms, end_ms))
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} >= %s AND {time_col} <= %s", (start_ms, end_ms))
         else:
-            cur.execute(f"DELETE FROM {table} WHERE ts_ms >= %s", (start_ms,))
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} >= %s", (start_ms,))
         n = cur.rowcount
         conn.commit()
         if n:
@@ -2248,6 +2360,7 @@ class PostgresTickWriter:
 
     def _delete_timestamps(self, conn, symbol, timestamps, kind, source):
         table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
         if not cur.fetchone():
@@ -2256,7 +2369,7 @@ class PostgresTickWriter:
         page_size = 1000
         for start in range(0, len(timestamps), page_size):
             page = timestamps[start:start + page_size]
-            cur.execute(f"DELETE FROM {table} WHERE ts_ms = ANY(%s)", (page,))
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} = ANY(%s)", (page,))
             total += cur.rowcount
         conn.commit()
         if total:
@@ -2274,7 +2387,11 @@ class PostgresTickWriter:
         tables = [r[0] for r in cur.fetchall()]
         total_deleted, affected = 0, 0
         for table in tables:
-            cur.execute(f"DELETE FROM {table} WHERE ts_ms < %s", (cutoff_ms,))
+            # quote_<symbol> now uses "timestamp" as its time column
+            # (exact match with the source schema); depth_<symbol>
+            # still uses "ts_ms" — see _time_col()'s docstring.
+            time_col = "ts_ms" if table.startswith("depth_") else "timestamp"
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} < %s", (cutoff_ms,))
             if cur.rowcount:
                 total_deleted += cur.rowcount
                 affected += 1

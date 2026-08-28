@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 from market_time import tz_kolkata, MARKET_OPEN
@@ -484,11 +485,34 @@ class OHLCCollector:
                 ticks.popleft()
 
         # ── Local SQLite tick cache (kind='quote') ─────────────────────
+        # Captures every field PostgreSQL's quote_<symbol> table has
+        # (see tick_writer.QUOTE_EXTRA_COLUMNS), not just ltp/qty, so
+        # nothing the broker feed sends is thrown away before it ever
+        # reaches disk. ingest_ns is stamped here (arrival time at this
+        # process), same role as pg_writer's ingest_ns upstream. The
+        # broker payload's exact key names for volume/oi/circuit limits
+        # weren't confirmed against a live feed when this was written —
+        # each field below tries the most likely key name(s) and falls
+        # back to None rather than raising, so an unrecognized field
+        # just stores NULL instead of breaking ingestion. If a column
+        # comes back consistently NULL, check what key OpenAlgo is
+        # actually sending for it and adjust the .get() call below.
         if self.tick_writer is not None:
             self.tick_writer.enqueue_live(symbol, "quote", {
-                "timestamp": data["ltt"],
-                "ltp":       ltp,
-                "qty":       data.get("last_trade_quantity", 0),
+                "timestamp":      data["ltt"],
+                "ltp":            ltp,
+                "qty":            data.get("last_trade_quantity", 0),
+                "ingest_ns":      time.time_ns(),
+                "ltt":            data.get("ltt"),
+                "volume":         data.get("volume"),
+                "open":           data.get("open"),
+                "high":           data.get("high"),
+                "low":            data.get("low"),
+                "close":          data.get("close"),
+                "last_quantity":  data.get("last_trade_quantity", data.get("last_quantity")),
+                "oi":             data.get("oi"),
+                "upper_circuit":  data.get("upper_circuit", data.get("upper_circuit_limit")),
+                "lower_circuit":  data.get("lower_circuit", data.get("lower_circuit_limit")),
             })
 
         # ── Update every configured TF directly from this tick ────────
