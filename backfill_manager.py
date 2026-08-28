@@ -10,7 +10,7 @@ from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
 from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata, is_market_open
-from tick_writer import DEPTH_LEVEL_COLUMNS
+from tick_writer import DEPTH_LEVEL_COLUMNS, QUOTE_EXTRA_COLUMNS
 from gap_detector import (
     GapDetector,
     is_market_hours_weekday_vectorized,
@@ -18,6 +18,13 @@ from gap_detector import (
 from tick_gap_detector import TickGapDetector
 
 load_dotenv()
+
+# Comma-joined QUOTE_EXTRA_COLUMNS for inline use inside f-string SQL —
+# these are the extra quote_<symbol> columns beyond timestamp/ltp/qty
+# (see tick_writer.QUOTE_EXTRA_COLUMNS docstring for the full list and
+# why they're additive rather than replacing the original three).
+_QUOTE_EXTRA_SELECT_COLS = ", ".join(QUOTE_EXTRA_COLUMNS)
+_QUOTE_FULL_DF_COLUMNS = ["symbol", "timestamp", "ltp", "qty"] + list(QUOTE_EXTRA_COLUMNS)
 
 # Minutes in one full trading session (9:15 → 15:30)
 SESSION_MINUTES = 375
@@ -1472,7 +1479,8 @@ class BackfillManager:
                 start_ms = int(start_ts.timestamp() * 1000)
                 clauses.append(
                     f"SELECT %s AS symbol, timestamp, ltp, "
-                    f"COALESCE(last_quantity, 0) AS qty FROM {table} "
+                    f"COALESCE(last_quantity, 0) AS qty, "
+                    f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
                     f"WHERE timestamp >= %s AND ltp IS NOT NULL"
                 )
                 params.extend([symbol, start_ms])
@@ -1548,7 +1556,7 @@ class BackfillManager:
             if not rows:
                 continue
 
-            df = pd.DataFrame(rows, columns=["symbol", "timestamp", "ltp", "qty"])
+            df = pd.DataFrame(rows, columns=_QUOTE_FULL_DF_COLUMNS)
             df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
 
             # Keep only market-hours rows on weekdays — same filter the old
@@ -1569,10 +1577,17 @@ class BackfillManager:
                 # store too. `g` is already ascending by timestamp (the
                 # query is ORDER BY symbol, timestamp), so this is a
                 # single ordered block — see tick_writer.py's ordering
-                # guarantee docstring for why that matters.
+                # guarantee docstring for why that matters. Every column
+                # PG has (not just timestamp/ltp/qty) rides along so the
+                # local cache is a full mirror, not a stripped-down copy.
                 if self.tick_writer is not None:
                     rows = [
-                        {"timestamp": int(row.timestamp), "ltp": row.ltp, "qty": row.qty}
+                        {
+                            "timestamp": int(row.timestamp),
+                            "ltp": row.ltp,
+                            "qty": row.qty,
+                            **{c: getattr(row, c) for c in QUOTE_EXTRA_COLUMNS},
+                        }
                         for row in g.itertuples(index=False)
                     ]
                     self.tick_writer.enqueue_backfill_rows(symbol, rows)
