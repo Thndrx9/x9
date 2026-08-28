@@ -10,6 +10,11 @@ import asyncio
 import threading
 from collections import deque
 from parquet_writer import ParquetWriter
+from gap_detector import (
+    compute_bucket,
+    compute_bucket_vectorized,
+    is_at_or_after_market_open_vectorized,
+)
 
 # 9:15:00 in seconds from midnight
 MARKET_OPEN_SECS = MARKET_OPEN.hour * 3600 + MARKET_OPEN.minute * 60  # 33300
@@ -231,6 +236,133 @@ class OHLCCollector:
                 store[symbol] = merged
 
         self.parquet_writer.enqueue_bulk(symbol, timeframe, candles_df)
+
+    # ─────────────────────────────────────────────
+    # Batch candle building — for BackfillManager's historical passes.
+    # (Separate from _process_tick(), which handles ONE live tick at a
+    # time; these work over a whole fetched DataFrame at once and use
+    # gap_detector's vectorized bucket math instead of a per-row loop.)
+    # ─────────────────────────────────────────────
+
+    def aggregate_ticks_to_candles(
+        self,
+        df:         pd.DataFrame,
+        tf_seconds: int,
+        now:        datetime,
+    ) -> pd.DataFrame:
+        """
+        Group ticks into OHLC candles using market-open-aligned buckets.
+        Excludes the currently-forming candle (bucket == current_bucket).
+        """
+        df = df.copy()
+
+        if df.empty or "ist_ts" not in df.columns:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+
+        # Vectorized — was previously a per-row .apply(compute_bucket), which
+        # is a pure-Python loop over every tick and dominated wall time
+        # (measured ~2.5s per 130k-tick symbol per timeframe; with 199
+        # symbols x 2 TFs that adds up to several minutes). This does the
+        # same bucket math as numpy array ops instead of a scalar function
+        # call per row. See compute_bucket_vectorized()'s docstring in
+        # gap_detector.py for the equivalence guarantee with compute_bucket().
+        df["bucket"] = compute_bucket_vectorized(df["ist_ts"], tf_seconds)
+
+        # Drop any tick that landed before market open (bucket would be 9:15:00
+        # even for pre-market ticks — filter them by comparing raw ist_ts).
+        # Vectorized (int64 seconds-of-day) instead of .dt.time — see
+        # is_at_or_after_market_open_vectorized()'s docstring in
+        # gap_detector.py; this was the dominant cost (~86%) of this method.
+        df = df[is_at_or_after_market_open_vectorized(df["ist_ts"])]
+
+        # Exclude the currently-forming (incomplete) candle
+        current_bucket = compute_bucket(now, tf_seconds)
+        df = df[df["bucket"] < current_bucket]
+
+        if df.empty:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+
+        grouped = (
+            df.groupby("bucket", sort=True)
+            .agg(
+                open   = ("ltp", "first"),
+                high   = ("ltp", "max"),
+                low    = ("ltp", "min"),
+                close  = ("ltp", "last"),
+                volume = ("qty", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"bucket": "timestamp"})
+        )
+
+        return grouped.reset_index(drop=True)
+
+    def build_symbol_candles(self, ticks_df, history_df, start_ts, now, timeframes, history_native_tf, gaps):
+        """
+        For every configured TF: build candles giving priority to
+        history-db data (history_df — already this symbol's full
+        lookback-window's worth of history-db candles, local-cache rows
+        plus freshly fetched ones, stitched together by BackfillManager)
+        over tick-aggregated ones:
+
+          - history_native_tf itself (default "1m"): a history-db
+            candle wins on any bucket collision; tick-aggregated candles
+            at that TF only fill buckets history_df doesn't cover.
+          - every OTHER (higher) TF: ALWAYS derived first by rolling up
+            the merged 1m base above via gaps.derive_from_1m(), across
+            every expected bucket for that TF — not just ones missing —
+            so a history-backed 1m sequence produces the higher-TF
+            candle even where raw-tick aggregation at that TF would
+            also have produced one. Only a bucket whose full run of 1m
+            sub-candles isn't available in the merged base falls back
+            to tick-aggregated-at-that-TF instead.
+
+        No DB calls in here — history_df/ticks_df must already be
+        fetched by the caller. `gaps` is a GapDetector (gap_detector.py)
+        instance — this method builds candles, it delegates "what's
+        missing" to gaps rather than computing that itself.
+
+        Returns per_tf: {tf_str: {"candles", "missing", "expected"}}
+        """
+        native_tf_seconds = dict(timeframes).get(history_native_tf)
+
+        # merged_1m: the history-priority 1m base every higher TF derives
+        # from. history_df wins on collision; tick-aggregated 1m fills in
+        # what history_df doesn't have. If history_native_tf isn't itself
+        # a configured display TF, history_df alone still serves as the
+        # roll-up base (nothing to merge it against).
+        merged_1m = None
+        if native_tf_seconds is not None:
+            tick_native = self.aggregate_ticks_to_candles(ticks_df, native_tf_seconds, now)
+            merged_1m = (
+                gaps.merge_candles(history_df, tick_native)
+                if history_df is not None and not history_df.empty
+                else tick_native
+            )
+        elif history_df is not None and not history_df.empty:
+            merged_1m = history_df
+
+        per_tf = {}
+        for tf_str, tf_seconds in timeframes:
+            expected = gaps.expected_buckets(start_ts, now, tf_seconds)
+
+            if tf_str == history_native_tf:
+                candles = merged_1m if merged_1m is not None else self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+            elif tf_seconds > 60 and merged_1m is not None and not merged_1m.empty:
+                derived     = gaps.derive_from_1m(merged_1m, expected, tf_seconds)
+                tick_direct = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+                candles     = gaps.merge_candles(derived, tick_direct)
+            else:
+                candles = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+
+            missing = gaps.find_missing(candles, expected)
+            per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
+
+        return per_tf
 
     def _retention_secs(self, tf_seconds: int) -> int:
         """max(flat RAM window, enough seconds for MIN_CANDLES) for this TF."""

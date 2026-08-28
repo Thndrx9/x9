@@ -13,11 +13,9 @@ from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, n
 from tick_writer import DEPTH_LEVEL_COLUMNS
 from gap_detector import (
     GapDetector,
-    compute_bucket,
-    compute_bucket_vectorized,
-    is_at_or_after_market_open_vectorized,
     is_market_hours_weekday_vectorized,
 )
+from tick_gap_detector import TickGapDetector
 
 load_dotenv()
 
@@ -61,6 +59,18 @@ class BackfillManager:
     Delegates all "what's missing" / "roll up 1m into higher TF" logic
     to GapDetector (gap_detector.py) — this class has no bucket math of
     its own beyond what it needs to run SQL queries.
+
+    Delegates all silent same-session tick-cache gap detection (is a
+    cached range's high-water mark actually trustworthy, or does it
+    hide a hole?) to TickGapDetector (tick_gap_detector.py). This
+    class only fetches from Postgres and reads/writes the local
+    SQLite tick cache — TickGapDetector tells it which cached ranges
+    are missing/untrusted and need re-fetching.
+
+    Delegates all candle building (raw tick→OHLC aggregation, and the
+    history-priority merge across timeframes) to OHLCCollector
+    (ohlc.py) — this class hands it whatever ticks_df/history_df it
+    fetched and gets candles back; it does no bucket-grouping itself.
 
     Schema (main db, confirmed against pg_writer.py's _QUOTE_COLUMN_DEFS —
     typed columns, NOT JSONB):
@@ -148,6 +158,11 @@ class BackfillManager:
         self.timeframes  = self._load_timeframes()   # [(tf_str, tf_seconds), ...]
         self.conn        = self._connect()
         self.gaps        = GapDetector()
+        # Tick-cache gap detection (silent same-session holes in
+        # already-cached ticks/depth) — see tick_gap_detector.py.
+        # BackfillManager only fetches from Postgres/reads the local
+        # cache; this is what tells it a range is actually missing.
+        self.tick_gaps   = TickGapDetector()
         self.batch_size  = int(os.getenv("BACKFILL_BATCH_SIZE", "0"))  # 0 = no chunking, all symbols in one query
 
         # How large a same-session silent gap in cached ticks (ticks.db)
@@ -155,7 +170,7 @@ class BackfillManager:
         # onward and re-fetch from the main db instead. max_ts() is only
         # a high-water mark — it doesn't guarantee everything before it
         # is actually present (crash mid-write, a failed insert batch,
-        # etc.) — see run()'s Phase 1 and _first_suspicious_gap_ms().
+        # etc.) — see run()'s Phase 1 and TickGapDetector.find_cache_gap().
         self.gap_threshold_secs = int(os.getenv("TICK_CACHE_GAP_THRESHOLD_SECS", "180"))
         # Populated by _fetch_ticks_batch()/_fetch_depth_batch() each run —
         # symbols whose main-db re-fetch chunk genuinely failed (network/
@@ -392,7 +407,7 @@ class BackfillManager:
         # a high-water mark — it doesn't guarantee everything before it
         # is actually present (a crash mid-write, a failed insert
         # batch, etc. can leave a silent hole earlier in the range).
-        # _first_suspicious_gap_ms() checks for same-session silent
+        # TickGapDetector.find_cache_gap() checks for same-session silent
         # gaps larger than gap_threshold_secs (overnight/weekend/
         # holiday gaps between sessions are expected and never
         # flagged). If one's found, everything from just after it
@@ -465,28 +480,25 @@ class BackfillManager:
 
                 if last_ms is not None and last_ms >= start_ms:
                     cached_df = self._ticks_rows_to_df(cached_rows_by_symbol.get(symbol, []))
-                    gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
+                    gap_result = self.tick_gaps.find_cache_gap(
+                        cached_df, last_ms, self.gap_threshold_secs, quote_outage_windows
+                    )
 
-                    if gap_ms is not None:
+                    if gap_result["gap_ms"] is not None:
                         gap_flagged.append(symbol)
-                        tail_df = cached_df[cached_df["timestamp"] > gap_ms]
-                        phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
-                        phantom_range = (gap_ms + 1, last_ms)
+                        phantom_local_ts = gap_result["phantom_local_ts"]
+                        phantom_range = gap_result["phantom_range"]
 
-                        if quote_outage_windows:
-                            from gap_detector import gap_matches_outage
-                            gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
-                            gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
-                            if gap_matches_outage(gap_start_dt, gap_end_dt, quote_outage_windows):
-                                confirmed_outage_count += 1
+                        if gap_result["confirmed_outage"]:
+                            confirmed_outage_count += 1
 
                         # Trusted portion stays; the tail (after the gap)
                         # is dropped from what we treat as cached here so
                         # it gets re-fetched below — the row itself is
                         # NOT deleted from SQLite, upsert corrects it once
                         # the re-fetch lands.
-                        cached_df = cached_df[cached_df["timestamp"] <= gap_ms].reset_index(drop=True)
-                        cached_until_ms = gap_ms if not cached_df.empty else None
+                        cached_df = gap_result["trusted_df"]
+                        cached_until_ms = gap_result["cached_until_ms"]
                     else:
                         cached_until_ms = last_ms
 
@@ -884,22 +896,19 @@ class BackfillManager:
 
                 if last_ms is not None and last_ms >= start_ms:
                     cached_df = self._depth_rows_to_df(cached_rows_by_symbol.get(symbol, []))
-                    gap_ms = self._first_suspicious_gap_ms(cached_df, self.gap_threshold_secs)
+                    gap_result = self.tick_gaps.find_cache_gap(
+                        cached_df, last_ms, self.gap_threshold_secs, depth_outage_windows
+                    )
 
-                    if gap_ms is not None:
+                    if gap_result["gap_ms"] is not None:
                         gap_flagged.append(symbol)
-                        tail_df = cached_df[cached_df["timestamp"] > gap_ms]
-                        phantom_local_ts = set(int(t) for t in tail_df["timestamp"])
-                        phantom_range = (gap_ms + 1, last_ms)
+                        phantom_local_ts = gap_result["phantom_local_ts"]
+                        phantom_range = gap_result["phantom_range"]
 
-                        if depth_outage_windows:
-                            from gap_detector import gap_matches_outage
-                            gap_start_dt = datetime.fromtimestamp(gap_ms / 1000, tz=tz_kolkata)
-                            gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
-                            if gap_matches_outage(gap_start_dt, gap_end_dt, depth_outage_windows):
-                                confirmed_outage_count += 1
+                        if gap_result["confirmed_outage"]:
+                            confirmed_outage_count += 1
 
-                        cached_until_ms = gap_ms
+                        cached_until_ms = gap_result["gap_ms"]
                     else:
                         cached_until_ms = last_ms
 
@@ -1190,101 +1199,17 @@ class BackfillManager:
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
         return df
 
-    def _first_suspicious_gap_ms(self, df: pd.DataFrame, threshold_secs: int):
-        """
-        Verifies a cached tick range instead of blindly trusting
-        max_ts() as proof of completeness. Scans df (must have an
-        'ist_ts' column; sorted internally) for the first pair of
-        consecutive ticks that are:
-          - on the same calendar day, AND
-          - both within market hours (MARKET_OPEN..MARKET_CLOSE), AND
-          - more than threshold_secs apart.
-        Overnight/weekend/holiday gaps between sessions never match
-        (different day, or outside market hours) — only a genuinely
-        silent stretch *inside* a live session counts as suspicious.
-
-        Returns the ts_ms of the tick immediately before that gap (the
-        last point still safe to trust), or None if no such gap exists
-        (including when df has fewer than 2 rows).
-        """
-        if df is None or len(df) < 2:
-            return None
-
-        d = df.sort_values("timestamp").reset_index(drop=True)
-        prev_ist = d["ist_ts"].iloc[:-1].reset_index(drop=True)
-        next_ist = d["ist_ts"].iloc[1:].reset_index(drop=True)
-        prev_ms  = d["timestamp"].iloc[:-1].reset_index(drop=True)
-
-        gap_secs = (next_ist - prev_ist).dt.total_seconds()
-        same_day = prev_ist.dt.date == next_ist.dt.date
-        prev_in_hours = (prev_ist.dt.time >= MARKET_OPEN) & (prev_ist.dt.time <= MARKET_CLOSE)
-        next_in_hours = (next_ist.dt.time >= MARKET_OPEN) & (next_ist.dt.time <= MARKET_CLOSE)
-
-        suspicious = same_day & prev_in_hours & next_in_hours & (gap_secs > threshold_secs)
-        hits = prev_ms[suspicious]
-
-        return int(hits.iloc[0]) if not hits.empty else None
-
     def _aggregate_symbol_with_history(self, ticks_df, history_df, start_ts, now):
         """
-        For every configured TF: build candles giving priority to
-        history-db data (history_df — already this symbol's full
-        lookback-window's worth of history-db candles, local-cache rows
-        plus freshly fetched ones, stitched together by run()'s Phase 3)
-        over tick-aggregated ones:
-
-          - self.history_native_tf itself (default "1m"): a history-db
-            candle wins on any bucket collision; tick-aggregated candles
-            at that TF only fill buckets history_df doesn't cover.
-          - every OTHER (higher) TF: ALWAYS derived first by rolling up
-            the merged 1m base above via gaps.derive_from_1m(), across
-            every expected bucket for that TF — not just ones missing —
-            so a history-backed 1m sequence produces the higher-TF
-            candle even where raw-tick aggregation at that TF would
-            also have produced one. Only a bucket whose full run of 1m
-            sub-candles isn't available in the merged base falls back
-            to tick-aggregated-at-that-TF instead.
-
-        No DB calls in here — history_df/ticks_df were already fetched
-        in Phase 2/2h.
-
-        Returns per_tf: {tf_str: {"candles", "missing", "expected"}}
+        Thin pass-through to OHLCCollector.build_symbol_candles() —
+        candle building itself lives in ohlc.py now; this file only
+        supplies what it fetched (ticks_df/history_df) plus its own
+        config (timeframes, history_native_tf) and its GapDetector.
         """
-        native_tf_seconds = dict(self.timeframes).get(self.history_native_tf)
-
-        # merged_1m: the history-priority 1m base every higher TF derives
-        # from. history_df wins on collision; tick-aggregated 1m fills in
-        # what history_df doesn't have. If history_native_tf isn't itself
-        # a configured display TF, history_df alone still serves as the
-        # roll-up base (nothing to merge it against).
-        merged_1m = None
-        if native_tf_seconds is not None:
-            tick_native = self._aggregate(ticks_df, native_tf_seconds, now)
-            merged_1m = (
-                self.gaps.merge_candles(history_df, tick_native)
-                if history_df is not None and not history_df.empty
-                else tick_native
-            )
-        elif history_df is not None and not history_df.empty:
-            merged_1m = history_df
-
-        per_tf = {}
-        for tf_str, tf_seconds in self.timeframes:
-            expected = self.gaps.expected_buckets(start_ts, now, tf_seconds)
-
-            if tf_str == self.history_native_tf:
-                candles = merged_1m if merged_1m is not None else self._aggregate(ticks_df, tf_seconds, now)
-            elif tf_seconds > 60 and merged_1m is not None and not merged_1m.empty:
-                derived     = self.gaps.derive_from_1m(merged_1m, expected, tf_seconds)
-                tick_direct = self._aggregate(ticks_df, tf_seconds, now)
-                candles     = self.gaps.merge_candles(derived, tick_direct)
-            else:
-                candles = self._aggregate(ticks_df, tf_seconds, now)
-
-            missing = self.gaps.find_missing(candles, expected)
-            per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
-
-        return per_tf
+        return self.ohlc.build_symbol_candles(
+            ticks_df, history_df, start_ts, now,
+            self.timeframes, self.history_native_tf, self.gaps,
+        )
 
     # ─────────────────────────────────────────────
     # Per-symbol finalization (Phase 4) — save to ohlc + report
@@ -1862,63 +1787,6 @@ class BackfillManager:
     # Aggregate ticks → OHLC for one TF
     # ─────────────────────────────────────────────
 
-    def _aggregate(
-        self,
-        df:         pd.DataFrame,
-        tf_seconds: int,
-        now:        datetime,
-    ) -> pd.DataFrame:
-        """
-        Group ticks into OHLC candles using market-open-aligned buckets.
-        Excludes the currently-forming candle (bucket == current_bucket).
-        """
-        df = df.copy()
-
-        if df.empty or "ist_ts" not in df.columns:
-            return pd.DataFrame(
-                columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
-
-        # Vectorized — was previously a per-row .apply(compute_bucket), which
-        # is a pure-Python loop over every tick and dominated Phase 3's wall
-        # time (measured ~2.5s per 130k-tick symbol per timeframe; with 199
-        # symbols x 2 TFs that adds up to several minutes). This does the
-        # same bucket math as numpy array ops instead of a scalar function
-        # call per row. See compute_bucket_vectorized()'s docstring in
-        # gap_detector.py for the equivalence guarantee with compute_bucket().
-        df["bucket"] = compute_bucket_vectorized(df["ist_ts"], tf_seconds)
-
-        # Drop any tick that landed before market open (bucket would be 9:15:00
-        # even for pre-market ticks — filter them by comparing raw ist_ts).
-        # Vectorized (int64 seconds-of-day) instead of .dt.time — see
-        # is_at_or_after_market_open_vectorized()'s docstring in
-        # gap_detector.py; this was the dominant cost (~86%) of _aggregate().
-        df = df[is_at_or_after_market_open_vectorized(df["ist_ts"])]
-
-        # Exclude the currently-forming (incomplete) candle
-        current_bucket = compute_bucket(now, tf_seconds)
-        df = df[df["bucket"] < current_bucket]
-
-        if df.empty:
-            return pd.DataFrame(
-                columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
-
-        grouped = (
-            df.groupby("bucket", sort=True)
-            .agg(
-                open   = ("ltp", "first"),
-                high   = ("ltp", "max"),
-                low    = ("ltp", "min"),
-                close  = ("ltp", "last"),
-                volume = ("qty", "sum"),
-            )
-            .reset_index()
-            .rename(columns={"bucket": "timestamp"})
-        )
-
-        return grouped.reset_index(drop=True)
-
     # ─────────────────────────────────────────────
     # Fetch history-db candles for every symbol newer than what's
     # already locally cached — BATCHED. Always run now (priority
@@ -2130,15 +1998,16 @@ class BackfillManager:
                     self.ohlc.ohlc_data.get(tf_str, {}).get(symbol, [])
                 )
                 missing = self.missing_counts.get((symbol, tf_str), 0)
+                verdict = self.tick_gaps.classify_symbol_tf(count, missing, self.min_candles)
 
-                if count < self.min_candles:
+                if verdict == "insufficient":
                     print(
                         f"[BACKFILL][WARN] {symbol} {tf_str}: "
                         f"{count}/{self.min_candles} candles — insufficient",
                         flush=True,
                     )
                     all_ok = False
-                elif missing > 0:
+                elif verdict == "gap":
                     print(
                         f"[BACKFILL] ⚠️  {symbol} {tf_str}: {count} candles "
                         f"loaded, but {missing} candle(s) are DATA MISSING "
