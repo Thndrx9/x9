@@ -107,6 +107,57 @@ PG_LOCAL_QUOTE_COLUMNS = (
 )
 
 
+_PG_BIGINT_MIN = -(2 ** 63)
+_PG_BIGINT_MAX = 2 ** 63 - 1
+_bigint_warned_cols = set()  # (table_col) pairs already warned about, to avoid log spam
+
+
+def _safe_bigint(value, table: str = "?", col: str = "?"):
+    """Coerce a value bound for a BIGINT column into either a genuine
+    Python int within Postgres's int8 range, or None.
+
+    Why this exists: values reaching here started life as plain Python
+    ints/None from psycopg2 (see PG source table), but pass through a
+    shared multi-symbol pandas DataFrame in backfill_manager._fetch_ticks_batch()
+    on the way here. Pandas infers column dtype across the WHOLE merged
+    chunk (every symbol in that fetch), not per symbol — so a single
+    NULL anywhere in a BIGINT-destined column (ingest_ns/ltt/volume/
+    last_quantity/oi is enough for a NaN, one for equities where OI is
+    always NULL) silently upcasts that entire column to float64 for
+    every row/symbol in the chunk. Those numpy floats (NaN, inf, or
+    just imprecise) were previously handed straight to psycopg2 with no
+    cast, which is what produced "bigint out of range" / "cannot
+    convert NaN to integer" batch-insert failures — see this class's
+    _insert()/_flush_bulk() history. This function is the single choke
+    point that normalizes any of that back into something Postgres's
+    BIGINT columns can actually accept, instead of letting a bad column
+    quietly poison every row's insert in a chunk that includes it.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+                return None
+            value = round(value)
+        ival = int(value)
+    except (ValueError, TypeError, OverflowError):
+        ival = None
+
+    if ival is None or not (_PG_BIGINT_MIN <= ival <= _PG_BIGINT_MAX):
+        key = (table, col)
+        if key not in _bigint_warned_cols:
+            _bigint_warned_cols.add(key)
+            print(
+                f"[PG_LOCAL_WRITER][WARN] {table}.{col}: value {value!r} is not a "
+                f"valid bigint (NULL/NaN/inf/out-of-range) — storing NULL instead "
+                f"(further occurrences for this column suppressed)",
+                flush=True,
+            )
+        return None
+    return ival
+
+
 def _flatten_depth_levels(levels, side):
     """levels: list of up to 5 {"price","quantity"/"qty","orders"} dicts
     (bids or asks, best-first) as DepthStore hands them to enqueue_live().
@@ -1072,7 +1123,11 @@ class SQLiteTickWriter:
             else:
                 bucket[1].append(
                     (int(ts_ms), snapshot.get("ltp"), snapshot.get("qty"))
-                    + tuple(snapshot.get(c) for c in QUOTE_EXTRA_COLUMNS)
+                    + tuple(
+                        _safe_bigint(snapshot.get(c), table=table, col=c) if c in _QUOTE_EXTRA_INT_COLUMNS
+                        else snapshot.get(c)
+                        for c in QUOTE_EXTRA_COLUMNS
+                    )
                 )
 
         n = 0
@@ -1104,7 +1159,11 @@ class SQLiteTickWriter:
                     continue
                 rows.append(
                     (int(ts_ms), r.get("ltp"), r.get("qty"))
-                    + tuple(r.get(c) for c in QUOTE_EXTRA_COLUMNS)
+                    + tuple(
+                        _safe_bigint(r.get(c), table=table, col=c) if c in _QUOTE_EXTRA_INT_COLUMNS
+                        else r.get(c)
+                        for c in QUOTE_EXTRA_COLUMNS
+                    )
                 )
         self._ensure_table(conn, table, kind)
         return self._insert(conn, table, kind, rows)
@@ -2293,6 +2352,8 @@ class PostgresTickWriter:
             return len(rows)
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] batch insert into {table} failed: {exc}", flush=True)
+            print(f"[PG_LOCAL_WRITER][WARN] {table}: sample row from failed batch: "
+                  f"{dict(zip(cols, rows[0])) if rows else '(no rows)'}", flush=True)
             conn.rollback()
             return 0
 
@@ -2311,7 +2372,9 @@ class PostgresTickWriter:
                 bucket[1].append((int(ts_ms), snapshot.get("ltp")) + tuple(flat[c] for c in DEPTH_LEVEL_COLUMNS))
             else:
                 bucket[1].append(tuple(
-                    int(ts_ms) if col == "timestamp" else snapshot.get(col)
+                    int(ts_ms) if col == "timestamp"
+                    else _safe_bigint(snapshot.get(col), table=table, col=col) if col in _QUOTE_EXTRA_INT_COLUMNS
+                    else snapshot.get(col)
                     for col in PG_LOCAL_QUOTE_COLUMNS
                 ))
 
@@ -2336,7 +2399,9 @@ class PostgresTickWriter:
                 if ts_ms is None:
                     continue
                 rows.append(tuple(
-                    int(ts_ms) if col == "timestamp" else r.get(col)
+                    int(ts_ms) if col == "timestamp"
+                    else _safe_bigint(r.get(col), table=table, col=col) if col in _QUOTE_EXTRA_INT_COLUMNS
+                    else r.get(col)
                     for col in PG_LOCAL_QUOTE_COLUMNS
                 ))
         self._ensure_table(conn, table, kind, state)

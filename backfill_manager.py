@@ -4,6 +4,7 @@ import os
 import re
 import math
 import psycopg2
+import psycopg2.extras
 import pandas as pd
 from collections import deque
 from typing import Optional
@@ -466,63 +467,94 @@ class BackfillManager:
 
             # Every symbol with cached data covering [start_ms, last_ms]
             # needs its full tick range read for gap detection — fetch
-            # ALL of them in one batched call instead of one per symbol.
+            # them in CHUNKS (not all 199 in one call) so the raw rows
+            # for every symbol never sit fully materialized in memory
+            # at once. Without this, cached_rows_by_symbol (raw rows,
+            # ALL eligible symbols) stayed alive for the ENTIRE loop
+            # below — including after being converted into this same
+            # loop's per-symbol cached_df DataFrames — so peak memory
+            # was roughly double what symbol_state alone ends up
+            # needing. Chunking bounds "raw rows still alive" to one
+            # batch instead of every symbol. symbol_state itself still
+            # ends up holding all 199 symbols' cached_df by the end —
+            # Phase 3's candle-building (see cached_df usage below)
+            # needs every symbol's trusted history available — so this
+            # doesn't shrink the final steady-state, only the
+            # unnecessary peak while getting there.
             ranges_needed = {
                 s: (start_ms, last_ms_by_symbol[s])
                 for s in all_symbol_names
                 if last_ms_by_symbol.get(s) is not None and last_ms_by_symbol[s] >= start_ms
             }
-            cached_rows_by_symbol = (
-                self.tick_writer.read_ticks_batch(ranges_needed, conn=cache_check_conn)
-                if self.tick_writer is not None and ranges_needed else {}
-            )
 
-            for i, inst in enumerate(symbols, start=1):
-                symbol  = inst["symbol"]
-                last_ms = last_ms_by_symbol.get(symbol)
+            _PHASE1_CHUNK_SIZE = 40  # matches PostgresTickWriter.read_ticks_batch's own internal chunk size
+            i = 0
+            for chunk_start in range(0, len(symbols), _PHASE1_CHUNK_SIZE):
+                chunk_symbols = symbols[chunk_start:chunk_start + _PHASE1_CHUNK_SIZE]
 
-                cached_df       = pd.DataFrame()
-                cached_until_ms = None
-                phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
-
-                if last_ms is not None and last_ms >= start_ms:
-                    cached_df = self._ticks_rows_to_df(cached_rows_by_symbol.get(symbol, []))
-                    gap_result = self.tick_gaps.find_cache_gap(
-                        cached_df, last_ms, self.gap_threshold_secs, quote_outage_windows
-                    )
-
-                    if gap_result["gap_ms"] is not None:
-                        gap_flagged.append(symbol)
-                        phantom_local_ts = gap_result["phantom_local_ts"]
-                        phantom_range = gap_result["phantom_range"]
-
-                        if gap_result["confirmed_outage"]:
-                            confirmed_outage_count += 1
-
-                        # Trusted portion stays; the tail (after the gap)
-                        # is dropped from what we treat as cached here so
-                        # it gets re-fetched below — the row itself is
-                        # NOT deleted from SQLite, upsert corrects it once
-                        # the re-fetch lands.
-                        cached_df = gap_result["trusted_df"]
-                        cached_until_ms = gap_result["cached_until_ms"]
-                    else:
-                        cached_until_ms = last_ms
-
-                fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
-
-                symbol_state[symbol] = {
-                    "cached_df": cached_df,
-                    "cached_until_ms": cached_until_ms,
-                    "phantom_range": phantom_range,
-                    "phantom_local_ts": phantom_local_ts if phantom_range else None,
-                    "fetch_start": (
-                        datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
-                        if fetch_start_ms < now_ms else None
-                    ),
+                ranges_needed_chunk = {
+                    inst["symbol"]: ranges_needed[inst["symbol"]]
+                    for inst in chunk_symbols
+                    if inst["symbol"] in ranges_needed
                 }
+                cached_rows_chunk = (
+                    self.tick_writer.read_ticks_batch(ranges_needed_chunk, conn=cache_check_conn)
+                    if self.tick_writer is not None and ranges_needed_chunk else {}
+                )
 
-                self._progress("Checking local tick cache", i, len(symbols))
+                for inst in chunk_symbols:
+                    i += 1
+                    symbol  = inst["symbol"]
+                    last_ms = last_ms_by_symbol.get(symbol)
+
+                    cached_df       = pd.DataFrame()
+                    cached_until_ms = None
+                    phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
+
+                    if last_ms is not None and last_ms >= start_ms:
+                        cached_df = self._ticks_rows_to_df(cached_rows_chunk.get(symbol, []))
+                        gap_result = self.tick_gaps.find_cache_gap(
+                            cached_df, last_ms, self.gap_threshold_secs, quote_outage_windows
+                        )
+
+                        if gap_result["gap_ms"] is not None:
+                            gap_flagged.append(symbol)
+                            phantom_local_ts = gap_result["phantom_local_ts"]
+                            phantom_range = gap_result["phantom_range"]
+
+                            if gap_result["confirmed_outage"]:
+                                confirmed_outage_count += 1
+
+                            # Trusted portion stays; the tail (after the gap)
+                            # is dropped from what we treat as cached here so
+                            # it gets re-fetched below — the row itself is
+                            # NOT deleted from SQLite, upsert corrects it once
+                            # the re-fetch lands.
+                            cached_df = gap_result["trusted_df"]
+                            cached_until_ms = gap_result["cached_until_ms"]
+                        else:
+                            cached_until_ms = last_ms
+
+                    fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
+
+                    symbol_state[symbol] = {
+                        "cached_df": cached_df,
+                        "cached_until_ms": cached_until_ms,
+                        "phantom_range": phantom_range,
+                        "phantom_local_ts": phantom_local_ts if phantom_range else None,
+                        "fetch_start": (
+                            datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
+                            if fetch_start_ms < now_ms else None
+                        ),
+                    }
+
+                    self._progress("Checking local tick cache", i, len(symbols))
+
+                # cached_rows_chunk (this batch's raw rows) falls out of
+                # scope here and is free to be garbage-collected before
+                # the next chunk's read_ticks_batch() call — this is the
+                # whole point of chunking instead of fetching everyone
+                # up front.
         finally:
             if cache_check_conn is not None:
                 try:
@@ -612,6 +644,12 @@ class BackfillManager:
         batched_history = self._fetch_history_candles_batch(
             history_fetch_starts, history_existing_tables
         )
+
+        # ── Phase 2d: mirror market_history's daily_<symbol> tables locally ──
+        # Separate pipeline from the 1m history candles above — see
+        # fetch_daily_candles()'s docstring. Not used by candle-building
+        # (Phase 3 below); just makes daily_<symbol> queryable locally.
+        self.fetch_daily_candles(symbols)
 
         # ── Phase 3: per-symbol aggregation, history-priority (pure pandas) ──
         # Aggregate totals only — no per-symbol lines. A single progress
@@ -1971,6 +2009,183 @@ class BackfillManager:
             flush=True,
         )
         return out
+
+    # ─────────────────────────────────────────────
+    # Daily candle mirror — market_history's daily_<symbol> tables
+    # ─────────────────────────────────────────────
+
+    def _local_pg_params(self) -> dict:
+        """Connection params for the LOCAL Postgres cache — same env vars
+        as tick_writer.py's PostgresTickWriter._params (PG_LOCAL_HOST/
+        PORT/DBNAME/USER/PASSWORD). Defined here independently rather
+        than reaching into self.tick_writer, since that may be a
+        SQLiteTickWriter (or None) — daily_<symbol> is mirrored verbatim
+        as a real Postgres/JSONB table, so this always needs its own
+        direct Postgres connection regardless of which backend the tick
+        cache itself is using."""
+        return {
+            "host":            os.getenv("PG_LOCAL_HOST", "localhost"),
+            "port":            int(os.getenv("PG_LOCAL_PORT", "5432")),
+            "dbname":          os.getenv("PG_LOCAL_DBNAME", "tickcache"),
+            "user":            os.getenv("PG_LOCAL_USER", "tickcache"),
+            "password":        os.getenv("PG_LOCAL_PASSWORD", ""),
+            "connect_timeout": 10,
+        }
+
+    def fetch_daily_candles(self, symbols) -> None:
+        """
+        Mirror market_history's daily_<symbol> tables (written by
+        x9_data_fetcher's DailyCloseManager — see pg_writer.py's
+        PgWriter(table="daily", ...)) into the local Postgres cache,
+        under the EXACT SAME table name and schema as the source:
+
+            daily_<symbol> (timestamp BIGINT NOT NULL, ingest_ns BIGINT,
+                             raw_json JSONB NOT NULL)
+
+        This is a straight mirror — no schema conversion, unlike quote_/
+        depth_'s typed-column local cache (see PG_LOCAL_QUOTE_COLUMNS in
+        tick_writer.py). Nothing else in x9 reads daily_<symbol> — the
+        similarly-named "history-db candles" phase above
+        (_fetch_history_candles_batch) reads market_history's
+        quote_<symbol> tables instead, at 1m granularity; that's a
+        completely separate pipeline that happens to share the same
+        database. This method only makes daily_<symbol> queryable
+        locally — wiring it into candle-building is a separate step.
+
+        Incremental: tracks MAX(timestamp) already present in the LOCAL
+        daily_<symbol> table and only pulls newer rows from
+        market_history on each run, same "resume from last cached point"
+        convention used everywhere else in this file. A per-symbol
+        UNIQUE index on timestamp (matching the source's own
+        dedup_on_timestamp=True) makes the insert idempotent via
+        ON CONFLICT DO NOTHING, so even a re-fetched overlapping range is
+        harmless.
+        """
+        history_conn = self._get_history_conn()
+        if history_conn is None:
+            print(
+                "[BACKFILL][WARN] Daily candle fetch skipped — no history-db connection",
+                flush=True,
+            )
+            return
+
+        daily_existing = self._load_existing_tables(history_conn, prefix="daily")
+        if not daily_existing:
+            print("[BACKFILL] Daily candle fetch: no daily_ tables found in history db", flush=True)
+            return
+
+        try:
+            local_conn = psycopg2.connect(**self._local_pg_params())
+            local_conn.autocommit = False
+        except Exception as exc:
+            print(
+                f"[BACKFILL][ERROR] Daily candle fetch: local cache connection failed: {exc}",
+                flush=True,
+            )
+            return
+
+        total_rows_fetched    = 0
+        total_symbols_written = 0
+        total_symbols_skipped = 0
+
+        try:
+            local_cur = local_conn.cursor()
+            for i, inst in enumerate(symbols, start=1):
+                symbol   = inst["symbol"]
+                safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_").lower()
+                table    = f"daily_{safe_sym}"
+
+                if table not in daily_existing:
+                    total_symbols_skipped += 1
+                    self._progress("Fetching daily candles", i, len(symbols))
+                    continue
+
+                # Same DDL as x9_data_fetcher's pg_writer.py _ensure_table
+                # for prefix="daily" — table name included, verbatim.
+                local_cur.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ("
+                    f"    timestamp BIGINT NOT NULL,"
+                    f"    ingest_ns BIGINT,"
+                    f"    raw_json JSONB NOT NULL"
+                    f")"
+                )
+                local_cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)")
+                local_cur.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS uidx_{table}_ts ON {table} (timestamp)"
+                )
+
+                local_cur.execute(f"SELECT MAX(timestamp) FROM {table}")
+                row = local_cur.fetchone()
+                local_max_ts = row[0] if row else None
+
+                hist_cur = history_conn.cursor()
+                try:
+                    if local_max_ts is not None:
+                        hist_cur.execute(
+                            f"SELECT timestamp, ingest_ns, raw_json FROM {table} "
+                            f"WHERE timestamp > %s ORDER BY timestamp",
+                            (local_max_ts,),
+                        )
+                    else:
+                        hist_cur.execute(
+                            f"SELECT timestamp, ingest_ns, raw_json FROM {table} ORDER BY timestamp"
+                        )
+                    rows = hist_cur.fetchall()
+                finally:
+                    hist_cur.close()
+
+                if rows:
+                    # psycopg2 auto-deserializes a JSONB column on SELECT
+                    # into a plain Python dict — rows[i][2] here is
+                    # already a dict, not a string. Handing that dict
+                    # straight back to execute_values() for the INSERT
+                    # fails with "can't adapt type 'dict'": psycopg2 needs
+                    # an explicit psycopg2.extras.Json(...) wrapper to
+                    # serialize a dict back INTO a JSONB column — the
+                    # auto-adaptation only works in the read direction.
+                    # raw_json can also come back as a plain str (if the
+                    # source driver/version didn't auto-parse it) or None
+                    # (NULL) — only wrap actual dicts, pass anything else
+                    # through unchanged.
+                    rows = [
+                        (
+                            ts,
+                            ingest_ns,
+                            psycopg2.extras.Json(raw_json) if isinstance(raw_json, dict) else raw_json,
+                        )
+                        for ts, ingest_ns, raw_json in rows
+                    ]
+                    psycopg2.extras.execute_values(
+                        local_cur,
+                        f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s "
+                        f"ON CONFLICT (timestamp) DO NOTHING",
+                        rows,
+                    )
+                    local_conn.commit()
+                    total_rows_fetched += len(rows)
+                    total_symbols_written += 1
+                else:
+                    local_conn.commit()  # commit the CREATE TABLE/INDEX even with 0 new rows
+
+                self._progress("Fetching daily candles", i, len(symbols))
+
+            print(
+                f"[BACKFILL] Daily candle fetch complete | {total_rows_fetched} row(s) "
+                f"across {total_symbols_written} symbol(s) "
+                f"({total_symbols_skipped} skipped — no daily_ table in history db)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[BACKFILL][ERROR] Daily candle fetch failed: {exc}", flush=True)
+            try:
+                local_conn.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                local_conn.close()
+            except Exception:
+                pass
 
     # ─────────────────────────────────────────────
     # Lookback window calculation
