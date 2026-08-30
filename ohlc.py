@@ -414,7 +414,7 @@ class OHLCCollector:
 
         from backfill_manager import BackfillManager
         backfill = BackfillManager(self)
-        backfill.run(symbols)
+        backfill.run_low_memory(symbols)
 
         print(
             f"[CANDLE] Candle building complete | {len(symbols)} symbol(s) | "

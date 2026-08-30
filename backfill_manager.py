@@ -370,7 +370,18 @@ class BackfillManager:
     # Entry point
     # ─────────────────────────────────────────────
 
-    def run(self, symbols):
+    def run_low_memory(self, symbols, chunk_size: int = 20):
+        """
+        Same end result as run() — local caches synced against the
+        main/history db, candles built and saved — but every phase is
+        chunked and discards each chunk's data before the next, so
+        peak RAM stays roughly proportional to one chunk of symbols
+        instead of all of them. Deliberately runs IN this process (not
+        a subprocess) because save_candles_bulk() populates the live
+        OHLCCollector's in-RAM ohlc_data dict, which live trading reads
+        from directly — see candle_builder.py's module docstring for
+        why a separate process would leave that dict empty.
+        """
         if self.conn is None:
             print("[BACKFILL][ERROR] No DB connection — skipping backfill", flush=True)
             return
@@ -388,46 +399,16 @@ class BackfillManager:
 
         print(
             f"[BACKFILL] Mode: {mode} | symbols={len(symbols)} "
-            f"| TFs={tf_names} | from={start_ts.strftime('%Y-%m-%d %H:%M %Z')}",
+            f"| TFs={tf_names} | from={start_ts.strftime('%Y-%m-%d %H:%M %Z')} "
+            f"| low-memory chunked path (chunk_size={chunk_size})",
             flush=True,
         )
 
-        # ── Phase 0: which quote_ tables exist in the main db AND history db ──
-        # History db tables are loaded here too (not lazily on first gap
-        # anymore) since history-db candles are now always fetched for
-        # every symbol — see Phase 2h.
         existing_tables = self._load_existing_quote_tables(self.conn)
         history_conn = self._get_history_conn()
-        history_existing_tables = self._load_existing_quote_tables(history_conn)
-
-        # ── Phase 1: local-SQLite-only pass — pure disk I/O, no main-db query ──
-        # Instead of checking pre-computed OHLC parquet files for
-        # completeness, check the local raw-tick cache (ticks.db, via
-        # TickWriter.max_ts) for what's already cached per symbol, and
-        # only fetch the ticks NEWER than that from the main db in
-        # Phase 2. Whatever's already cached gets combined with the
-        # freshly fetched ticks before aggregation (Phase 3), so
-        # candles are still built over the FULL lookback window — just
-        # without re-downloading ticks Postgres already gave us on a
-        # previous run.
-        #
-        # Before trusting the cached range, verify it: max_ts is only
-        # a high-water mark — it doesn't guarantee everything before it
-        # is actually present (a crash mid-write, a failed insert
-        # batch, etc. can leave a silent hole earlier in the range).
-        # TickGapDetector.find_cache_gap() checks for same-session silent
-        # gaps larger than gap_threshold_secs (overnight/weekend/
-        # holiday gaps between sessions are expected and never
-        # flagged). If one's found, everything from just after it
-        # onward is treated as untrusted and re-fetched from the main
-        # db — NOT deleted first. The re-fetch corrects any wrong rows
-        # in place via upsert (see tick_writer.py's unique-index/
-        # upsert change), and a separate phantom-row check afterward
-        # (once we know exactly what the main db returned for this
-        # range) removes only rows PROVABLY absent from the main db —
-        # see _phantom_row_check() below, called from Phase 4.
-        start_ms = int(start_ts.timestamp() * 1000)
-        now_ms   = int(now.timestamp() * 1000)
+        history_existing_tables = (
+            self._load_existing_quote_tables(history_conn) if history_conn is not None else set()
+        )
 
         quote_outage_windows = []
         if self.conn_log_dir:
@@ -437,403 +418,27 @@ class BackfillManager:
             except Exception as exc:
                 print(f"[BACKFILL][WARN] could not read connection log: {exc}", flush=True)
 
-        symbol_state = {}
-        gap_flagged = []
-        confirmed_outage_count = 0
-
-        # Three levels of batching now, all aimed at the same 199-symbol
-        # loop:
-        #  1. One connection reused for the whole loop instead of a
-        #     fresh psycopg2.connect() per symbol.
-        #  2. max_ts_batch() replaces 199 sequential single-symbol
-        #     round-trips with ~2 round-trips total.
-        #  3. read_ticks_batch() does the same for the full-tick-range
-        #     read that used to happen per-symbol via _cached_ticks_df()
-        #     for every symbol that already has cached data — on a live
-        #     system that's most/all symbols, and each of those reads
-        #     pulls back a symbol's WHOLE cached range (not just a
-        #     scalar like max_ts), making this the heavier of the two
-        #     per-symbol costs in practice. Confirmed via live logs:
-        #     even after (2), Phase 1 was still crawling through
-        #     "17/199, 20/199, 27/199..." one slow symbol at a time
-        #     while the live queue overflowed — this was why.
-        cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
-        try:
-            all_symbol_names = [inst["symbol"] for inst in symbols]
-            last_ms_by_symbol = (
-                self.tick_writer.max_ts_batch(all_symbol_names, conn=cache_check_conn)
-                if self.tick_writer is not None else {}
-            )
-
-            # Every symbol with cached data covering [start_ms, last_ms]
-            # needs its full tick range read for gap detection — fetch
-            # them in CHUNKS (not all 199 in one call) so the raw rows
-            # for every symbol never sit fully materialized in memory
-            # at once. Without this, cached_rows_by_symbol (raw rows,
-            # ALL eligible symbols) stayed alive for the ENTIRE loop
-            # below — including after being converted into this same
-            # loop's per-symbol cached_df DataFrames — so peak memory
-            # was roughly double what symbol_state alone ends up
-            # needing. Chunking bounds "raw rows still alive" to one
-            # batch instead of every symbol. symbol_state itself still
-            # ends up holding all 199 symbols' cached_df by the end —
-            # Phase 3's candle-building (see cached_df usage below)
-            # needs every symbol's trusted history available — so this
-            # doesn't shrink the final steady-state, only the
-            # unnecessary peak while getting there.
-            ranges_needed = {
-                s: (start_ms, last_ms_by_symbol[s])
-                for s in all_symbol_names
-                if last_ms_by_symbol.get(s) is not None and last_ms_by_symbol[s] >= start_ms
-            }
-
-            _PHASE1_CHUNK_SIZE = 40  # matches PostgresTickWriter.read_ticks_batch's own internal chunk size
-            i = 0
-            for chunk_start in range(0, len(symbols), _PHASE1_CHUNK_SIZE):
-                chunk_symbols = symbols[chunk_start:chunk_start + _PHASE1_CHUNK_SIZE]
-
-                ranges_needed_chunk = {
-                    inst["symbol"]: ranges_needed[inst["symbol"]]
-                    for inst in chunk_symbols
-                    if inst["symbol"] in ranges_needed
-                }
-                cached_rows_chunk = (
-                    self.tick_writer.read_ticks_batch(ranges_needed_chunk, conn=cache_check_conn)
-                    if self.tick_writer is not None and ranges_needed_chunk else {}
-                )
-
-                for inst in chunk_symbols:
-                    i += 1
-                    symbol  = inst["symbol"]
-                    last_ms = last_ms_by_symbol.get(symbol)
-
-                    cached_df       = pd.DataFrame()
-                    cached_until_ms = None
-                    phantom_range   = None   # (start_ms, end_ms) of the untrusted local range, for Phase 4
-
-                    if last_ms is not None and last_ms >= start_ms:
-                        cached_df = self._ticks_rows_to_df(cached_rows_chunk.get(symbol, []))
-                        gap_result = self.tick_gaps.find_cache_gap(
-                            cached_df, last_ms, self.gap_threshold_secs, quote_outage_windows
-                        )
-
-                        if gap_result["gap_ms"] is not None:
-                            gap_flagged.append(symbol)
-                            phantom_local_ts = gap_result["phantom_local_ts"]
-                            phantom_range = gap_result["phantom_range"]
-
-                            if gap_result["confirmed_outage"]:
-                                confirmed_outage_count += 1
-
-                            # Trusted portion stays; the tail (after the gap)
-                            # is dropped from what we treat as cached here so
-                            # it gets re-fetched below — the row itself is
-                            # NOT deleted from SQLite, upsert corrects it once
-                            # the re-fetch lands.
-                            cached_df = gap_result["trusted_df"]
-                            cached_until_ms = gap_result["cached_until_ms"]
-                        else:
-                            cached_until_ms = last_ms
-
-                    fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
-
-                    symbol_state[symbol] = {
-                        "cached_df": cached_df,
-                        "cached_until_ms": cached_until_ms,
-                        "phantom_range": phantom_range,
-                        "phantom_local_ts": phantom_local_ts if phantom_range else None,
-                        "fetch_start": (
-                            datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
-                            if fetch_start_ms < now_ms else None
-                        ),
-                    }
-
-                    self._progress("Checking local tick cache", i, len(symbols))
-
-                # cached_rows_chunk (this batch's raw rows) falls out of
-                # scope here and is free to be garbage-collected before
-                # the next chunk's read_ticks_batch() call — this is the
-                # whole point of chunking instead of fetching everyone
-                # up front.
-        finally:
-            if cache_check_conn is not None:
-                try:
-                    cache_check_conn.close()
-                except Exception as exc:
-                    print(f"[BACKFILL][WARN] closing cache-check connection failed: {exc}", flush=True)
-
-        if gap_flagged:
-            preview = ", ".join(gap_flagged[:10])
-            more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
-            confirmed_note = (
-                f" ({confirmed_outage_count} confirmed against connection log)"
-                if quote_outage_windows else " (connection log not available to verify)"
-            )
-            print(
-                f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
-                f"(>{self.gap_threshold_secs}s within a session) in their cached "
-                f"ticks{confirmed_note} — will re-fetch and correct: "
-                f"{preview}{more}",
-                flush=True,
-            )
-
-        fully_covered = [s for s, st in symbol_state.items() if st["fetch_start"] is None]
-        if fully_covered:
-            print(
-                f"[BACKFILL] {len(fully_covered)}/{len(symbols)} symbol(s) fully "
-                f"caught up in the local tick cache — skipping main db fetch "
-                f"for them",
-                flush=True,
-            )
-
-        # ── Phase 1h: local-history-candle-cache-only pass ──────────────
-        # Same idea as Phase 1, but against history_candles.db
-        # (HistoryCandleStore) instead of ticks.db — history-db candles
-        # are idempotent (upserted, not appended) so this doesn't need
-        # the same silent-gap verification tick caching does; a stale
-        # partial range there just gets topped up by the next fetch,
-        # never duplicated.
-        history_state = {}
-        for i, inst in enumerate(symbols, start=1):
-            symbol   = inst["symbol"]
-            last_hms = self.history_store.max_ts(symbol) if self.history_store is not None else None
-
-            cached_hdf        = pd.DataFrame()
-            cached_h_until_ms = None
-
-            if last_hms is not None and last_hms >= start_ms:
-                cached_hdf        = self._cached_history_df(symbol, start_ms, last_hms)
-                cached_h_until_ms = last_hms
-
-            h_fetch_start_ms = (cached_h_until_ms + 1) if cached_h_until_ms is not None else start_ms
-
-            history_state[symbol] = {
-                "cached_df": cached_hdf,
-                "fetch_start": (
-                    datetime.fromtimestamp(h_fetch_start_ms / 1000, tz=tz_kolkata)
-                    if h_fetch_start_ms < now_ms else None
-                ),
-            }
-
-            self._progress("Checking local history-candle cache", i, len(symbols))
-
-        history_fully_covered = [s for s, st in history_state.items() if st["fetch_start"] is None]
-        if history_fully_covered:
-            print(
-                f"[BACKFILL] {len(history_fully_covered)}/{len(symbols)} symbol(s) "
-                f"fully caught up in the local history-candle cache — skipping "
-                f"history db fetch for them",
-                flush=True,
-            )
-
-        # ── Phase 2: ONE batched fetch for every symbol that still needs data ──
-        fetch_starts = {
-            s: st["fetch_start"] for s, st in symbol_state.items()
-            if st["fetch_start"] is not None
-        }
-        batched_ticks = self._fetch_ticks_batch(fetch_starts, existing_tables)
-
-        # ── Phase 2h: ONE batched history-db candle fetch ────────────────
-        # Always run now (not just as a last-resort gap filler) — see
-        # _aggregate_symbol_with_history() for how the result gets
-        # priority over tick-aggregated candles.
-        history_fetch_starts = {
-            s: st["fetch_start"] for s, st in history_state.items()
-            if st["fetch_start"] is not None
-        }
-        batched_history = self._fetch_history_candles_batch(
-            history_fetch_starts, history_existing_tables
+        # Step 1 — make the local tick cache correct (no candles yet).
+        self.sync_local_cache_with_main_db(
+            symbols, start_ts, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
         )
 
-        # ── Phase 2d: mirror market_history's daily_<symbol> tables locally ──
-        # Separate pipeline from the 1m history candles above — see
-        # fetch_daily_candles()'s docstring. Not used by candle-building
-        # (Phase 3 below); just makes daily_<symbol> queryable locally.
+        # Step 2 — make the local history-candle cache correct.
+        if history_conn is not None:
+            self.sync_history_cache_with_main_db(
+                symbols, start_ts, now, history_existing_tables, chunk_size=chunk_size
+            )
+
+        # Step 2d: mirror market_history's daily_<symbol> tables locally —
+        # unchanged from the old run(), not part of the RAM problem.
         self.fetch_daily_candles(symbols)
 
-        # ── Phase 3: per-symbol aggregation, history-priority (pure pandas) ──
-        # Aggregate totals only — no per-symbol lines. A single progress
-        # line updates in place; per-symbol tick/candle counts are summed
-        # into totals and reported once, after every symbol is done.
-        total_ticks = total_ticks_cached = total_ticks_fetched = 0
-        total_hist  = total_hist_cached  = total_hist_fetched  = 0
-        no_data_symbols = []
-        total_phantom_rows = 0
-        phantom_symbols = set()
+        # Step 3 — build + save candles from the now-correct local
+        # caches, chunked, discarding each symbol's raw ticks right
+        # after use (see build_candles_from_local_cache's docstring).
+        self.build_candles_from_local_cache(symbols, start_ts, now, chunk_size=chunk_size)
 
-        for i, inst in enumerate(symbols, start=1):
-            symbol    = inst["symbol"]
-            state     = symbol_state[symbol]
-            fresh_df  = batched_ticks.get(symbol, pd.DataFrame())
-            cached_df = state.get("cached_df", pd.DataFrame())
-
-            if not cached_df.empty and not fresh_df.empty:
-                ticks_df = (
-                    pd.concat([cached_df, fresh_df], ignore_index=True)
-                    .sort_values("timestamp")
-                    .reset_index(drop=True)
-                )
-            elif not cached_df.empty:
-                ticks_df = cached_df
-            else:
-                ticks_df = fresh_df
-
-            state["ticks_df"] = ticks_df
-
-            phantom_range    = state.get("phantom_range")
-            phantom_local_ts = state.get("phantom_local_ts")
-            if phantom_range and phantom_local_ts:
-                if symbol in self._last_fetch_failed_symbols:
-                    # The confirming re-fetch for this symbol never
-                    # actually reached main db this run (chunk failed) —
-                    # we have NO information about whether these
-                    # timestamps are real or not, so we must NOT delete
-                    # them. They stay in the local table exactly as
-                    # before; cached_df already excludes them from
-                    # ticks_df above, so nothing untrusted gets used
-                    # either. Phase 1 will re-detect the same suspicious
-                    # gap next run and try the confirming fetch again —
-                    # this only resolves once that fetch actually
-                    # succeeds.
-                    pass
-                elif not fresh_df.empty:
-                    in_range = fresh_df[
-                        (fresh_df["timestamp"] >= phantom_range[0])
-                        & (fresh_df["timestamp"] <= phantom_range[1])
-                    ]
-                    pg_confirmed_ts = set(int(t) for t in in_range["timestamp"])
-                    phantom_ts = phantom_local_ts - pg_confirmed_ts
-                    if phantom_ts:
-                        total_phantom_rows += len(phantom_ts)
-                        phantom_symbols.add(symbol)
-                        # wait=False — fire-and-forget, same reasoning as
-                        # the other tick_writer calls in this loop.
-                        self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
-                else:
-                    # fresh_df IS genuinely empty here — the fetch
-                    # succeeded (symbol not in failed set) and main db
-                    # confirmed zero rows in phantom_range, so every
-                    # locally-cached phantom timestamp really is fake.
-                    # Safe to delete all of them.
-                    phantom_ts = phantom_local_ts
-                    total_phantom_rows += len(phantom_ts)
-                    phantom_symbols.add(symbol)
-                    self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
-
-            if cached_df.empty and fresh_df.empty and state["fetch_start"] is not None:
-                no_data_symbols.append(symbol)
-            elif not ticks_df.empty:
-                total_ticks         += len(ticks_df)
-                total_ticks_cached  += len(cached_df)
-                total_ticks_fetched += len(fresh_df)
-
-            hstate     = history_state[symbol]
-            fresh_hdf  = batched_history.get(symbol, pd.DataFrame())
-            cached_hdf = hstate.get("cached_df", pd.DataFrame())
-
-            if not cached_hdf.empty and not fresh_hdf.empty:
-                history_df = (
-                    pd.concat([cached_hdf, fresh_hdf], ignore_index=True)
-                    .sort_values("timestamp")
-                    .reset_index(drop=True)
-                )
-            elif not cached_hdf.empty:
-                history_df = cached_hdf
-            else:
-                history_df = fresh_hdf
-
-            if not history_df.empty:
-                total_hist         += len(history_df)
-                total_hist_cached  += len(cached_hdf)
-                total_hist_fetched += len(fresh_hdf)
-
-            per_tf = self._aggregate_symbol_with_history(ticks_df, history_df, start_ts, now)
-            state["per_tf"] = per_tf
-
-            self._progress("Building candles", i, len(symbols))
-
-        if total_ticks:
-            print(
-                f"[BACKFILL] Tick data complete | {total_ticks} tick(s) total "
-                f"({total_ticks_cached} from local cache + {total_ticks_fetched} fetched)",
-                flush=True,
-            )
-        if total_hist:
-            print(
-                f"[BACKFILL] History-db candle data complete | {total_hist} candle(s) total "
-                f"({total_hist_cached} from local cache + {total_hist_fetched} fetched)",
-                flush=True,
-            )
-        if no_data_symbols:
-            preview = ", ".join(no_data_symbols[:10])
-            more = f" (+{len(no_data_symbols) - 10} more)" if len(no_data_symbols) - 10 > 0 else ""
-            print(
-                f"[BACKFILL][WARN] {len(no_data_symbols)}/{len(symbols)} symbol(s) had no "
-                f"tick data in main db or local cache: {preview}{more}",
-                flush=True,
-            )
-        if total_phantom_rows:
-            print(
-                f"[BACKFILL] Phantom-row check: {total_phantom_rows} row(s) removed "
-                f"across {len(phantom_symbols)} symbol(s) (locally cached but "
-                f"confirmed absent from main db)",
-                flush=True,
-            )
-
-        # ── Phase 4: per-symbol save to ohlc + missing-bucket reporting ──
-        zero_candle_counts = {}  # tf_str -> count of symbols with 0 candles
-        for i, inst in enumerate(symbols, start=1):
-            symbol = inst["symbol"]
-            zero_tfs = self._finalize_symbol(symbol, symbol_state[symbol]["per_tf"])
-            for tf_str in zero_tfs:
-                zero_candle_counts[tf_str] = zero_candle_counts.get(tf_str, 0) + 1
-            self._progress("Saving candles", i, len(symbols))
-
-        total_missing = sum(self.missing_counts.values())
-        if total_missing:
-            print(
-                f"[BACKFILL][WARN] {total_missing} candle(s) still missing across "
-                f"{len(self.missing_counts)} symbol/TF pair(s) (not in local tick "
-                f"cache, local history cache, main db, or history db)",
-                flush=True,
-            )
-        for tf_str, count in zero_candle_counts.items():
-            print(
-                f"[BACKFILL][WARN] {tf_str}: {count}/{len(symbols)} symbol(s) had 0 candles aggregated",
-                flush=True,
-            )
-
-        # ── Phase 5: tick-buffer seeding — reuse Phase 2 fetch, batch the rest ──
-        window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
-        seed_stats  = {"seeded": 0, "empty": 0, "ticks": 0}
-        need_seed_batch = []
-
-        for inst in symbols:
-            symbol   = inst["symbol"]
-            ticks_df = symbol_state[symbol].get("ticks_df", pd.DataFrame())
-            if ticks_df is not None and not ticks_df.empty:
-                n = self._seed_recent_ticks(symbol, ticks_df)
-                if n:
-                    seed_stats["seeded"] += 1
-                    seed_stats["ticks"]  += n
-                else:
-                    seed_stats["empty"] += 1
-            else:
-                need_seed_batch.append(symbol)
-
-        if need_seed_batch:
-            batch_stats = self._seed_recent_ticks_batch(need_seed_batch, existing_tables)
-            seed_stats["seeded"] += batch_stats["seeded"]
-            seed_stats["empty"]  += batch_stats["empty"]
-            seed_stats["ticks"]  += batch_stats["ticks"]
-
-        print(
-            f"[BACKFILL] Tick RAM buffers seeded: {seed_stats['seeded']}/{len(symbols)} "
-            f"symbol(s), {seed_stats['ticks']} total tick(s), "
-            f"{seed_stats['empty']} symbol(s) had none ({window_secs // 60:.0f} min window)",
-            flush=True,
-        )
-
+        # Step 4 — depth backfill (already chunked — see _run_depth_backfill).
         self._run_depth_backfill(symbols, now)
 
         self._validate(symbols)
@@ -842,14 +447,13 @@ class BackfillManager:
             self.conn.close()
         except Exception:
             pass
-
         if self.conn_history is not None:
             try:
                 self.conn_history.close()
             except Exception:
                 pass
 
-        print("[BACKFILL] Completed", flush=True)
+        print("[BACKFILL] Completed (low-memory path)", flush=True)
 
     # ─────────────────────────────────────────────
     # Depth backfill — LOOKBACK IS INTENTIONALLY SHORTER THAN QUOTE:
@@ -888,6 +492,7 @@ class BackfillManager:
         start_ts = self._compute_depth_lookback_start(now)
         start_ms = int(start_ts.timestamp() * 1000)
         now_ms   = int(now.timestamp() * 1000)
+        chunk_size = 20
 
         print(
             f"[BACKFILL] Depth backfill starting | lookback: last 1 trading "
@@ -904,68 +509,19 @@ class BackfillManager:
                 print(f"[BACKFILL][WARN] could not read connection log for depth: {exc}", flush=True)
 
         # ── Phase D1: check local depth cache, flag gaps ──
-        depth_state = {}
-        fetch_starts = {}
-        gap_flagged = []
-        confirmed_outage_count = 0
-
-        # Same fix as Phase 1's quote cache-check loop above: reuse one
-        # connection, batch max_ts lookups via max_ts_batch(), AND batch
-        # the full-range cache reads via read_ticks_batch() instead of
-        # one round-trip per symbol for each.
+        # Same helper as the quote-tick path — tick_gaps.scan_local_cache()
+        # owns all local-cache reading, chunked, and hands back only
+        # small per-symbol facts (fetch-start ms, phantom range). No
+        # depth row (the heaviest row type — reconstructed order-book
+        # dicts) is retained past the chunk it was read in.
         depth_cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
         try:
-            all_symbol_names = [inst["symbol"] for inst in symbols]
-            last_ms_by_symbol = (
-                self.tick_writer.max_ts_batch(all_symbol_names, kind="depth", conn=depth_cache_check_conn)
-                if self.tick_writer is not None else {}
+            gap_map = self.tick_gaps.scan_local_cache(
+                symbols, self.tick_writer, start_ms, now_ms,
+                self.gap_threshold_secs, depth_outage_windows,
+                chunk_size=chunk_size, conn=depth_cache_check_conn, kind="depth",
+                progress=lambda i, n: self._progress("Checking local depth cache", i, n),
             )
-
-            ranges_needed = {
-                s: (start_ms, last_ms_by_symbol[s])
-                for s in all_symbol_names
-                if last_ms_by_symbol.get(s) is not None and last_ms_by_symbol[s] >= start_ms
-            }
-            cached_rows_by_symbol = (
-                self.tick_writer.read_ticks_batch(ranges_needed, kind="depth", conn=depth_cache_check_conn)
-                if self.tick_writer is not None and ranges_needed else {}
-            )
-
-            for i, inst in enumerate(symbols, start=1):
-                symbol  = inst["symbol"]
-                last_ms = last_ms_by_symbol.get(symbol)
-
-                cached_until_ms = None
-                phantom_range   = None
-                phantom_local_ts = None
-
-                if last_ms is not None and last_ms >= start_ms:
-                    cached_df = self._depth_rows_to_df(cached_rows_by_symbol.get(symbol, []))
-                    gap_result = self.tick_gaps.find_cache_gap(
-                        cached_df, last_ms, self.gap_threshold_secs, depth_outage_windows
-                    )
-
-                    if gap_result["gap_ms"] is not None:
-                        gap_flagged.append(symbol)
-                        phantom_local_ts = gap_result["phantom_local_ts"]
-                        phantom_range = gap_result["phantom_range"]
-
-                        if gap_result["confirmed_outage"]:
-                            confirmed_outage_count += 1
-
-                        cached_until_ms = gap_result["gap_ms"]
-                    else:
-                        cached_until_ms = last_ms
-
-                fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
-                depth_state[symbol] = {
-                    "phantom_range": phantom_range,
-                    "phantom_local_ts": phantom_local_ts,
-                }
-                if fetch_start_ms < now_ms:
-                    fetch_starts[symbol] = datetime.fromtimestamp(fetch_start_ms / 1000, tz=tz_kolkata)
-
-                self._progress("Checking local depth cache", i, len(symbols))
         finally:
             if depth_cache_check_conn is not None:
                 try:
@@ -973,6 +529,8 @@ class BackfillManager:
                 except Exception as exc:
                     print(f"[BACKFILL][WARN] closing depth cache-check connection failed: {exc}", flush=True)
 
+        gap_flagged = [s for s, e in gap_map.items() if e["phantom_range"] is not None]
+        confirmed_outage_count = sum(1 for e in gap_map.values() if e["confirmed_outage"])
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
             more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
@@ -988,43 +546,72 @@ class BackfillManager:
                 flush=True,
             )
 
+        depth_state = {
+            s: {"phantom_range": e["phantom_range"], "phantom_local_ts": e["phantom_local_ts"]}
+            for s, e in gap_map.items()
+        }
+        fetch_starts = {
+            s: datetime.fromtimestamp(e["fetch_start_ms"] / 1000, tz=tz_kolkata)
+            for s, e in gap_map.items() if e["fetch_start_ms"] is not None
+        }
+
         if not fetch_starts:
             print("[BACKFILL] Depth backfill: nothing to fetch — all symbols fully cached", flush=True)
             return
 
-        # ── Phase D2: batched fetch from Postgres depth_<symbol> ──
-        # (also writes freshly fetched rows into local depth cache via
-        # enqueue_backfill_rows — see _fetch_depth_batch's docstring)
+        # ── Phase D2 + D3, combined per chunk — fetch, write, phantom-
+        # check, forget, move on. Nothing survives past its own chunk;
+        # unlike the earlier version, `fetched`/`chunk_fetched` are no
+        # longer accumulated across the whole run just to run the
+        # phantom-row check once at the end — that check now happens
+        # immediately after each chunk's fetch, using only that
+        # chunk's data, then everything is discarded before the next
+        # chunk starts. Exactly mirrors sync_local_cache_with_main_db's
+        # quote-tick loop.
         depth_existing_tables = self._load_existing_tables(self.conn, prefix="depth")
-        fetched = self._fetch_depth_batch(fetch_starts, depth_existing_tables)
-
-        # ── Phase D3: phantom-row check ──
+        fetch_items = list(fetch_starts.items())
         total_phantom_rows = 0
         phantom_symbols = set()
-        for symbol, state in depth_state.items():
-            phantom_range    = state.get("phantom_range")
-            phantom_local_ts = state.get("phantom_local_ts")
-            if not (phantom_range and phantom_local_ts):
-                continue
+        last_fetch_failed_symbols = set()
 
-            if symbol in self._last_fetch_failed_symbols:
-                # Same reasoning as the quote-phase phantom check above:
-                # the confirming re-fetch for this symbol never actually
-                # reached main db this run, so we have no basis to
-                # delete anything — leave it for next run to retry.
-                continue
+        for i in range(0, len(fetch_items), chunk_size):
+            chunk_fetch_starts = dict(fetch_items[i:i + chunk_size])
+            chunk_fetched = self._fetch_depth_batch(chunk_fetch_starts, depth_existing_tables)
+            # _fetch_depth_batch sets self._last_fetch_failed_symbols
+            # fresh on every call — capture this chunk's failures
+            # before the next chunk's call overwrites it.
+            last_fetch_failed_symbols |= self._last_fetch_failed_symbols
 
-            fetched_ts = fetched.get(symbol, set())
-            pg_confirmed_ts = {
-                t for t in fetched_ts
-                if phantom_range[0] <= t <= phantom_range[1]
-            }
+            for symbol in chunk_fetch_starts:
+                state = depth_state.get(symbol, {})
+                phantom_range    = state.get("phantom_range")
+                phantom_local_ts = state.get("phantom_local_ts")
+                if not (phantom_range and phantom_local_ts):
+                    continue
+                if symbol in self._last_fetch_failed_symbols:
+                    # This symbol's confirming re-fetch never actually
+                    # reached main db this chunk — no basis to delete
+                    # anything, leave it for next run to retry.
+                    continue
 
-            phantom_ts = phantom_local_ts - pg_confirmed_ts
-            if phantom_ts:
-                total_phantom_rows += len(phantom_ts)
-                phantom_symbols.add(symbol)
-                self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="depth", wait=False)
+                fetched_ts = chunk_fetched.get(symbol, set())
+                pg_confirmed_ts = {
+                    t for t in fetched_ts
+                    if phantom_range[0] <= t <= phantom_range[1]
+                }
+                phantom_ts = phantom_local_ts - pg_confirmed_ts
+                if phantom_ts:
+                    total_phantom_rows += len(phantom_ts)
+                    phantom_symbols.add(symbol)
+                    self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="depth", wait=False)
+
+            # This chunk's fetched timestamp sets (and whatever
+            # DataFrame _fetch_depth_batch built internally) are done
+            # being used — discard before the next chunk's query runs.
+            del chunk_fetched
+            self._progress("Fetching + writing depth gaps", min(i + chunk_size, len(fetch_items)), len(fetch_items))
+
+        self._last_fetch_failed_symbols = last_fetch_failed_symbols
 
         if total_phantom_rows:
             print(
@@ -1174,15 +761,6 @@ class BackfillManager:
         df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
         return df
 
-    def _depth_rows_to_df(self, rows: list) -> pd.DataFrame:
-        """Same as _ticks_rows_to_df but for depth rows (timestamp/ltp
-        only — gap detection doesn't need the flat level columns)."""
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame([{"timestamp": r["timestamp"], "ltp": r.get("ltp")} for r in rows])
-        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-        return df
-
     def _cached_ticks_df(self, symbol: str, start_ms: int, end_ms: int, conn=None) -> pd.DataFrame:
         """
         Read symbol's already-cached quote ticks back out of ticks.db
@@ -1203,26 +781,6 @@ class BackfillManager:
 
         rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="quote", conn=conn)
         return self._ticks_rows_to_df(rows)
-
-    def _cached_depth_df(self, symbol: str, start_ms: int, end_ms: int, conn=None) -> pd.DataFrame:
-        """
-        Same idea as _cached_ticks_df but for the local depth_<symbol>
-        SQLite cache — used by the Depth backfill pass purely for gap
-        detection, which only needs timestamp/ist_ts. The full flat
-        level columns come back from read_ticks() too but aren't
-        needed here, so they're dropped immediately rather than kept
-        around in this DataFrame.
-
-        conn: optional pre-opened connection, passed through to
-        tick_writer.read_ticks() — see Phase D1's cache-check loop.
-        Prefer read_ticks_batch() + _depth_rows_to_df() for multiple
-        symbols at once.
-        """
-        if self.tick_writer is None:
-            return pd.DataFrame()
-
-        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="depth", conn=conn)
-        return self._depth_rows_to_df(rows)
 
     def _cached_history_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
         """
@@ -1294,6 +852,66 @@ class BackfillManager:
         return zero_candle_tfs
 
     # ─────────────────────────────────────────────
+    # Candle building from the (now gap-free) local cache — meant to be
+    # called from candle_builder.py, a SEPARATE process from the one
+    # that ran sync_local_cache_with_main_db(). Reads fresh from local
+    # cache/history_store per chunk, builds + saves, discards before
+    # the next chunk. Never touches Postgres/main db.
+    # ─────────────────────────────────────────────
+
+    def build_candles_from_local_cache(self, symbols, start_ts, now, chunk_size: int = 20):
+        start_ms = int(start_ts.timestamp() * 1000)
+        now_ms   = int(now.timestamp() * 1000)
+        window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
+        seed_stats = {"seeded": 0, "empty": 0, "ticks": 0}
+
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i:i + chunk_size]
+
+            for inst in chunk:
+                symbol = inst["symbol"]
+
+                ticks_df = self._cached_ticks_df(symbol, start_ms, now_ms)
+                history_df = self._cached_history_df(symbol, start_ms, now_ms)
+
+                per_tf = self._aggregate_symbol_with_history(ticks_df, history_df, start_ts, now)
+                self._finalize_symbol(symbol, per_tf)
+
+                # Only the trailing seed window is worth keeping in RAM
+                # after this — not the full lookback range.
+                if not ticks_df.empty:
+                    cutoff_ms = now_ms - window_secs * 1000
+                    seed_df = ticks_df[ticks_df["timestamp"] >= cutoff_ms]
+                    n = self._seed_recent_ticks(symbol, seed_df)
+                    if n:
+                        seed_stats["seeded"] += 1
+                        seed_stats["ticks"] += n
+                    else:
+                        seed_stats["empty"] += 1
+                else:
+                    seed_stats["empty"] += 1
+
+                # ticks_df/history_df/per_tf all die with this loop
+                # iteration — nothing accumulates across symbols.
+                del ticks_df, history_df, per_tf
+
+            self._progress("Building candles", min(i + chunk_size, len(symbols)), len(symbols))
+
+        total_missing = sum(self.missing_counts.values())
+        if total_missing:
+            print(
+                f"[CANDLE_BUILDER][WARN] {total_missing} candle(s) still missing "
+                f"across {len(self.missing_counts)} symbol/TF pair(s)",
+                flush=True,
+            )
+        print(
+            f"[CANDLE_BUILDER] Tick RAM buffers seeded: {seed_stats['seeded']}/{len(symbols)} "
+            f"symbol(s), {seed_stats['ticks']} total tick(s), "
+            f"{seed_stats['empty']} symbol(s) had none ({window_secs // 60:.0f} min window)",
+            flush=True,
+        )
+
+    # ─────────────────────────────────────────────
     # Tick-buffer seeding (OHLCCollector.raw_ticks)
     # ─────────────────────────────────────────────
 
@@ -1306,14 +924,13 @@ class BackfillManager:
         read via ohlc.get_recent_ticks()/ohlc.raw_ticks is already warm
         at startup, whether the market is currently open or closed.
 
-        Only handles the reuse case now (ticks_df already fetched by
-        Phase 2's batched query) — zero extra DB round trips. Symbols
-        with no reusable ticks_df go through _seed_recent_ticks_batch()
-        instead (called once, batched, from run()'s Phase 6).
+        Called from build_candles_from_local_cache() with each symbol's
+        own trailing-window slice of its local-cache ticks — no extra
+        DB round trip needed.
 
-        Returns the number of ticks loaded (0 if none) — run() aggregates
-        this across every symbol into a single summary print instead of
-        one line per symbol.
+        Returns the number of ticks loaded (0 if none) — the caller
+        aggregates this across every symbol into a single summary print
+        instead of one line per symbol.
         """
         window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
 
@@ -1323,92 +940,6 @@ class BackfillManager:
         cutoff = ticks_df["ist_ts"].max() - timedelta(seconds=window_secs)
         window_df = ticks_df[ticks_df["ist_ts"] >= cutoff]
         return self._load_ticks_into_ram(symbol, window_df)
-
-    def _seed_recent_ticks_batch(self, symbols: list, existing_tables: set) -> dict:
-        """
-        Batched fallback path for symbols where no reusable ticks_df was
-        available from Phase 2 (i.e. the local tick cache already covered
-        the full window, so nothing needed fetching for them). Each symbol still
-        gets its own self-anchored subquery (own MAX(timestamp) - window,
-        computed server-side), combined into chunked UNION ALL queries —
-        replacing what used to be one query per symbol.
-
-        Returns {"seeded": n, "empty": n, "ticks": n} — run() folds this
-        into the single Phase 6 summary print instead of per-chunk/
-        per-symbol output.
-        """
-        stats = {"seeded": 0, "empty": 0, "ticks": 0}
-        if self.conn is None or not symbols:
-            return stats
-
-        window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
-        window_ms   = window_secs * 1000
-
-        seeded           = set()
-        skipped_no_table = []
-
-        chunk_size = self.batch_size if self.batch_size > 0 else max(len(symbols), 1)
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i:i + chunk_size]
-
-            clauses = []
-            params  = []
-            for symbol in chunk:
-                safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
-                table = f"quote_{safe_sym}".lower()
-                if table not in existing_tables:
-                    skipped_no_table.append(symbol)
-                    continue
-                clauses.append(
-                    f"SELECT %s AS symbol, timestamp, ltp, "
-                    f"COALESCE(last_quantity, 0) AS qty FROM {table} "
-                    f"WHERE timestamp >= (SELECT MAX(timestamp) FROM {table}) - %s "
-                    f"AND ltp IS NOT NULL"
-                )
-                params.extend([symbol, window_ms])
-
-            if not clauses:
-                continue
-
-            query = " UNION ALL ".join(clauses) + " ORDER BY symbol, timestamp"
-
-            try:
-                cur = self.conn.cursor()
-                cur.execute(query, params)
-                rows = cur.fetchall()
-                cur.close()
-            except Exception as exc:
-                print(
-                    f"[BACKFILL][WARN] batched tick-buffer seed failed for a "
-                    f"chunk of {len(chunk)} symbol(s): {exc}",
-                    flush=True,
-                )
-                try:
-                    self.conn.rollback()
-                except Exception:
-                    pass
-                continue
-
-            if not rows:
-                continue
-
-            df = pd.DataFrame(rows, columns=["symbol", "timestamp", "ltp", "qty"])
-            df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-
-            for symbol, group in df.groupby("symbol"):
-                g = group.drop(columns=["symbol"]).reset_index(drop=True)
-                n = self._load_ticks_into_ram(symbol, g)
-                seeded.add(symbol)
-                if n:
-                    stats["seeded"] += 1
-                    stats["ticks"]  += n
-                else:
-                    stats["empty"] += 1
-
-        stats["empty"] += len(skipped_no_table)
-        stats["empty"] += sum(1 for s in symbols if s not in seeded and s not in skipped_no_table)
-
-        return stats
 
     def _load_ticks_into_ram(self, symbol, df) -> int:
         if df.empty:
@@ -1470,6 +1001,210 @@ class BackfillManager:
     # ─────────────────────────────────────────────
     # Fetch ticks from PostgreSQL (main db) — BATCHED across symbols
     # ─────────────────────────────────────────────
+
+    def sync_local_cache_with_main_db(
+        self, symbols, start_ts, now, existing_tables, quote_outage_windows, chunk_size: int = 20
+    ):
+        """
+        Replaces the old Phase 1 (local-cache scan) + Phase 2 (main-db
+        fetch) + the quote-tick half of the old Phase 3 phantom-row
+        cleanup — WITHOUT building any candles. Candle building has
+        moved to candle_builder.py, which runs as its own process and
+        reads the local cache fresh, AFTER this method has guaranteed
+        it's gap-free. This method's only job is: make the local tick
+        cache correct. It never holds more than one chunk's ticks in
+        RAM at a time, and never retains a DataFrame past the chunk
+        it was fetched for.
+
+        Step 1 — tick_gaps.scan_local_cache() does ALL local-cache
+        reading (read-only), chunked, and reports back only small
+        per-symbol facts (a fetch-start timestamp, maybe a phantom
+        range) — no tick data survives this step.
+
+        Step 2 — for symbols that need it, fetch just the missing
+        range from Postgres, in the same chunk size, write it to
+        tick_writer, run the phantom-row check, then discard the
+        fetched DataFrame before moving to the next chunk.
+        """
+        start_ms = int(start_ts.timestamp() * 1000)
+        now_ms   = int(now.timestamp() * 1000)
+
+        cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
+        try:
+            gap_map = self.tick_gaps.scan_local_cache(
+                symbols, self.tick_writer, start_ms, now_ms,
+                self.gap_threshold_secs, quote_outage_windows,
+                chunk_size=chunk_size, conn=cache_check_conn,
+                progress=lambda i, n: self._progress("Checking local tick cache", i, n),
+            )
+        finally:
+            if cache_check_conn is not None:
+                try:
+                    cache_check_conn.close()
+                except Exception as exc:
+                    print(f"[BACKFILL][WARN] closing cache-check connection failed: {exc}", flush=True)
+
+        gap_flagged = [s for s, e in gap_map.items() if e["phantom_range"] is not None]
+        confirmed_outage_count = sum(1 for e in gap_map.values() if e["confirmed_outage"])
+        if gap_flagged:
+            preview = ", ".join(gap_flagged[:10])
+            more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
+            confirmed_note = (
+                f" ({confirmed_outage_count} confirmed against connection log)"
+                if quote_outage_windows else " (connection log not available to verify)"
+            )
+            print(
+                f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
+                f"(>{self.gap_threshold_secs}s within a session) in their cached "
+                f"ticks{confirmed_note} — will re-fetch and correct: "
+                f"{preview}{more}",
+                flush=True,
+            )
+
+        fully_covered = [s for s, e in gap_map.items() if e["fetch_start_ms"] is None]
+        if fully_covered:
+            print(
+                f"[BACKFILL] {len(fully_covered)}/{len(symbols)} symbol(s) fully "
+                f"caught up in the local tick cache — skipping main db fetch for them",
+                flush=True,
+            )
+
+        to_fetch = [s for s, e in gap_map.items() if e["fetch_start_ms"] is not None]
+        total_fetched = 0
+        total_phantom_rows = 0
+        phantom_symbols = set()
+        no_data_symbols = []
+        self._last_fetch_failed_symbols = set()
+
+        for i in range(0, len(to_fetch), chunk_size):
+            chunk_symbols = to_fetch[i:i + chunk_size]
+            fetch_starts_chunk = {
+                s: datetime.fromtimestamp(gap_map[s]["fetch_start_ms"] / 1000, tz=tz_kolkata)
+                for s in chunk_symbols
+            }
+
+            # _fetch_ticks_batch() already writes each symbol's rows to
+            # tick_writer as it goes (see its own body) — the DataFrame
+            # it returns here is only needed transiently, for the
+            # phantom-row comparison right below, then discarded.
+            fetched = self._fetch_ticks_batch(fetch_starts_chunk, existing_tables)
+
+            for symbol in chunk_symbols:
+                fresh_df = fetched.get(symbol, pd.DataFrame())
+                entry = gap_map[symbol]
+
+                if fresh_df.empty and entry["phantom_range"] is None:
+                    continue
+                if fresh_df.empty:
+                    no_data_symbols.append(symbol)
+                total_fetched += len(fresh_df)
+
+                phantom_range    = entry["phantom_range"]
+                phantom_local_ts = entry["phantom_local_ts"]
+                if phantom_range and phantom_local_ts:
+                    if symbol in self._last_fetch_failed_symbols:
+                        pass  # fetch genuinely failed — don't delete, retry next run
+                    elif not fresh_df.empty:
+                        in_range = fresh_df[
+                            (fresh_df["timestamp"] >= phantom_range[0])
+                            & (fresh_df["timestamp"] <= phantom_range[1])
+                        ]
+                        pg_confirmed_ts = set(int(t) for t in in_range["timestamp"])
+                        phantom_ts = phantom_local_ts - pg_confirmed_ts
+                        if phantom_ts:
+                            total_phantom_rows += len(phantom_ts)
+                            phantom_symbols.add(symbol)
+                            self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
+                    else:
+                        phantom_ts = phantom_local_ts
+                        total_phantom_rows += len(phantom_ts)
+                        phantom_symbols.add(symbol)
+                        self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
+
+            # This chunk's fetched DataFrames are done being used — drop
+            # them before the next chunk's fetch, instead of letting
+            # every chunk's result pile up for the rest of run().
+            del fetched
+            self._progress("Fetching + writing tick gaps", min(i + chunk_size, len(to_fetch)), len(to_fetch))
+
+        if total_fetched:
+            print(f"[BACKFILL] Tick gaps filled | {total_fetched} tick(s) fetched from main db", flush=True)
+        if no_data_symbols:
+            preview = ", ".join(no_data_symbols[:10])
+            more = f" (+{len(no_data_symbols) - 10} more)" if len(no_data_symbols) - 10 > 0 else ""
+            print(
+                f"[BACKFILL][WARN] {len(no_data_symbols)} symbol(s) had no new "
+                f"tick data in main db: {preview}{more}",
+                flush=True,
+            )
+        if total_phantom_rows:
+            print(
+                f"[BACKFILL] Phantom-row check: {total_phantom_rows} row(s) removed "
+                f"across {len(phantom_symbols)} symbol(s) (locally cached but "
+                f"confirmed absent from main db)",
+                flush=True,
+            )
+
+    def sync_history_cache_with_main_db(
+        self, symbols, start_ts, now, history_existing_tables, chunk_size: int = 20
+    ):
+        """
+        History-candle counterpart to sync_local_cache_with_main_db().
+        History-db candles are idempotent (upserted, not appended) —
+        see the module note where Phase 1h originally lived — so this
+        doesn't need gap/phantom-row detection, just "is the local
+        history_store cache caught up, and if not, top it up."
+
+        Reads local coverage (history_store.max_ts) per symbol —
+        cheap, local SQLite, no DataFrame involved — then fetches
+        whatever's missing from the history db in chunks of
+        `chunk_size`, discarding each chunk's fetched DataFrame right
+        after it's written to history_store (which
+        _fetch_history_candles_batch already does internally).
+        """
+        start_ms = int(start_ts.timestamp() * 1000)
+        now_ms   = int(now.timestamp() * 1000)
+
+        fetch_starts = {}
+        fully_covered = []
+        for inst in symbols:
+            symbol   = inst["symbol"]
+            last_hms = self.history_store.max_ts(symbol) if self.history_store is not None else None
+
+            if last_hms is not None and last_hms >= start_ms:
+                h_fetch_start_ms = last_hms + 1
+            else:
+                h_fetch_start_ms = start_ms
+
+            if h_fetch_start_ms < now_ms:
+                fetch_starts[symbol] = datetime.fromtimestamp(h_fetch_start_ms / 1000, tz=tz_kolkata)
+            else:
+                fully_covered.append(symbol)
+
+        if fully_covered:
+            print(
+                f"[BACKFILL] {len(fully_covered)}/{len(symbols)} symbol(s) fully "
+                f"caught up in the local history-candle cache — skipping history "
+                f"db fetch for them",
+                flush=True,
+            )
+
+        items = list(fetch_starts.items())
+        total_fetched = 0
+        for i in range(0, len(items), chunk_size):
+            chunk = dict(items[i:i + chunk_size])
+            fetched = self._fetch_history_candles_batch(chunk, history_existing_tables)
+            total_fetched += sum(len(df) for df in fetched.values())
+            # Already written to history_store inside
+            # _fetch_history_candles_batch — discard before next chunk.
+            del fetched
+            self._progress("Fetching + writing history-candle gaps", min(i + chunk_size, len(items)), len(items))
+
+        if total_fetched:
+            print(
+                f"[BACKFILL] History-db candle gaps filled | {total_fetched} candle(s) fetched",
+                flush=True,
+            )
 
     def _fetch_ticks_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
         """
