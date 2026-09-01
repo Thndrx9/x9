@@ -10,7 +10,10 @@ from collections import deque
 from typing import Optional
 from datetime import datetime, timedelta, time as dtime
 from dotenv import load_dotenv
-from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata, is_market_open
+from market_time import (
+    tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata,
+    is_market_open, trading_day_n_back,
+)
 from tick_writer import DEPTH_LEVEL_COLUMNS, QUOTE_EXTRA_COLUMNS
 from gap_detector import (
     GapDetector,
@@ -285,13 +288,14 @@ class BackfillManager:
     def _get_history_conn(self):
         """
         Lazily connects to the history DB (PG_HDBNAME) — cached after
-        the first call. run() now calls this unconditionally near the
-        top (Phase 0h) since history-db candles are always fetched for
-        every symbol (not just as a last-resort gap filler anymore —
-        see the module docstring and _aggregate_symbol_with_history()),
-        but the lazy-connect-and-cache shape is kept as-is so anything
-        else calling this mid-run still gets the same connection
-        without reconnecting.
+        the first call. run_low_memory() calls this right before its
+        history-candle step (not up front) so the connection doesn't
+        sit idle through the earlier tick-fetch phase and get dropped
+        for being idle by the time it's actually used — see the call
+        site's comment. The lazy-connect-and-cache shape here still
+        matters for the other call sites (_fetch_history_candles_batch,
+        fetch_daily_candles) that call this mid-run and expect the same
+        cached connection without reconnecting.
         """
         if self.conn_history is not None:
             if not self.conn_history.closed:
@@ -405,10 +409,6 @@ class BackfillManager:
         )
 
         existing_tables = self._load_existing_quote_tables(self.conn)
-        history_conn = self._get_history_conn()
-        history_existing_tables = (
-            self._load_existing_quote_tables(history_conn) if history_conn is not None else set()
-        )
 
         quote_outage_windows = []
         if self.conn_log_dir:
@@ -421,6 +421,20 @@ class BackfillManager:
         # Step 1 — make the local tick cache correct (no candles yet).
         self.sync_local_cache_with_main_db(
             symbols, start_ts, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
+        )
+
+        # History-db connection is opened here, right before it's
+        # actually used — not up front. Step 1 above can take a while
+        # (a full main-db tick fetch), and opening this connection
+        # before that ran left it sitting idle for the whole tick
+        # phase, long enough that the server/proxy would drop it for
+        # being idle — showing up as a "connection dropped ...
+        # reconnecting" on the very first history-db query. Connecting
+        # here instead means it's opened right when it's about to be
+        # used.
+        history_conn = self._get_history_conn()
+        history_existing_tables = (
+            self._load_existing_quote_tables(history_conn) if history_conn is not None else set()
         )
 
         # Step 2 — make the local history-candle cache correct.
@@ -554,6 +568,14 @@ class BackfillManager:
             s: datetime.fromtimestamp(e["fetch_start_ms"] / 1000, tz=tz_kolkata)
             for s, e in gap_map.items() if e["fetch_start_ms"] is not None
         }
+        # Only present for symbols where the leading part of the window
+        # was found missing (widened lookback) — caps that fetch at the
+        # row already trusted locally instead of re-pulling everything
+        # through now. See tick_gap_detector.scan_local_cache().
+        fetch_ends = {
+            s: datetime.fromtimestamp(e["fetch_end_ms"] / 1000, tz=tz_kolkata)
+            for s, e in gap_map.items() if e.get("fetch_end_ms") is not None
+        }
 
         if not fetch_starts:
             print("[BACKFILL] Depth backfill: nothing to fetch — all symbols fully cached", flush=True)
@@ -576,7 +598,8 @@ class BackfillManager:
 
         for i in range(0, len(fetch_items), chunk_size):
             chunk_fetch_starts = dict(fetch_items[i:i + chunk_size])
-            chunk_fetched = self._fetch_depth_batch(chunk_fetch_starts, depth_existing_tables)
+            chunk_fetch_ends = {s: fetch_ends[s] for s in chunk_fetch_starts if s in fetch_ends}
+            chunk_fetched = self._fetch_depth_batch(chunk_fetch_starts, depth_existing_tables, chunk_fetch_ends)
             # _fetch_depth_batch sets self._last_fetch_failed_symbols
             # fresh on every call — capture this chunk's failures
             # before the next chunk's call overwrites it.
@@ -1082,12 +1105,21 @@ class BackfillManager:
                 s: datetime.fromtimestamp(gap_map[s]["fetch_start_ms"] / 1000, tz=tz_kolkata)
                 for s in chunk_symbols
             }
+            # Only present for symbols where the leading part of the
+            # window was found missing (widened lookback) — caps that
+            # fetch at the row already trusted locally, instead of
+            # re-pulling (and re-writing on top of) everything through
+            # now. See tick_gap_detector.scan_local_cache().
+            fetch_ends_chunk = {
+                s: datetime.fromtimestamp(gap_map[s]["fetch_end_ms"] / 1000, tz=tz_kolkata)
+                for s in chunk_symbols if gap_map[s].get("fetch_end_ms") is not None
+            }
 
             # _fetch_ticks_batch() already writes each symbol's rows to
             # tick_writer as it goes (see its own body) — the DataFrame
             # it returns here is only needed transiently, for the
             # phantom-row comparison right below, then discarded.
-            fetched = self._fetch_ticks_batch(fetch_starts_chunk, existing_tables)
+            fetched = self._fetch_ticks_batch(fetch_starts_chunk, existing_tables, fetch_ends_chunk)
 
             for symbol in chunk_symbols:
                 fresh_df = fetched.get(symbol, pd.DataFrame())
@@ -1206,11 +1238,17 @@ class BackfillManager:
                 flush=True,
             )
 
-    def _fetch_ticks_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
+    def _fetch_ticks_batch(self, fetch_starts: dict, existing_tables: set, fetch_ends: dict = None) -> dict:
         """
         fetch_starts: {symbol: start_ts} — symbols needing a main-db tick
         fetch, each with its own start time (already narrowed to just
         what's missing beyond the local tick cache, in run()'s Phase 1).
+
+        fetch_ends: optional {symbol: end_ts}, only for symbols whose
+        fetch must stop before an already-cached, already-validated
+        stretch (the widened-lookback case — see
+        tick_gap_detector.scan_local_cache()). A symbol absent from
+        this dict is fetched open-ended, same as before.
 
         Returns {symbol: DataFrame} — same columns/session-filtering as
         the old per-symbol _fetch_ticks() used to return — but issued as
@@ -1234,6 +1272,7 @@ class BackfillManager:
         if self.conn is None or not fetch_starts:
             return out
 
+        fetch_ends = fetch_ends or {}
         items = list(fetch_starts.items())
         skipped_no_table = []
 
@@ -1250,13 +1289,24 @@ class BackfillManager:
                     skipped_no_table.append(symbol)
                     continue
                 start_ms = int(start_ts.timestamp() * 1000)
-                clauses.append(
-                    f"SELECT %s AS symbol, timestamp, ltp, "
-                    f"COALESCE(last_quantity, 0) AS qty, "
-                    f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
-                    f"WHERE timestamp >= %s AND ltp IS NOT NULL"
-                )
-                params.extend([symbol, start_ms])
+                end_ts = fetch_ends.get(symbol)
+                if end_ts is not None:
+                    end_ms = int(end_ts.timestamp() * 1000)
+                    clauses.append(
+                        f"SELECT %s AS symbol, timestamp, ltp, "
+                        f"COALESCE(last_quantity, 0) AS qty, "
+                        f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
+                        f"WHERE timestamp >= %s AND timestamp <= %s AND ltp IS NOT NULL"
+                    )
+                    params.extend([symbol, start_ms, end_ms])
+                else:
+                    clauses.append(
+                        f"SELECT %s AS symbol, timestamp, ltp, "
+                        f"COALESCE(last_quantity, 0) AS qty, "
+                        f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
+                        f"WHERE timestamp >= %s AND ltp IS NOT NULL"
+                    )
+                    params.extend([symbol, start_ms])
 
             if not clauses:
                 continue
@@ -1265,11 +1315,7 @@ class BackfillManager:
 
             chunk_num = i // chunk_size + 1
             total_chunks = (len(items) + chunk_size - 1) // chunk_size
-            print(
-                f"[BACKFILL] Fetching main-db ticks: chunk {chunk_num}/{total_chunks} "
-                f"({len(clauses)} symbol(s))...",
-                flush=True,
-            )
+            self._progress("Fetching main-db ticks", chunk_num, total_chunks)
 
             try:
                 self._ensure_connected()
@@ -1402,10 +1448,14 @@ class BackfillManager:
     # of a raw_json blob.
     _DEPTH_LEVEL_COLUMNS = DEPTH_LEVEL_COLUMNS
 
-    def _fetch_depth_batch(self, fetch_starts: dict, existing_tables: set) -> dict:
+    def _fetch_depth_batch(self, fetch_starts: dict, existing_tables: set, fetch_ends: dict = None) -> dict:
         """
         fetch_starts: {symbol: start_ts} — same shape as
         _fetch_ticks_batch's parameter, just for depth_<symbol> tables.
+
+        fetch_ends: optional {symbol: end_ts} — same meaning as
+        _fetch_ticks_batch's fetch_ends; a symbol absent from it is
+        fetched open-ended, same as before.
 
         Returns {symbol: set(timestamp_ms)} — ONLY timestamps, not the
         full bids/asks payload (see the comment at the return-value
@@ -1426,6 +1476,7 @@ class BackfillManager:
         if self.conn is None or not fetch_starts:
             return out
 
+        fetch_ends = fetch_ends or {}
         items = list(fetch_starts.items())
         skipped_no_table = []
 
@@ -1444,11 +1495,20 @@ class BackfillManager:
                     skipped_no_table.append(symbol)
                     continue
                 start_ms = int(start_ts.timestamp() * 1000)
-                clauses.append(
-                    f"SELECT %s AS symbol, timestamp, ltp, {level_cols_sql} "
-                    f"FROM {table} WHERE timestamp >= %s"
-                )
-                params.extend([symbol, start_ms])
+                end_ts = fetch_ends.get(symbol)
+                if end_ts is not None:
+                    end_ms = int(end_ts.timestamp() * 1000)
+                    clauses.append(
+                        f"SELECT %s AS symbol, timestamp, ltp, {level_cols_sql} "
+                        f"FROM {table} WHERE timestamp >= %s AND timestamp <= %s"
+                    )
+                    params.extend([symbol, start_ms, end_ms])
+                else:
+                    clauses.append(
+                        f"SELECT %s AS symbol, timestamp, ltp, {level_cols_sql} "
+                        f"FROM {table} WHERE timestamp >= %s"
+                    )
+                    params.extend([symbol, start_ms])
 
             if not clauses:
                 continue
@@ -1767,6 +1827,20 @@ class BackfillManager:
             "connect_timeout": 10,
         }
 
+    def _daily_retention_cutoff_ms(self) -> int:
+        """
+        Epoch-ms cutoff for the local daily-candle cache's retention
+        window: keep only the most recent 30 TRADING days (not 30
+        calendar days) — same trading-day sizing convention used
+        everywhere else in this file (see _compute_lookback_start()).
+        Anything timestamped before this cutoff gets pruned from the
+        LOCAL mirror only in fetch_daily_candles()'s prune phase — the
+        source market_history table is never touched.
+        """
+        cutoff_date = trading_day_n_back(30)
+        cutoff_dt   = datetime.combine(cutoff_date, dtime.min, tzinfo=tz_kolkata)
+        return int(cutoff_dt.timestamp() * 1000)
+
     def fetch_daily_candles(self, symbols) -> None:
         """
         Mirror market_history's daily_<symbol> tables (written by
@@ -1787,14 +1861,29 @@ class BackfillManager:
         database. This method only makes daily_<symbol> queryable
         locally — wiring it into candle-building is a separate step.
 
-        Incremental: tracks MAX(timestamp) already present in the LOCAL
-        daily_<symbol> table and only pulls newer rows from
-        market_history on each run, same "resume from last cached point"
-        convention used everywhere else in this file. A per-symbol
-        UNIQUE index on timestamp (matching the source's own
-        dedup_on_timestamp=True) makes the insert idempotent via
-        ON CONFLICT DO NOTHING, so even a re-fetched overlapping range is
-        harmless.
+        Three explicit phases, matching the check-then-fetch pattern
+        used for ticks elsewhere in this file (TickGapDetector.
+        scan_local_cache() + sync_local_cache_with_main_db()) instead
+        of doing the local-cache check and the fetch interleaved,
+        symbol-by-symbol, in one pass like this used to:
+
+          Phase 1 — check: for every symbol, look at what the LOCAL
+          daily_<symbol> table already has (just MAX(timestamp) — daily
+          candles arrive append-only from the source with no mid-range
+          gaps to detect, unlike ticks, so this is simpler than
+          scan_local_cache()) and note the resume point.
+          Phase 2 — fetch: pull only rows newer than that resume point
+          from market_history for each symbol — never a full re-fetch.
+          A per-symbol UNIQUE index on timestamp (matching the source's
+          own dedup_on_timestamp=True) makes the insert idempotent via
+          ON CONFLICT DO NOTHING too, so even a re-fetched overlapping
+          range would be harmless — belt-and-suspenders alongside the
+          "only fetch what's newer" resume logic.
+          Phase 3 — prune: delete local rows older than the
+          30-trading-day retention window (_daily_retention_cutoff_ms()).
+          Runs every time for every locally-cached symbol, independent
+          of whether that symbol had anything new to fetch this run —
+          this is what keeps the local mirror from growing forever.
         """
         history_conn = self._get_history_conn()
         if history_conn is None:
@@ -1819,12 +1908,19 @@ class BackfillManager:
             )
             return
 
-        total_rows_fetched    = 0
-        total_symbols_written = 0
-        total_symbols_skipped = 0
+        cutoff_ts_ms = self._daily_retention_cutoff_ms()
+
+        resume_points          = {}   # symbol -> local MAX(timestamp), or None if empty
+        tables_by_symbol       = {}   # symbol -> local table name (only symbols with a source table)
+        total_symbols_skipped  = 0
+        total_rows_fetched     = 0
+        total_symbols_written  = 0
+        total_rows_pruned      = 0
 
         try:
             local_cur = local_conn.cursor()
+
+            # Phase 1 — check: what does the local cache already have?
             for i, inst in enumerate(symbols, start=1):
                 symbol   = inst["symbol"]
                 safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_").lower()
@@ -1832,7 +1928,7 @@ class BackfillManager:
 
                 if table not in daily_existing:
                     total_symbols_skipped += 1
-                    self._progress("Fetching daily candles", i, len(symbols))
+                    self._progress("Checking local daily cache", i, len(symbols))
                     continue
 
                 # Same DDL as x9_data_fetcher's pg_writer.py _ensure_table
@@ -1851,7 +1947,22 @@ class BackfillManager:
 
                 local_cur.execute(f"SELECT MAX(timestamp) FROM {table}")
                 row = local_cur.fetchone()
-                local_max_ts = row[0] if row else None
+                resume_points[symbol]    = row[0] if row else None
+                tables_by_symbol[symbol] = table
+                local_conn.commit()   # commit CREATE TABLE/INDEX even if there's nothing to fetch yet
+
+                self._progress("Checking local daily cache", i, len(symbols))
+
+            print(
+                f"[BACKFILL] Daily cache check complete | {len(tables_by_symbol)}/{len(symbols)} "
+                f"symbol(s) have a daily_ table in history db "
+                f"({total_symbols_skipped} skipped — no daily_ table in history db)",
+                flush=True,
+            )
+
+            # Phase 2 — fetch: pull only what's not present locally.
+            for i, (symbol, table) in enumerate(tables_by_symbol.items(), start=1):
+                local_max_ts = resume_points[symbol]
 
                 hist_cur = history_conn.cursor()
                 try:
@@ -1897,17 +2008,29 @@ class BackfillManager:
                         rows,
                     )
                     local_conn.commit()
-                    total_rows_fetched += len(rows)
+                    total_rows_fetched    += len(rows)
                     total_symbols_written += 1
-                else:
-                    local_conn.commit()  # commit the CREATE TABLE/INDEX even with 0 new rows
 
-                self._progress("Fetching daily candles", i, len(symbols))
+                self._progress("Fetching daily candles", i, len(tables_by_symbol))
 
             print(
                 f"[BACKFILL] Daily candle fetch complete | {total_rows_fetched} row(s) "
-                f"across {total_symbols_written} symbol(s) "
-                f"({total_symbols_skipped} skipped — no daily_ table in history db)",
+                f"across {total_symbols_written} symbol(s)",
+                flush=True,
+            )
+
+            # Phase 3 — prune: drop anything older than the 30-trading-day
+            # retention window, for every locally-cached symbol (not just
+            # ones that had something new to fetch this run).
+            for i, (symbol, table) in enumerate(tables_by_symbol.items(), start=1):
+                local_cur.execute(f"DELETE FROM {table} WHERE timestamp < %s", (cutoff_ts_ms,))
+                total_rows_pruned += local_cur.rowcount
+                local_conn.commit()
+                self._progress("Pruning local daily cache", i, len(tables_by_symbol))
+
+            print(
+                f"[BACKFILL] Daily candle prune complete | {total_rows_pruned} row(s) older than "
+                f"30 trading days removed across {len(tables_by_symbol)} symbol(s)",
                 flush=True,
             )
         except Exception as exc:

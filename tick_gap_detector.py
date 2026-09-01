@@ -199,6 +199,7 @@ class TickGapDetector:
                 phantom_range    = None
                 phantom_local_ts = None
                 confirmed_outage = False
+                fetch_end_ms     = None
 
                 if last_ms is not None and last_ms >= start_ms:
                     cached_df = self._rows_to_df(cached_rows_chunk.get(symbol, []))
@@ -223,17 +224,22 @@ class TickGapDetector:
                     # being missing an entire leading chunk — silently
                     # under-covering the window with no warning. Catch
                     # that here: if the earliest cached row starts
-                    # meaningfully later than start_ms, treat the whole
-                    # range as needing a fresh fetch from start_ms.
-                    # Re-fetching the already-covered middle portion
-                    # this causes is safe/idempotent (local cache writes
-                    # dedup on timestamp) — it only costs a bit of
-                    # redundant work, and only on the run right after
-                    # the window was widened.
+                    # meaningfully later than start_ms, only the leading
+                    # slice before that row (start_ms .. earliest_cached_ms-1)
+                    # is actually missing — everything from
+                    # earliest_cached_ms onward already passed the gap
+                    # check above and doesn't need touching. Fetch just
+                    # that leading slice via fetch_end_ms, instead of
+                    # re-fetching (and re-writing on top of) the whole
+                    # already-covered range through now: the writer has
+                    # no dedup-on-timestamp, so re-inserting rows that
+                    # already exist would leave duplicates behind, not
+                    # just cost extra time.
                     if not cached_df.empty:
                         earliest_cached_ms = int(cached_df["timestamp"].min())
                         if earliest_cached_ms > start_ms + threshold_secs * 1000:
                             cached_until_ms = None
+                            fetch_end_ms = earliest_cached_ms - 1
 
                     del cached_df   # this symbol's raw rows are done being used
 
@@ -241,6 +247,7 @@ class TickGapDetector:
 
                 out[symbol] = {
                     "fetch_start_ms":   fetch_start_ms if fetch_start_ms < now_ms else None,
+                    "fetch_end_ms":     fetch_end_ms,
                     "phantom_range":    phantom_range,
                     "phantom_local_ts": phantom_local_ts,
                     "confirmed_outage": confirmed_outage,
