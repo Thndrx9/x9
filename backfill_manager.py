@@ -337,7 +337,7 @@ class BackfillManager:
         end = "\n" if current >= total else ""
         print(f"\r[BACKFILL] {label}: {current}/{total} symbols", end=end, flush=True)
 
-    def _load_existing_tables(self, conn, prefix: str = "quote") -> set:
+    def _load_existing_tables(self, conn, prefix: str = "quote") -> Optional[set]:
         """
         One query: which <prefix>_% tables actually exist in this db
         (prefix is "quote" or "depth"). Needed BEFORE building any
@@ -345,6 +345,19 @@ class BackfillManager:
         even one clause references a table that doesn't exist, so
         symbols without a table yet get filtered out up front instead
         of blowing up the whole chunk.
+
+        Returns None (not an empty set) on a genuine query failure —
+        callers MUST treat that as "unknown, don't trust this" rather
+        than "confirmed: no tables exist". Those used to be the same
+        return value (set()), which meant a plain connection drop
+        during this check (a real ERROR, printed right below) was
+        silently indistinguishable from every single symbol genuinely
+        having no table — and every downstream fetch quietly skipped
+        the entire universe with only a WARN, not the connection-level
+        failure that actually caused it. Seen in practice: this check's
+        connection died mid-query while the DB was under load from an
+        unrelated in-flight backfill, and all 199 symbols got skipped
+        for depth with nothing louder than "no depth_ table found".
         """
         if conn is None:
             return set()
@@ -364,11 +377,36 @@ class BackfillManager:
                 conn.rollback()
             except Exception:
                 pass
-            return set()
+            return None
 
-    def _load_existing_quote_tables(self, conn) -> set:
+    def _load_existing_quote_tables(self, conn) -> Optional[set]:
         """Back-compat alias — see _load_existing_tables()."""
         return self._load_existing_tables(conn, prefix="quote")
+
+    def _existing_tables_or_empty(self, existing_tables: Optional[set], prefix: str, context: str) -> set:
+        """
+        Every call site below needs a plain set to hand to downstream
+        code (UNION ALL batch building, membership checks, etc.), so
+        this is where None (a genuine query/connection failure — see
+        _load_existing_tables()'s docstring) gets converted to one.
+        Kept as a single, explicit conversion point specifically so
+        that conversion is loud and distinguishable from a confirmed
+        empty result, rather than silently indistinguishable the way
+        it used to be. Downstream code proceeds as if there are no
+        {prefix}_ tables either way (avoids aborting the whole run over
+        what's often a transient blip), but at least the log now says
+        clearly which one actually happened.
+        """
+        if existing_tables is None:
+            print(
+                f"[BACKFILL][ERROR] {context}: could not confirm which {prefix}_ tables exist "
+                f"(see failure above) — proceeding as if NONE do for this run. This is NOT the "
+                f"same as confirmed-empty; every symbol will be skipped below with a WARN, but "
+                f"the real cause is this connection failure, not missing tables.",
+                flush=True,
+            )
+            return set()
+        return existing_tables
 
     # ─────────────────────────────────────────────
     # Entry point
@@ -408,7 +446,9 @@ class BackfillManager:
             flush=True,
         )
 
-        existing_tables = self._load_existing_quote_tables(self.conn)
+        existing_tables = self._existing_tables_or_empty(
+            self._load_existing_quote_tables(self.conn), "quote", "startup tick backfill (main db)"
+        )
 
         quote_outage_windows = []
         if self.conn_log_dir:
@@ -433,8 +473,9 @@ class BackfillManager:
         # here instead means it's opened right when it's about to be
         # used.
         history_conn = self._get_history_conn()
-        history_existing_tables = (
-            self._load_existing_quote_tables(history_conn) if history_conn is not None else set()
+        history_existing_tables = self._existing_tables_or_empty(
+            self._load_existing_quote_tables(history_conn) if history_conn is not None else set(),
+            "quote", "startup tick backfill (history db)",
         )
 
         # Step 2 — make the local history-candle cache correct.
@@ -590,7 +631,9 @@ class BackfillManager:
         # chunk's data, then everything is discarded before the next
         # chunk starts. Exactly mirrors sync_local_cache_with_main_db's
         # quote-tick loop.
-        depth_existing_tables = self._load_existing_tables(self.conn, prefix="depth")
+        depth_existing_tables = self._existing_tables_or_empty(
+            self._load_existing_tables(self.conn, prefix="depth"), "depth", "depth backfill"
+        )
         fetch_items = list(fetch_starts.items())
         total_phantom_rows = 0
         phantom_symbols = set()
@@ -761,7 +804,9 @@ class BackfillManager:
             flush=True,
         )
 
-        existing_tables = self._load_existing_tables(self.conn, prefix=mode)
+        existing_tables = self._existing_tables_or_empty(
+            self._load_existing_tables(self.conn, prefix=mode), mode, f"{mode} targeted heal"
+        )
         if mode == "depth":
             self._fetch_depth_batch(fetch_starts, existing_tables)
         else:
@@ -1003,7 +1048,10 @@ class BackfillManager:
         if self.tick_writer is None or not symbols:
             return
 
-        existing_tables = self._load_existing_quote_tables(self.conn) if self.conn else set()
+        existing_tables = self._existing_tables_or_empty(
+            self._load_existing_quote_tables(self.conn) if self.conn else set(),
+            "quote", "pre-live catch-up",
+        )
         now = now_kolkata()
         default_start = now - timedelta(seconds=default_window_secs)
 
@@ -1861,17 +1909,33 @@ class BackfillManager:
         database. This method only makes daily_<symbol> queryable
         locally — wiring it into candle-building is a separate step.
 
-        Three explicit phases, matching the check-then-fetch pattern
+        Four explicit phases, matching the check-then-fetch pattern
         used for ticks elsewhere in this file (TickGapDetector.
         scan_local_cache() + sync_local_cache_with_main_db()) instead
         of doing the local-cache check and the fetch interleaved,
         symbol-by-symbol, in one pass like this used to:
 
           Phase 1 — check: for every symbol, look at what the LOCAL
-          daily_<symbol> table already has (just MAX(timestamp) — daily
-          candles arrive append-only from the source with no mid-range
-          gaps to detect, unlike ticks, so this is simpler than
-          scan_local_cache()) and note the resume point.
+          daily_<symbol> table already has (just MAX(timestamp) — see
+          Phase 1d below for the mid-range case that alone can't
+          catch) and note the resume point.
+          Phase 1d — mid-range gap check: MAX(timestamp) alone only
+          proves the cache is caught up at the LEADING edge; a day
+          silently missing in the MIDDLE of already-cached history
+          (e.g. a run that died partway through) would never surface
+          from a resume point alone, since every later day's presence
+          still makes MAX(timestamp) look fully caught up. Unlike
+          tick_gap_detector's LAG()-based approach, this can't use a
+          fixed gap-size threshold — daily candles don't have one
+          uniform expected cadence the way ticks do within a session
+          (weekends/holidays make the calendar itself irregular, so a
+          single missing weekday can be a SMALLER gap than a normal
+          weekend) — so instead it's an anti-join against the actual
+          trading-day calendar: the ~30 expected trading dates in the
+          retention window are computed once in Python and passed as
+          one array parameter, and each symbol's branch does
+          `expected EXCEPT actual` server-side to get back just its
+          missing dates, never a full row pull.
           Phase 2 — fetch: pull only rows newer than that resume point
           from market_history for each symbol — never a full re-fetch.
           A per-symbol UNIQUE index on timestamp (matching the source's
@@ -1893,7 +1957,9 @@ class BackfillManager:
             )
             return
 
-        daily_existing = self._load_existing_tables(history_conn, prefix="daily")
+        daily_existing = self._existing_tables_or_empty(
+            self._load_existing_tables(history_conn, prefix="daily"), "daily", "daily candle backfill"
+        )
         if not daily_existing:
             print("[BACKFILL] Daily candle fetch: no daily_ tables found in history db", flush=True)
             return
@@ -1921,44 +1987,254 @@ class BackfillManager:
             local_cur = local_conn.cursor()
 
             # Phase 1 — check: what does the local cache already have?
-            for i, inst in enumerate(symbols, start=1):
+            #
+            # This used to run CREATE TABLE + 2x CREATE INDEX + SELECT
+            # MAX(timestamp) separately for EVERY symbol — up to 4 real
+            # round trips x 199 symbols, every single run, even though
+            # the table/indexes only ever need creating once (after
+            # that, IF NOT EXISTS was just paying the round-trip cost to
+            # confirm something that was already true). Same shape as
+            # the quote/depth "199 individual queries" problem
+            # max_ts_batch() fixed in tick_writer.py, so it gets the
+            # same two-step fix here:
+            #   1a. one batched existence check (tablename = ANY(%s))
+            #       for which LOCAL daily_ tables already exist
+            #   1b. CREATE TABLE/INDEX only for the symbols actually
+            #       missing one locally (first run only, in practice)
+            #   1c. one UNION ALL per chunk for MAX(timestamp) across
+            #       every symbol whose local table now exists, instead
+            #       of one SELECT per symbol
+            symbol_table = {}
+            for inst in symbols:
                 symbol   = inst["symbol"]
                 safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_").lower()
                 table    = f"daily_{safe_sym}"
-
-                if table not in daily_existing:
+                if table in daily_existing:
+                    symbol_table[symbol] = table
+                else:
                     total_symbols_skipped += 1
-                    self._progress("Checking local daily cache", i, len(symbols))
-                    continue
 
-                # Same DDL as x9_data_fetcher's pg_writer.py _ensure_table
-                # for prefix="daily" — table name included, verbatim.
+            # 1a. Which of these tables already exist in the LOCAL cache?
+            # One round trip regardless of symbol count.
+            all_local_tables = list(symbol_table.values())
+            existing_local_tables = set()
+            if all_local_tables:
                 local_cur.execute(
-                    f"CREATE TABLE IF NOT EXISTS {table} ("
-                    f"    timestamp BIGINT NOT NULL,"
-                    f"    ingest_ns BIGINT,"
-                    f"    raw_json JSONB NOT NULL"
-                    f")"
+                    "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                    (all_local_tables,),
                 )
-                local_cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)")
-                local_cur.execute(
-                    f"CREATE UNIQUE INDEX IF NOT EXISTS uidx_{table}_ts ON {table} (timestamp)"
+                existing_local_tables = {row[0] for row in local_cur.fetchall()}
+
+            # 1b. DDL can't be batched into one round trip the way a read
+            # can (each CREATE TABLE is its own statement) — but this
+            # only runs for a symbol the very first time its daily_
+            # table is mirrored locally, so after the first run this
+            # loop is empty for everyone.
+            newly_created = 0
+            for i, (symbol, table) in enumerate(symbol_table.items(), start=1):
+                if table not in existing_local_tables:
+                    # Same DDL as x9_data_fetcher's pg_writer.py
+                    # _ensure_table for prefix="daily" — table name
+                    # included, verbatim.
+                    local_cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {table} ("
+                        f"    timestamp BIGINT NOT NULL,"
+                        f"    ingest_ns BIGINT,"
+                        f"    raw_json JSONB NOT NULL"
+                        f")"
+                    )
+                    local_cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table} ON {table} (timestamp)")
+                    local_cur.execute(
+                        f"CREATE UNIQUE INDEX IF NOT EXISTS uidx_{table}_ts ON {table} (timestamp)"
+                    )
+                    local_conn.commit()
+                    newly_created += 1
+                self._progress("Checking local daily cache", i, len(symbol_table))
+
+            tables_by_symbol = dict(symbol_table)
+            resume_points = {s: None for s in tables_by_symbol}
+
+            # 1c. Batched MAX(timestamp) resume-point check — one UNION
+            # ALL per chunk instead of one SELECT per symbol, same
+            # savepoint-per-chunk isolation as tick_writer.max_ts_batch()
+            # so one bad/corrupt table can't blank out the rest of the
+            # chunk's results.
+            _DAILY_CHUNK_SIZE = 150
+            symbol_items = list(tables_by_symbol.items())
+            for start in range(0, len(symbol_items), _DAILY_CHUNK_SIZE):
+                chunk = symbol_items[start:start + _DAILY_CHUNK_SIZE]
+                branches, params = [], []
+                for s, t in chunk:
+                    branches.append(f"SELECT %s AS symbol, MAX(timestamp) AS max_ts FROM {t}")
+                    params.append(s)
+                query = " UNION ALL ".join(branches)
+
+                local_cur.execute("SAVEPOINT sp_daily_maxts_chunk")
+                try:
+                    local_cur.execute(query, params)
+                    for sym, max_ts in local_cur.fetchall():
+                        resume_points[sym] = max_ts
+                    local_cur.execute("RELEASE SAVEPOINT sp_daily_maxts_chunk")
+                except Exception as exc:
+                    local_cur.execute("ROLLBACK TO SAVEPOINT sp_daily_maxts_chunk")
+                    print(
+                        f"[BACKFILL][WARN] daily cache MAX(timestamp) batch failed ({exc}); "
+                        f"falling back to per-symbol checks for this chunk ({len(chunk)} symbols)",
+                        flush=True,
+                    )
+                    for s, t in chunk:
+                        try:
+                            local_cur.execute(f"SELECT MAX(timestamp) FROM {t}")
+                            row = local_cur.fetchone()
+                            resume_points[s] = row[0] if row else None
+                            local_conn.commit()
+                        except Exception as inner_exc:
+                            print(f"[BACKFILL][WARN] daily MAX(timestamp) failed for {s}: {inner_exc}", flush=True)
+                            local_conn.rollback()
+                local_conn.commit()
+                self._progress(
+                    "Checking local daily cache", min(start + _DAILY_CHUNK_SIZE, len(symbol_items)), len(symbol_items)
                 )
-
-                local_cur.execute(f"SELECT MAX(timestamp) FROM {table}")
-                row = local_cur.fetchone()
-                resume_points[symbol]    = row[0] if row else None
-                tables_by_symbol[symbol] = table
-                local_conn.commit()   # commit CREATE TABLE/INDEX even if there's nothing to fetch yet
-
-                self._progress("Checking local daily cache", i, len(symbols))
 
             print(
                 f"[BACKFILL] Daily cache check complete | {len(tables_by_symbol)}/{len(symbols)} "
                 f"symbol(s) have a daily_ table in history db "
-                f"({total_symbols_skipped} skipped — no daily_ table in history db)",
+                f"({total_symbols_skipped} skipped — no daily_ table in history db, "
+                f"{newly_created} newly mirrored locally)",
                 flush=True,
             )
+
+            # Phase 1d — mid-range gap check: Phase 1c's resume points
+            # only catch gaps at the LEADING edge (Phase 2 fetches
+            # "newer than local MAX(timestamp)") — a day silently
+            # missing in the MIDDLE of already-cached history (a run
+            # that died partway through, a transient history-db hiccup
+            # on one specific date) would never surface from a resume
+            # point alone, since every later day's presence still makes
+            # MAX(timestamp) look fully caught up.
+            #
+            # Tried a straight port of tick_gap_detector's LAG()
+            # approach first (flag any consecutive-row gap bigger than
+            # a fixed day count) — it doesn't actually work here. Ticks
+            # have one uniform expected cadence throughout a session, so
+            # "bigger than usual" is a clean signal; daily candles don't
+            # — the calendar itself is irregular (weekends, holidays),
+            # so a single midweek day silently missing (Tue -> Thu, a
+            # 2-day gap) is SMALLER than a completely ordinary Friday ->
+            # Monday weekend (3 days). Any fixed threshold generous
+            # enough to not misfire on every normal weekend also lets a
+            # single missing day sail straight through — confirmed by
+            # testing both cases before shipping this.
+            #
+            # The correct check is an anti-join against the actual
+            # trading calendar (already known in Python via
+            # trading_day_n_back()/is_trading_day() — the same source
+            # of truth _daily_retention_cutoff_ms() uses), not a
+            # distance-based heuristic. Still pushed into Postgres in
+            # the same spirit as session_gap_batch() though: the full
+            # list of expected trading dates in the retention window
+            # (~30 of them) is passed once as an array parameter, and
+            # each symbol's branch does `expected EXCEPT actual` to get
+            # back only the missing dates — a handful of small date
+            # values per symbol, never a full row pull.
+            expected_dates = []
+            day = trading_day_n_back(30)
+            yesterday = (now_kolkata() - timedelta(days=1)).date()
+            while day <= yesterday:
+                if is_trading_day(day):
+                    expected_dates.append(day)
+                day += timedelta(days=1)
+
+            missing_dates_by_symbol = {}
+            if expected_dates:
+                for start in range(0, len(symbol_items), _DAILY_CHUNK_SIZE):
+                    chunk = symbol_items[start:start + _DAILY_CHUNK_SIZE]
+                    branches, params = [], []
+                    for s, t in chunk:
+                        branches.append(f"""
+                            SELECT %s AS symbol, missing.d AS missing_date
+                            FROM (
+                                SELECT unnest(%s::date[]) AS d
+                                EXCEPT
+                                SELECT (to_timestamp(timestamp / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                                FROM {t}
+                                WHERE timestamp >= %s
+                            ) missing
+                        """)
+                        params.extend([s, expected_dates, cutoff_ts_ms])
+                    query = " UNION ALL ".join(branches)
+
+                    local_cur.execute("SAVEPOINT sp_daily_gap_chunk")
+                    try:
+                        local_cur.execute(query, params)
+                        for sym, missing_date in local_cur.fetchall():
+                            missing_dates_by_symbol.setdefault(sym, []).append(missing_date)
+                        local_cur.execute("RELEASE SAVEPOINT sp_daily_gap_chunk")
+                    except Exception as exc:
+                        local_cur.execute("ROLLBACK TO SAVEPOINT sp_daily_gap_chunk")
+                        print(
+                            f"[BACKFILL][WARN] daily gap-check batch failed ({exc}) — "
+                            f"skipping mid-range gap check for this chunk ({len(chunk)} symbols)",
+                            flush=True,
+                        )
+                    local_conn.commit()
+
+            if missing_dates_by_symbol:
+                preview = ", ".join(list(missing_dates_by_symbol)[:10])
+                more = f" (+{len(missing_dates_by_symbol) - 10} more)" if len(missing_dates_by_symbol) - 10 > 0 else ""
+                total_missing_dates = sum(len(v) for v in missing_dates_by_symbol.values())
+                print(
+                    f"[BACKFILL][WARN] {len(missing_dates_by_symbol)} symbol(s) have "
+                    f"{total_missing_dates} confirmed missing trading day(s) in their "
+                    f"cached daily candles — re-fetching just those dates: {preview}{more}",
+                    flush=True,
+                )
+
+                total_gap_rows_filled = 0
+                for symbol, missing_dates in missing_dates_by_symbol.items():
+                    table = tables_by_symbol[symbol]
+                    day_start_ms = int(datetime.combine(min(missing_dates), dtime.min, tzinfo=tz_kolkata).timestamp() * 1000)
+                    day_end_ms   = int(datetime.combine(max(missing_dates) + timedelta(days=1), dtime.min, tzinfo=tz_kolkata).timestamp() * 1000)
+
+                    hist_cur = history_conn.cursor()
+                    try:
+                        hist_cur.execute(
+                            f"SELECT timestamp, ingest_ns, raw_json FROM {table} "
+                            f"WHERE timestamp >= %s AND timestamp < %s ORDER BY timestamp",
+                            (day_start_ms, day_end_ms),
+                        )
+                        rows = hist_cur.fetchall()
+                    except Exception as exc:
+                        print(f"[BACKFILL][WARN] daily gap re-fetch failed for {symbol}: {exc}", flush=True)
+                        rows = []
+                    finally:
+                        hist_cur.close()
+
+                    if rows:
+                        rows = [
+                            (
+                                ts,
+                                ingest_ns,
+                                psycopg2.extras.Json(raw_json) if isinstance(raw_json, dict) else raw_json,
+                            )
+                            for ts, ingest_ns, raw_json in rows
+                        ]
+                        psycopg2.extras.execute_values(
+                            local_cur,
+                            f"INSERT INTO {table} (timestamp, ingest_ns, raw_json) VALUES %s "
+                            f"ON CONFLICT (timestamp) DO NOTHING",
+                            rows,
+                        )
+                        local_conn.commit()
+                        total_gap_rows_filled += len(rows)
+
+                if total_gap_rows_filled:
+                    print(
+                        f"[BACKFILL] Daily mid-range gap fill complete | "
+                        f"{total_gap_rows_filled} row(s) recovered across "
+                        f"{len(missing_dates_by_symbol)} symbol(s)",
+                        flush=True,
+                    )
 
             # Phase 2 — fetch: pull only what's not present locally.
             for i, (symbol, table) in enumerate(tables_by_symbol.items(), start=1):

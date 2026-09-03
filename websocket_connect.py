@@ -19,6 +19,7 @@ async def websocket_client(
     depth_levels: int = 5,
     conn_log_dir: Optional[str] = None,
     on_reconnect: Optional[Callable[[str, "datetime", "datetime"], Awaitable]] = None,
+    background_tasks: Optional[set] = None,
 ):
     """
     WebSocket connection only:
@@ -37,6 +38,11 @@ async def websocket_client(
     connection comes back up after a REAL mid-session drop (never on the
     day's first connect — there's nothing to heal then, since nothing
     was ever missed).
+
+    background_tasks: shared set the fire-and-forget heal task gets
+    added to (see below for why). Optional only so this module still
+    works standalone/in tests without engine_runtime.py wiring one up;
+    production always passes one.
     """
     if not ws_url:
         ws_url = DEFAULT_WS_URL
@@ -68,7 +74,27 @@ async def websocket_client(
                         # Fire-and-forget — the heal runs in the background
                         # via asyncio.to_thread (see engine_runtime.py), the
                         # live feed keeps flowing without waiting on it.
-                        asyncio.create_task(on_reconnect(mode_label, last_disconnect_at, now))
+                        #
+                        # Kept in `background_tasks` (and only removed once
+                        # actually done) specifically so engine_runtime.py's
+                        # shutdown sequence can find and wait for it. Before
+                        # this, the task from asyncio.create_task() here had
+                        # NO reference stored anywhere at all — shutdown had
+                        # zero way to even know it existed, let alone wait
+                        # for it, so a heal (and whatever candle-building/
+                        # backfill work it kicks off) could keep running
+                        # completely undetected well after "Shutdown
+                        # complete" was already printed. This is the
+                        # standard asyncio pattern for fire-and-forget tasks
+                        # (see the "Important" note in the asyncio.create_task
+                        # docs) — a bare asyncio.create_task() with nothing
+                        # holding a reference is only ever safe from garbage
+                        # collection by luck, and gives the caller no way to
+                        # ever find it again.
+                        heal_task = asyncio.create_task(on_reconnect(mode_label, last_disconnect_at, now))
+                        if background_tasks is not None:
+                            background_tasks.add(heal_task)
+                            heal_task.add_done_callback(background_tasks.discard)
                     last_disconnect_at = None
 
                 for inst in instruments:
@@ -168,6 +194,7 @@ async def run_market_data_feeds(
     conn_log_dir: Optional[str] = None,
     depth_levels: int = 5,
     on_reconnect: Optional[Callable[[str, "datetime", "datetime"], Awaitable]] = None,
+    background_tasks: Optional[set] = None,
 ):
     """
     Single entry point that owns BOTH the Quote and Depth connections.
@@ -185,6 +212,11 @@ async def run_market_data_feeds(
     own mode_label, so a Quote reconnect only ever triggers a Quote
     heal and a Depth reconnect only ever triggers a Depth heal.
 
+    background_tasks: shared set passed through to both connections
+    unchanged, so a heal fired from either one lands in the SAME set
+    engine_runtime.py watches at shutdown — see websocket_client's
+    docstring for why this exists at all.
+
     Both connections retry independently forever (each has its own
     try/except + reconnect loop), so a Depth-side drop never affects
     the Quote side and vice versa. This coroutine itself only returns
@@ -196,6 +228,7 @@ async def run_market_data_feeds(
             mode="Quote",
             conn_log_dir=conn_log_dir,
             on_reconnect=on_reconnect,
+            background_tasks=background_tasks,
         ),
         websocket_client(
             ws_url, api_key, instruments,
@@ -203,5 +236,6 @@ async def run_market_data_feeds(
             depth_levels=depth_levels,
             conn_log_dir=conn_log_dir,
             on_reconnect=on_reconnect,
+            background_tasks=background_tasks,
         ),
     )

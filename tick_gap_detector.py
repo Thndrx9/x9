@@ -177,19 +177,42 @@ class TickGapDetector:
             if tick_writer is not None else {}
         )
 
+        # session_gap_batch() (Postgres only) runs the whole "compare
+        # each tick to the one before it, flag big gaps" scan INSIDE the
+        # database via a LAG() window function, and hands back just two
+        # small numbers per symbol instead of every cached row. That's
+        # what lets this method skip read_ticks_batch()'s full-day pull
+        # entirely for the common case (no gap found). It's generic over
+        # `kind`, so quote and depth both get the same network savings
+        # with no separate code path — this loop never has to know which
+        # one it's scanning. SQLite has no server worth offloading to
+        # (it's a local file — there's no network cost to save), so it
+        # isn't given this method and the loop below falls back to the
+        # original full-row pandas scan for it automatically.
+        use_server_side_gap = tick_writer is not None and hasattr(tick_writer, "session_gap_batch")
+
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i:i + chunk_size]
 
-            ranges_needed = {
-                inst["symbol"]: (start_ms, last_ms_by_symbol[inst["symbol"]])
-                for inst in chunk
+            names_in_range = [
+                inst["symbol"] for inst in chunk
                 if last_ms_by_symbol.get(inst["symbol"]) is not None
                 and last_ms_by_symbol[inst["symbol"]] >= start_ms
-            }
-            cached_rows_chunk = (
-                tick_writer.read_ticks_batch(ranges_needed, kind=kind, conn=conn)
-                if tick_writer is not None and ranges_needed else {}
-            )
+            ]
+
+            gap_info_chunk = {}
+            cached_rows_chunk = {}
+            if names_in_range:
+                if use_server_side_gap:
+                    gap_info_chunk = tick_writer.session_gap_batch(
+                        names_in_range, kind=kind, start_ms=start_ms,
+                        threshold_secs=threshold_secs, conn=conn,
+                    )
+                else:
+                    ranges_needed = {
+                        name: (start_ms, last_ms_by_symbol[name]) for name in names_in_range
+                    }
+                    cached_rows_chunk = tick_writer.read_ticks_batch(ranges_needed, kind=kind, conn=conn)
 
             for j, inst in enumerate(chunk):
                 symbol  = inst["symbol"]
@@ -202,46 +225,85 @@ class TickGapDetector:
                 fetch_end_ms     = None
 
                 if last_ms is not None and last_ms >= start_ms:
-                    cached_df = self._rows_to_df(cached_rows_chunk.get(symbol, []))
-                    gap_result = self.find_cache_gap(cached_df, last_ms, threshold_secs, outage_windows)
+                    if use_server_side_gap:
+                        info = gap_info_chunk.get(symbol, {})
+                        earliest_ms = info.get("earliest_ms")
+                        gap_prev_ms = info.get("gap_prev_ms")
 
-                    if gap_result["gap_ms"] is not None:
-                        cached_until_ms  = gap_result["cached_until_ms"]
-                        phantom_range    = gap_result["phantom_range"]
-                        phantom_local_ts = gap_result["phantom_local_ts"]
-                        confirmed_outage = gap_result["confirmed_outage"]
-                    else:
-                        cached_until_ms = last_ms
+                        if gap_prev_ms is not None:
+                            cached_until_ms = gap_prev_ms
+                            phantom_range   = (gap_prev_ms + 1, last_ms)
+                            # The one place actual rows still have to
+                            # cross the network: we need the EXACT set of
+                            # locally-cached timestamps sitting past the
+                            # gap, so a later step can diff them against
+                            # a fresh re-fetch and delete whichever ones
+                            # don't get reconfirmed. But this only ever
+                            # runs for symbols where a gap was actually
+                            # found (rare) and only pulls the small tail
+                            # after it — never the full day.
+                            tail_rows = tick_writer.read_ticks_batch(
+                                {symbol: (gap_prev_ms + 1, last_ms)}, kind=kind, conn=conn
+                            ).get(symbol, [])
+                            phantom_local_ts = set(int(r["timestamp"]) for r in tail_rows)
 
-                    # find_cache_gap() (above) only checks for gaps
-                    # BETWEEN rows already in cached_df — it has no way
-                    # to know whether cached_df's own earliest row goes
-                    # back far enough to cover start_ms. If the lookback
-                    # window was just widened (a longer TF added,
-                    # MIN_CANDLES raised) and the newly-required older
-                    # days were never fetched before, cached_df would
-                    # look perfectly gap-free internally while still
-                    # being missing an entire leading chunk — silently
-                    # under-covering the window with no warning. Catch
-                    # that here: if the earliest cached row starts
-                    # meaningfully later than start_ms, only the leading
-                    # slice before that row (start_ms .. earliest_cached_ms-1)
-                    # is actually missing — everything from
-                    # earliest_cached_ms onward already passed the gap
-                    # check above and doesn't need touching. Fetch just
-                    # that leading slice via fetch_end_ms, instead of
-                    # re-fetching (and re-writing on top of) the whole
-                    # already-covered range through now: the writer has
-                    # no dedup-on-timestamp, so re-inserting rows that
-                    # already exist would leave duplicates behind, not
-                    # just cost extra time.
-                    if not cached_df.empty:
-                        earliest_cached_ms = int(cached_df["timestamp"].min())
-                        if earliest_cached_ms > start_ms + threshold_secs * 1000:
+                            if outage_windows:
+                                gap_start_dt = datetime.fromtimestamp(gap_prev_ms / 1000, tz=tz_kolkata)
+                                gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                                confirmed_outage = gap_matches_outage(gap_start_dt, gap_end_dt, outage_windows)
+                        else:
+                            cached_until_ms = last_ms
+
+                        # Same "widened lookback" leading-gap check as the
+                        # legacy path below, using the earliest_ms the
+                        # server already computed instead of re-deriving
+                        # it from a DataFrame — see the legacy branch's
+                        # comment for the full explanation.
+                        if earliest_ms is not None and earliest_ms > start_ms + threshold_secs * 1000:
                             cached_until_ms = None
-                            fetch_end_ms = earliest_cached_ms - 1
+                            fetch_end_ms = earliest_ms - 1
 
-                    del cached_df   # this symbol's raw rows are done being used
+                    else:
+                        cached_df = self._rows_to_df(cached_rows_chunk.get(symbol, []))
+                        gap_result = self.find_cache_gap(cached_df, last_ms, threshold_secs, outage_windows)
+
+                        if gap_result["gap_ms"] is not None:
+                            cached_until_ms  = gap_result["cached_until_ms"]
+                            phantom_range    = gap_result["phantom_range"]
+                            phantom_local_ts = gap_result["phantom_local_ts"]
+                            confirmed_outage = gap_result["confirmed_outage"]
+                        else:
+                            cached_until_ms = last_ms
+
+                        # find_cache_gap() (above) only checks for gaps
+                        # BETWEEN rows already in cached_df — it has no way
+                        # to know whether cached_df's own earliest row goes
+                        # back far enough to cover start_ms. If the lookback
+                        # window was just widened (a longer TF added,
+                        # MIN_CANDLES raised) and the newly-required older
+                        # days were never fetched before, cached_df would
+                        # look perfectly gap-free internally while still
+                        # being missing an entire leading chunk — silently
+                        # under-covering the window with no warning. Catch
+                        # that here: if the earliest cached row starts
+                        # meaningfully later than start_ms, only the leading
+                        # slice before that row (start_ms .. earliest_cached_ms-1)
+                        # is actually missing — everything from
+                        # earliest_cached_ms onward already passed the gap
+                        # check above and doesn't need touching. Fetch just
+                        # that leading slice via fetch_end_ms, instead of
+                        # re-fetching (and re-writing on top of) the whole
+                        # already-covered range through now: the writer has
+                        # no dedup-on-timestamp, so re-inserting rows that
+                        # already exist would leave duplicates behind, not
+                        # just cost extra time.
+                        if not cached_df.empty:
+                            earliest_cached_ms = int(cached_df["timestamp"].min())
+                            if earliest_cached_ms > start_ms + threshold_secs * 1000:
+                                cached_until_ms = None
+                                fetch_end_ms = earliest_cached_ms - 1
+
+                        del cached_df   # this symbol's raw rows are done being used
 
                 fetch_start_ms = (cached_until_ms + 1) if cached_until_ms is not None else start_ms
 
@@ -256,10 +318,10 @@ class TickGapDetector:
                 if progress:
                     progress(i + j + 1, len(symbols))
 
-            # cached_rows_chunk (this chunk's raw local-cache rows) falls
-            # out of scope here — nothing from it is retained beyond the
-            # small dicts written into `out` above.
-            del cached_rows_chunk
+            # Whatever this chunk pulled (server-side gap answers, or the
+            # legacy path's raw rows) falls out of scope here — nothing
+            # survives beyond the small dicts written into `out` above.
+            del gap_info_chunk, cached_rows_chunk
 
         return out
 

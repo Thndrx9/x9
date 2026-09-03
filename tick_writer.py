@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 import psycopg2
 import psycopg2.extras
 
-from market_time import tz_kolkata, trading_day_n_back
+from market_time import tz_kolkata, trading_day_n_back, MARKET_OPEN, MARKET_CLOSE
 
 
 def _safe_symbol(symbol: str) -> str:
@@ -1488,9 +1488,54 @@ class PostgresTickWriter:
     # headroom against genuine burstiness (quote+depth ticks for busy
     # symbols landing close together) — the earlier size was tuned
     # assuming steady arrival, which real market data isn't. Combined
-    # with the polling-delay fix above (the actual root cause), this is
+    # with the GIL-priority backpressure below (the actual root cause —
+    # see _yield_to_live_if_pressured()'s docstring), this is
     # defense-in-depth, not the primary fix.
     WRITER_POOL_SIZE = 9        # overridable via PG_LOCAL_WRITER_THREADS
+
+    # ── Live-writer GIL priority ──────────────────────────────────────
+    # CPython's GIL round-robins every RUNNABLE thread roughly equally
+    # by default — it has no concept of "this thread matters more".
+    # With WRITER_POOL_SIZE (9) bulk shard threads plus 1 live thread
+    # all runnable at once during a big concurrent backfill, the live
+    # thread only ever gets ~1/10th of available CPU turns purely by
+    # chance, even though it does far less total work per tick. That
+    # GIL/CPU starvation — not a queue-capacity problem, and not a DB
+    # lock (live and bulk write to entirely separate tables via
+    # entirely separate connections, see class docstring) — is what
+    # let the live queue's drain rate fall behind live tick arrival
+    # rate during a large backfill, producing "LIVE queue full" drops.
+    #
+    # Two levers, both applied, neither needing elevated OS privileges
+    # (real per-thread OS priority/SCHED_FIFO would need CAP_SYS_NICE
+    # and risks destabilizing the whole box if misused — not worth it
+    # for what's fundamentally a Python-level scheduling problem):
+    #
+    #   1. sys.setswitchinterval() lowered in __init__ — a process-wide
+    #      knob controlling how long any one thread can hold the GIL
+    #      before CPython checks whether another thread wants a turn.
+    #      Lower means the live thread waits less, worst-case, for its
+    #      next turn during any single bulk thread's CPU-bound stretch
+    #      (row/dict prep, JSON encoding) — a small, safe global tweak
+    #      that helps ALL threads' fairness, live included.
+    #   2. _yield_to_live_if_pressured() below — the real fix. Every
+    #      bulk shard thread checks the live queue's fill level between
+    #      items and voluntarily sleeps (proportional to how pressured
+    #      it is) before grabbing its next one, explicitly handing GIL
+    #      turns to the live thread exactly when it needs them. Costs
+    #      bulk throughput NOTHING when the live queue isn't under
+    #      pressure — it returns immediately below the threshold.
+    #
+    # This is NOT a mathematical guarantee of literally zero drops
+    # under any circumstance (e.g. Postgres itself being unreachable
+    # would stall the live thread regardless of how much GIL time it
+    # gets) — but it directly targets the actual mechanism that caused
+    # the drops seen in practice, and should eliminate them for the
+    # "big backfill running concurrently with live feed" scenario this
+    # was built for.
+    _LIVE_PRESSURE_THRESHOLD      = 0.5    # start backing bulk off once live queue is >50% full
+    _LIVE_PRESSURE_MAX_SLEEP_SECS = 0.02   # full-pressure pause per bulk item, per shard (20ms)
+    _GIL_SWITCH_INTERVAL_SECS     = 0.001  # default is 0.005s
 
     # Statement timeout (ms) applied to open_read_connection()'s
     # connection — see that method's docstring. This connection is only
@@ -1502,6 +1547,11 @@ class PostgresTickWriter:
 
     def __init__(self):
         self._params = auto_setup()
+
+        # See "Live-writer GIL priority" above — process-wide, safe,
+        # done once here since PostgresTickWriter is effectively a
+        # singleton per process.
+        sys.setswitchinterval(self._GIL_SWITCH_INTERVAL_SECS)
 
         self.pool_size = max(1, int(os.getenv("PG_LOCAL_WRITER_THREADS", str(self.WRITER_POOL_SIZE))))
 
@@ -2087,6 +2137,179 @@ class PostgresTickWriter:
                     result[s] = self.max_ts(s, kind=kind, source=source, conn=None)
         return result
 
+    def _session_gap_query(self, table: str, time_col: str) -> str:
+        """One symbol's branch for session_gap_batch()/_session_gap_single()
+        below. Pure server-side twin of
+        TickGapDetector.first_suspicious_gap_ms(): LAG() gets each row's
+        previous timestamp, then a single FILTER'd MIN() picks out the
+        earliest pair that's on the same IST calendar day, both inside
+        market hours, and further apart than the threshold — exactly the
+        same three conditions first_suspicious_gap_ms() checks in pandas.
+        Because rows are scanned in ts order, the smallest qualifying
+        prev_ts IS the first (chronologically earliest) suspicious gap,
+        so a plain MIN() reproduces pandas' ".iloc[0]" without needing to
+        materialize or sort anything client-side.
+
+        Param order per branch: (symbol_label, threshold_ms, MARKET_OPEN,
+        MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE, start_ms).
+        """
+        return f"""
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms
+            FROM (
+                SELECT
+                    MIN(t.{time_col}) AS earliest_ms,
+                    MIN(t.prev_ts) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_prev_ms
+                FROM (
+                    SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
+                    FROM {table}
+                    WHERE {time_col} >= %s
+                ) t
+            ) agg
+        """
+
+    def _session_gap_single(self, symbol: str, table: str, time_col: str,
+                             threshold_ms: int, start_ms: int, conn) -> dict:
+        """Per-symbol fallback used when a chunk branch in
+        session_gap_batch() fails — same query, one table at a time."""
+        try:
+            cur = conn.cursor()
+            query = self._session_gap_query(table, time_col)
+            cur.execute(query, [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE,
+                                 MARKET_OPEN, MARKET_CLOSE, int(start_ms)])
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2]}
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap single-symbol query for {symbol} failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"earliest_ms": None, "gap_prev_ms": None}
+
+    def session_gap_batch(self, symbols: list, kind: str = "quote", start_ms: int = 0,
+                           threshold_secs: int = 300, source: str = "backfill",
+                           conn=None) -> dict:
+        """
+        Server-side twin of TickGapDetector.first_suspicious_gap_ms(), run
+        entirely inside Postgres via the LAG() window function, so
+        BackfillManager's cache-check no longer has to pull a symbol's
+        full day of ticks (or depth snapshots) across the network just to
+        look for one silent gap. The database still scans every row —
+        that work doesn't disappear — but only a couple of small numbers
+        per symbol cross the wire instead of the whole cached range.
+
+        Returns {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None}}
+          - earliest_ms: MIN(time_col) among rows >= start_ms, or None if
+            the table has no rows in range (used by scan_local_cache() to
+            detect a widened lookback whose leading edge was never
+            fetched — see its comment on "earliest cached row").
+          - gap_prev_ms: ts of the tick immediately before the first
+            silent same-session gap (same IST day, both ticks inside
+            market hours, gap > threshold_secs), or None if there isn't
+            one. Same value first_suspicious_gap_ms() would have returned
+            from the equivalent DataFrame.
+
+        kind selects quote_<symbol>_<source> vs depth_<symbol>_<source>
+        via table_name()/_time_col() exactly like max_ts_batch() and
+        read_ticks_batch() — this is what makes the optimization apply to
+        depth for free: scan_local_cache() already calls this generically
+        with kind="quote" or kind="depth", so depth's silent-gap check
+        gets the same network savings with no depth-specific code here.
+
+        Same batching shape as max_ts_batch(): one "which tables exist"
+        check, then one UNION ALL per chunk of _BATCH_CHUNK_SIZE symbols,
+        each isolated by its own savepoint so one bad/corrupt table can't
+        blank out the rest of the chunk — a failed branch falls back to
+        _session_gap_single() for just that symbol.
+        """
+        if not symbols:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
+        time_col = self._time_col(kind)
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None} for s in symbols}
+        threshold_ms = int(threshold_secs) * 1000
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_gap_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_gap_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_gap_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                _BATCH_CHUNK_SIZE = 100
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches, params = [], []
+                    for s in chunk:
+                        branches.append(self._session_gap_query(table_by_symbol[s], time_col))
+                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE,
+                                        MARKET_OPEN, MARKET_CLOSE, int(start_ms)])
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_gap_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, earliest_ms, gap_prev_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms}
+                        cur.execute("RELEASE SAVEPOINT sp_gap_chunk")
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_gap_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] session_gap_batch chunk failed ({exc}); "
+                            f"falling back to per-symbol queries for this chunk ({len(chunk)} symbols)",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            result[s] = self._session_gap_single(
+                                s, table_by_symbol[s], time_col, threshold_ms, start_ms, conn
+                            )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_batch failed: {exc}", flush=True)
+            for s in symbols:
+                if result[s]["earliest_ms"] is None and result[s]["gap_prev_ms"] is None:
+                    fresh_conn = None
+                    try:
+                        fresh_conn = psycopg2.connect(**self._params)
+                        result[s] = self._session_gap_single(
+                            s, table_by_symbol[s], time_col, threshold_ms, start_ms, fresh_conn
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        if fresh_conn is not None:
+                            fresh_conn.close()
+        return result
+
     def _read_ticks_chunk_with_bisection(self, cur, chunk, table_by_symbol, symbol_ranges,
                                           select_cols_sql, out_cols, result, conn, time_col="ts_ms",
                                           kind="quote", source="backfill", depth=0):
@@ -2542,6 +2765,33 @@ class PostgresTickWriter:
         state["pending_commit_rows"] += n
         state["rows_written_total"]  += n
 
+    def _yield_to_live_if_pressured(self):
+        """
+        Called by every bulk shard thread between items — see class
+        docstring's "Live-writer GIL priority" section for the full
+        story. Checks how full the live queue currently is and
+        voluntarily sleeps a proportional amount before this shard
+        grabs its next item, explicitly handing the GIL to whichever
+        thread wants it next (in practice, usually the live thread,
+        since it's the one actually starved).
+
+        Linear ramp from _LIVE_PRESSURE_THRESHOLD (a token nudge) up to
+        full (LIVE_QUEUE_MAXSIZE, the full _LIVE_PRESSURE_MAX_SLEEP_SECS
+        pause). Every bulk shard runs this independently and reads the
+        same shared queue's .qsize(), so at genuine max pressure all
+        WRITER_POOL_SIZE shards back off together — collectively
+        handing the live thread nearly the whole GIL until it catches
+        up. Below the threshold this is a single cheap .qsize() call
+        and an immediate return — zero cost to bulk throughput during
+        normal operation, when there's no pressure to relieve.
+        """
+        qsize = self._live_queue.qsize()
+        fill_ratio = qsize / self.LIVE_QUEUE_MAXSIZE
+        if fill_ratio <= self._LIVE_PRESSURE_THRESHOLD:
+            return
+        excess = (fill_ratio - self._LIVE_PRESSURE_THRESHOLD) / (1.0 - self._LIVE_PRESSURE_THRESHOLD)
+        time.sleep(self._LIVE_PRESSURE_MAX_SLEEP_SECS * min(1.0, excess))
+
     def _run_bulk(self, shard_idx: int):
         """
         One of self.pool_size bulk shard threads. Handles ONLY backfill
@@ -2549,7 +2799,8 @@ class PostgresTickWriter:
         (prune/delete/barrier/build_indexes) that piggyback on shard 0's
         connection — see class docstring. Live ticks never flow through
         here anymore (see _run_live()), so there's no batch-accumulation
-        or live/bulk priority juggling left to do — just drain bulk_q.
+        or live/bulk priority juggling left to do beyond
+        _yield_to_live_if_pressured() below — just drain bulk_q.
         """
         bulk_q = self._bulk_queues[shard_idx]
         state  = self._shard_state[shard_idx]
@@ -2562,6 +2813,8 @@ class PostgresTickWriter:
                 if stopping:
                     conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
                     break
+
+                self._yield_to_live_if_pressured()
 
                 try:
                     item = bulk_q.get(timeout=0.25)

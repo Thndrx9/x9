@@ -33,6 +33,11 @@ PARALLEL_BACKFILL_THRESHOLD_SECS = 60
 _HEAL_MAX_ATTEMPTS       = 3
 _HEAL_RETRY_BACKOFF_SECS = 3   # attempt N waits N * this many seconds before retrying
 
+# How long shutdown will WAIT (not cancel — see the shutdown block at
+# the bottom of run_engine()) for an in-flight backfill/heal task to
+# finish before giving up and logging loudly instead.
+BACKFILL_SHUTDOWN_TIMEOUT_SECS = int(os.getenv("BACKFILL_SHUTDOWN_TIMEOUT_SECS", "60"))
+
 # Where DAY_STARTED / RECONNECTED / DISCONNECTED events get logged for
 # the Quote-mode websocket connection (the one backfill/gap-detection
 # cares about for figuring out when the feed actually dropped).
@@ -216,6 +221,30 @@ async def run_engine(enable_trading: bool):
 
     tasks = []
 
+    # Tasks that hold backfill_lock (_run_backfill_and_release,
+    # _catchup_and_release below) spend nearly all their time inside
+    # asyncio.to_thread(...) running SYNCHRONOUS BackfillManager/
+    # psycopg2/pandas code. Cancelling such a task only detaches the
+    # *awaiting coroutine* — a running Python thread can't be
+    # force-killed, so the actual DB fetch/write underneath keeps going
+    # regardless, completely unsupervised. Tracked separately from
+    # `tasks` so shutdown WAITS for these instead of cancelling them —
+    # see the shutdown block at the bottom of this function.
+    backfill_tasks = []
+
+    # Mid-session heals (see _on_reconnect below) are fired from inside
+    # websocket_connect.py as bare asyncio.create_task() calls with no
+    # caller ever holding a reference — the standard fire-and-forget
+    # pattern, but it means shutdown here had literally no way to even
+    # know a heal was in flight, let alone wait for it. This set is
+    # threaded through run_market_data_feeds() -> websocket_client() so
+    # every heal task gets registered here the moment it's created (and
+    # removes itself once done via add_done_callback) — see
+    # websocket_client()'s docstring for the full story. Same
+    # "can't cancel, can only wait" situation as backfill_tasks, since
+    # a heal is just another asyncio.to_thread(...) wrapper.
+    heal_tasks = set()
+
     # Serializes every synchronous, DB-heavy backfill/heal operation
     # (startup backfill, pre-live catch-up, mid-session auto-heal) so
     # at most one runs at a time — see _run_backfill_safe()'s docstring
@@ -334,6 +363,7 @@ async def run_engine(enable_trading: bool):
                 conn_log_dir=CONN_LOG_DIR,
                 depth_levels=int(os.getenv("DEPTH_LEVELS", "5")),
                 on_reconnect=_on_reconnect,
+                background_tasks=heal_tasks,
             )
         ))
         tasks.append(asyncio.create_task(ohlc.run()))
@@ -381,7 +411,7 @@ async def run_engine(enable_trading: bool):
         # (see _run_backfill_and_release's docstring).
         tick_writer.hold()
         start_live_tasks()
-        tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
+        backfill_tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
     else:
         next_open      = _next_market_open(now)
@@ -395,7 +425,7 @@ async def run_engine(enable_trading: bool):
             )
             tick_writer.hold()
             start_live_tasks()
-            tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
+            backfill_tasks.append(asyncio.create_task(_run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
         else:
             # Market is closed and not imminent — block until backfill finishes
@@ -427,17 +457,55 @@ async def run_engine(enable_trading: bool):
                 # whatever landed in PG since backfill finished.
                 tick_writer.hold()
                 start_live_tasks()
-                tasks.append(asyncio.create_task(_catchup_and_release(ohlc, symbols, tick_writer, backfill_lock)))
+                backfill_tasks.append(asyncio.create_task(_catchup_and_release(ohlc, symbols, tick_writer, backfill_lock)))
 
     await stop_event.wait()
 
     if executor:
         await executor.shutdown_async()
 
+    # `tasks` only ever holds plain async loops (websocket feed dispatch,
+    # ohlc.run(), indicator_loop(), etc.) — none of them run synchronous
+    # work on a background thread, so cancelling them is genuinely
+    # effective and immediate.
     for t in tasks:
         t.cancel()
-
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    # backfill_tasks and heal_tasks are different: both spend nearly all
+    # their time inside asyncio.to_thread(...) running synchronous
+    # BackfillManager/psycopg2/pandas code, which — being a real OS
+    # thread — cannot be force-stopped by cancelling the asyncio task
+    # that's awaiting it. Cancelling here would just detach our only
+    # reference and let that thread keep writing to the DB completely
+    # unsupervised, with the log printing "Shutdown complete" while it's
+    # still going. Since it truly can't be stopped, the honest thing to
+    # do is WAIT for it — bounded, so a stuck thread can't hang the
+    # process forever — and say so loudly if the timeout is hit, instead
+    # of silently declaring victory either way.
+    pending_thread_backed = [t for t in (*backfill_tasks, *heal_tasks) if not t.done()]
+    if pending_thread_backed:
+        print(
+            f"[SYSTEM] Waiting up to {BACKFILL_SHUTDOWN_TIMEOUT_SECS}s for "
+            f"{len(pending_thread_backed)} in-flight backfill/heal task(s) to finish "
+            f"(can't be force-stopped mid-write)...",
+            flush=True,
+        )
+        done, still_pending = await asyncio.wait(pending_thread_backed, timeout=BACKFILL_SHUTDOWN_TIMEOUT_SECS)
+        if still_pending:
+            print(
+                f"[SYSTEM][WARN] {len(still_pending)} backfill/heal task(s) still running after "
+                f"{BACKFILL_SHUTDOWN_TIMEOUT_SECS}s — they will keep writing to the local/main DB "
+                f"in the background even though this process is reporting shutdown below. This is "
+                f"a real Python limitation (a running OS thread can't be force-killed from here), "
+                f"not something this timeout can fix — if it happens often, the actual fix is "
+                f"reducing what triggers a slow backfill/heal this close to shutdown, not waiting "
+                f"longer here.",
+                flush=True,
+            )
+            for t in still_pending:
+                t.cancel()  # detach our reference at least, even though the thread itself won't stop
+
     ohlc.shutdown()
 
     # Market end or manual stop — both come through here (stop_event
