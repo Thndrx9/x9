@@ -172,24 +172,47 @@ class TickGapDetector:
         out = {}
         all_names = [s["symbol"] for s in symbols]
 
-        last_ms_by_symbol = (
-            tick_writer.max_ts_batch(all_names, kind=kind, conn=conn)
-            if tick_writer is not None else {}
-        )
+        # Two server-side capability tiers, checked in order:
+        #   1. session_gap_batch_combined() — scans the UNION of a
+        #      symbol's backfill AND live tables for a silent gap, not
+        #      backfill alone. Without this, every tick already
+        #      captured live since backfill last ran looks like a gap
+        #      needing a redundant re-fetch from main db after a
+        #      restart — not incorrect, just wasted network/DB time for
+        #      data already on hand. See its docstring in tick_writer.py
+        #      for the full reasoning, including why this is a genuine
+        #      LAG-based scan of the merged timeline and NOT just "trust
+        #      each table's min/max" — a live table can have its own
+        #      internal gaps too.
+        #   2. session_gap_batch() — backfill-only fallback, for a
+        #      writer that has the single-table method but not yet the
+        #      combined one.
+        # SQLite has no server worth offloading to (it's a local file —
+        # no network cost to save), so it gets neither and the loop
+        # below falls back to the original full-row pandas scan for it
+        # automatically.
+        use_combined_gap    = tick_writer is not None and hasattr(tick_writer, "session_gap_batch_combined")
+        use_server_side_gap = use_combined_gap or (tick_writer is not None and hasattr(tick_writer, "session_gap_batch"))
 
-        # session_gap_batch() (Postgres only) runs the whole "compare
-        # each tick to the one before it, flag big gaps" scan INSIDE the
-        # database via a LAG() window function, and hands back just two
-        # small numbers per symbol instead of every cached row. That's
-        # what lets this method skip read_ticks_batch()'s full-day pull
-        # entirely for the common case (no gap found). It's generic over
-        # `kind`, so quote and depth both get the same network savings
-        # with no separate code path — this loop never has to know which
-        # one it's scanning. SQLite has no server worth offloading to
-        # (it's a local file — there's no network cost to save), so it
-        # isn't given this method and the loop below falls back to the
-        # original full-row pandas scan for it automatically.
-        use_server_side_gap = tick_writer is not None and hasattr(tick_writer, "session_gap_batch")
+        # last_ms_by_symbol has to reflect the MORE RECENT of the two
+        # tables too, for the same reason as the gap check above: after
+        # a restart, live's last row is very likely newer than
+        # backfill's own (backfill hasn't run since; live has been
+        # writing the whole time). Using backfill's max_ts() alone here
+        # would make scan_local_cache() think coverage ends earlier than
+        # it actually does, even once the gap check itself is combined.
+        if use_combined_gap:
+            last_ms_backfill = tick_writer.max_ts_batch(all_names, kind=kind, source="backfill", conn=conn)
+            last_ms_live     = tick_writer.max_ts_batch(all_names, kind=kind, source="live", conn=conn)
+            last_ms_by_symbol = {}
+            for name in all_names:
+                candidates = [v for v in (last_ms_backfill.get(name), last_ms_live.get(name)) if v is not None]
+                last_ms_by_symbol[name] = max(candidates) if candidates else None
+        else:
+            last_ms_by_symbol = (
+                tick_writer.max_ts_batch(all_names, kind=kind, conn=conn)
+                if tick_writer is not None else {}
+            )
 
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i:i + chunk_size]
@@ -203,7 +226,12 @@ class TickGapDetector:
             gap_info_chunk = {}
             cached_rows_chunk = {}
             if names_in_range:
-                if use_server_side_gap:
+                if use_combined_gap:
+                    gap_info_chunk = tick_writer.session_gap_batch_combined(
+                        names_in_range, kind=kind, start_ms=start_ms,
+                        threshold_secs=threshold_secs, conn=conn,
+                    )
+                elif use_server_side_gap:
                     gap_info_chunk = tick_writer.session_gap_batch(
                         names_in_range, kind=kind, start_ms=start_ms,
                         threshold_secs=threshold_secs, conn=conn,
@@ -242,9 +270,28 @@ class TickGapDetector:
                             # runs for symbols where a gap was actually
                             # found (rare) and only pulls the small tail
                             # after it — never the full day.
-                            tail_rows = tick_writer.read_ticks_batch(
-                                {symbol: (gap_prev_ms + 1, last_ms)}, kind=kind, conn=conn
-                            ).get(symbol, [])
+                            #
+                            # Combined path: the phantom tail can now
+                            # legitimately span BOTH tables (the gap
+                            # itself might be the cross-table seam this
+                            # feature exists to check), so this has to
+                            # read backfill AND live for that tail, not
+                            # backfill alone — read_ticks_combined()
+                            # already does exactly that (see its
+                            # docstring: built for full-history reads
+                            # like candle-building, and this phantom-tail
+                            # check is exactly that kind of read, NOT the
+                            # resume-point decision above it, which is
+                            # the one thing that must stay backfill-only
+                            # or single/combined-gap-aware).
+                            if use_combined_gap:
+                                tail_rows = tick_writer.read_ticks_combined(
+                                    symbol, gap_prev_ms + 1, last_ms, kind=kind
+                                )
+                            else:
+                                tail_rows = tick_writer.read_ticks_batch(
+                                    {symbol: (gap_prev_ms + 1, last_ms)}, kind=kind, conn=conn
+                                ).get(symbol, [])
                             phantom_local_ts = set(int(r["timestamp"]) for r in tail_rows)
 
                             if outage_windows:

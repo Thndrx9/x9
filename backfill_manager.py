@@ -333,9 +333,24 @@ class BackfillManager:
         overwrites itself via carriage return instead of printing one
         line per symbol. Prints a trailing newline once current==total
         so the next phase's output starts on a fresh line.
+
+        \\033[K (clear-to-end-of-line) after the text, not just \\r, so
+        a shorter new line can never leave stray trailing characters
+        from a longer previous one still visible — \\r alone only moves
+        the cursor back to column 0, it doesn't erase anything. That
+        mismatch is exactly what produced garbled output like
+        "1/1 symbols9 symbols" when a shorter progress string
+        overwrote a longer one (e.g. "...199/199 symbols" followed by
+        "...20/199 symbols") — \\r left the old line's unwritten tail
+        sitting there untouched. Standard ANSI escape, supported by
+        every terminal this project actually runs in (Linux/WSL/macOS
+        terminals, VS Code's integrated terminal); if this is ever run
+        somewhere that doesn't support ANSI escapes, the raw sequence
+        would print literally rather than clear the line — not a
+        concern for this project's actual deployment targets.
         """
         end = "\n" if current >= total else ""
-        print(f"\r[BACKFILL] {label}: {current}/{total} symbols", end=end, flush=True)
+        print(f"\r[BACKFILL] {label}: {current}/{total} symbols\033[K", end=end, flush=True)
 
     def _load_existing_tables(self, conn, prefix: str = "quote") -> Optional[set]:
         """
@@ -1363,7 +1378,18 @@ class BackfillManager:
 
             chunk_num = i // chunk_size + 1
             total_chunks = (len(items) + chunk_size - 1) // chunk_size
-            self._progress("Fetching main-db ticks", chunk_num, total_chunks)
+            # No per-chunk print here on purpose — every caller of this
+            # method (the day-start loop, mid-session heals) already
+            # owns its own single overwriting _progress() line based on
+            # ITS OWN cumulative symbol count, which is the number that
+            # actually means something to someone watching (e.g. "20 of
+            # 199 symbols done"). This method's own chunk_num/total_chunks
+            # is just an internal batching detail — usually 1/1, since a
+            # caller typically hands this method one already-small group
+            # at a time — and printing it on its own line here (as this
+            # used to) produced noise at best and, when it interleaved
+            # with a DIFFERENT progress line's carriage-return, visibly
+            # garbled output at worst.
 
             try:
                 self._ensure_connected()
@@ -1418,7 +1444,9 @@ class BackfillManager:
                         pass
                     continue
 
-            print(f"[BACKFILL] Chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received", flush=True)
+            # (no "Chunk N/M: X row(s) received" print here either —
+            # same reasoning as above; the outer caller's progress line
+            # already reflects work completed)
 
             if not rows:
                 continue
@@ -1468,11 +1496,9 @@ class BackfillManager:
                 flush=True,
             )
 
-        print(
-            f"[BACKFILL] Batched main-db fetch: {len(out)}/{len(fetch_starts)} "
-            f"symbol(s) returned data",
-            flush=True,
-        )
+        # (no "Batched main-db fetch: X/Y symbols returned data" print
+        # here either — same reasoning as the two removed above; the
+        # caller's own progress line already covers this)
         return out
 
     # ─────────────────────────────────────────────
@@ -1565,11 +1591,8 @@ class BackfillManager:
 
             chunk_num = i // chunk_size + 1
             total_chunks = (len(items) + chunk_size - 1) // chunk_size
-            print(
-                f"[BACKFILL] Fetching main-db depth: chunk {chunk_num}/{total_chunks} "
-                f"({len(clauses)} symbol(s))...",
-                flush=True,
-            )
+            # No per-chunk print here — see _fetch_ticks_batch()'s
+            # identical comment; the caller owns progress reporting.
 
             try:
                 self._ensure_connected()
@@ -1624,7 +1647,8 @@ class BackfillManager:
                         pass
                     continue
 
-            print(f"[BACKFILL] Depth chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received", flush=True)
+            # (no "Depth chunk N/M: X row(s) received" print here — see
+            # _fetch_ticks_batch()'s identical comment)
 
             if not rows:
                 continue
@@ -1672,11 +1696,8 @@ class BackfillManager:
                 flush=True,
             )
 
-        print(
-            f"[BACKFILL] Batched main-db depth fetch: {len(out)}/{len(fetch_starts)} "
-            f"symbol(s) returned data",
-            flush=True,
-        )
+        # (no "Batched main-db depth fetch: X/Y symbols returned data"
+        # print here — see _fetch_ticks_batch()'s identical comment)
         return out
 
     # ─────────────────────────────────────────────
@@ -1747,11 +1768,8 @@ class BackfillManager:
 
             chunk_num = i // chunk_size + 1
             total_chunks = (len(items) + chunk_size - 1) // chunk_size
-            print(
-                f"[BACKFILL] Fetching history-db candles: chunk {chunk_num}/{total_chunks} "
-                f"({len(clauses)} symbol(s))...",
-                flush=True,
-            )
+            # No per-chunk print here — see _fetch_ticks_batch()'s
+            # identical comment; the caller owns progress reporting.
 
             try:
                 conn = self._get_history_conn()
@@ -1803,10 +1821,8 @@ class BackfillManager:
                         pass
                     continue
 
-            print(
-                f"[BACKFILL] History chunk {chunk_num}/{total_chunks}: {len(rows)} row(s) received",
-                flush=True,
-            )
+            # (no "History chunk N/M: X row(s) received" print here —
+            # see _fetch_ticks_batch()'s identical comment)
 
             if not rows:
                 continue
@@ -1846,11 +1862,8 @@ class BackfillManager:
                 flush=True,
             )
 
-        print(
-            f"[BACKFILL] Batched history-db fetch: {len(out)}/{len(fetch_starts)} "
-            f"symbol(s) returned data",
-            flush=True,
-        )
+        # (no "Batched history-db fetch: X/Y symbols returned data"
+        # print here — see _fetch_ticks_batch()'s identical comment)
         return out
 
     # ─────────────────────────────────────────────
