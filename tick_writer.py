@@ -38,6 +38,7 @@ import sys
 import threading
 import zlib
 from datetime import datetime, timedelta
+from typing import Optional
 
 import psycopg2
 import psycopg2.extras
@@ -1416,6 +1417,18 @@ class PostgresTickWriter:
     simpler than the shard-hash scheme below, which now exists purely
     for bulk/backfill throughput.
 
+    Bulk shard threads ALSO help drain this same queue the moment their
+    own bulk queue is empty — see _help_drain_live_queue(), called from
+    _run_bulk()'s idle branch. This is what makes "every worker writes
+    live ticks only once backfill is done" happen with zero explicit
+    mode switch: the instant a shard's bulk queue runs dry (permanently,
+    for every shard, the moment the day's backfill finishes), it starts
+    helping the dedicated live thread on every subsequent idle
+    iteration for the rest of the session. Safe because Postgres's MVCC
+    tolerates concurrent writers to one table fine, and nothing
+    downstream depends on cross-thread write order (every read path
+    already does ORDER BY timestamp off each row's own column).
+
     ── Bulk writer pool: still sharded ──────────────────────────────────
     Every symbol is routed to exactly ONE bulk shard for its entire
     lifetime (via a deterministic hash — see _shard_for()), so all of
@@ -1536,6 +1549,14 @@ class PostgresTickWriter:
     _LIVE_PRESSURE_THRESHOLD      = 0.5    # start backing bulk off once live queue is >50% full
     _LIVE_PRESSURE_MAX_SLEEP_SECS = 0.02   # full-pressure pause per bulk item, per shard (20ms)
     _GIL_SWITCH_INTERVAL_SECS     = 0.001  # default is 0.005s
+
+    # Below this, a lone dribbling live tick isn't worth 9 threads
+    # constantly interrupting real bulk work to go check on it — see
+    # _run_bulk()'s "live priority" check at the top of its loop. Above
+    # it, a genuine backlog exists and every bulk shard proactively
+    # peels off a chunk before touching its own next bulk item, rather
+    # than waiting until it happens to be fully idle.
+    _LIVE_PROACTIVE_DRAIN_MIN_QSIZE = 5
 
     # Statement timeout (ms) applied to open_read_connection()'s
     # connection — see that method's docstring. This connection is only
@@ -2310,6 +2331,243 @@ class PostgresTickWriter:
                             fresh_conn.close()
         return result
 
+    def _session_gap_query_combined(self, table_backfill: Optional[str], table_live: Optional[str],
+                                     time_col: str) -> tuple:
+        """
+        Same LAG()-based "first suspicious gap" logic as
+        _session_gap_query(), but scanned across the UNION of BOTH a
+        symbol's backfill AND live tables — not just one. See
+        session_gap_batch_combined()'s docstring for why: checking
+        backfill alone after a restart makes every minute of ticks
+        already captured live look like a gap needing re-fetch from
+        main db all over again.
+
+        UNION (not UNION ALL) between the two source SELECTs so a
+        timestamp landing in both tables — right at the seam where live
+        picked up before this check next runs — is only counted once;
+        doesn't change LAG's gap-size math either way, just avoids
+        double-counting a moment we already have.
+
+        This still isn't "just check the two tables' min/max and call
+        it covered" — a genuine gap CAN exist within the live table
+        itself (a WS drop that predates the priority/backpressure fixes,
+        or one on a machine that doesn't have them yet), so the LAG scan
+        runs on the merged timeline itself, catching an internal live-
+        only gap exactly the same way it already catches an internal
+        backfill-only one.
+
+        Handles a symbol having only ONE of the two tables (e.g. live
+        hasn't started writing for it yet, or backfill has never run)
+        by just scanning that one table alone — same query shape as
+        the single-table _session_gap_query(), automatically.
+
+        Returns (query_string, n_start_params) — the caller needs
+        n_start_params to know whether to supply the start_ms parameter
+        once or twice when building this branch's param list, since
+        that depends on whether both tables are actually being unioned.
+        """
+        if table_backfill and table_live:
+            source_sql = (
+                f"SELECT {time_col} FROM {table_backfill} WHERE {time_col} >= %s "
+                f"UNION "
+                f"SELECT {time_col} FROM {table_live} WHERE {time_col} >= %s"
+            )
+            n_start_params = 2
+        elif table_backfill:
+            source_sql = f"SELECT {time_col} FROM {table_backfill} WHERE {time_col} >= %s"
+            n_start_params = 1
+        else:
+            source_sql = f"SELECT {time_col} FROM {table_live} WHERE {time_col} >= %s"
+            n_start_params = 1
+
+        query = f"""
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms
+            FROM (
+                SELECT
+                    MIN(t.{time_col}) AS earliest_ms,
+                    MIN(t.prev_ts) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_prev_ms
+                FROM (
+                    SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
+                    FROM ({source_sql}) src
+                ) t
+            ) agg
+        """
+        return query, n_start_params
+
+    def _session_gap_single_combined(self, symbol: str, table_backfill: Optional[str],
+                                      table_live: Optional[str], time_col: str,
+                                      threshold_ms: int, start_ms: int, conn) -> dict:
+        """Per-symbol fallback used when a chunk branch in
+        session_gap_batch_combined() fails — same combined query, one
+        symbol at a time."""
+        try:
+            cur = conn.cursor()
+            query, n_start_params = self._session_gap_query_combined(table_backfill, table_live, time_col)
+            params = [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params.extend([int(start_ms)] * n_start_params)
+            cur.execute(query, params)
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2]}
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_combined single-symbol query for {symbol} failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"earliest_ms": None, "gap_prev_ms": None}
+
+    def session_gap_batch_combined(self, symbols: list, kind: str = "quote", start_ms: int = 0,
+                                    threshold_secs: int = 300, conn=None) -> dict:
+        """
+        session_gap_batch()'s combined-coverage twin: scans the UNION of
+        each symbol's backfill AND live tables for a silent gap, instead
+        of backfill alone.
+
+        Why this exists: session_gap_batch() (backfill-only, by design —
+        see class docstring's "Live vs. backfill tables" section) is
+        exactly right for one specific question — "does BACKFILL have
+        anything it doesn't already know it should trust" — but it's the
+        wrong question for "what does this system actually already
+        have, combining everything". After a restart mid-session,
+        backfill's own table stops at whenever it last ran; every tick
+        captured live since then sits in a completely separate table
+        that session_gap_batch() never looks at. Treating backfill's
+        table as "the whole picture" for THAT question makes real,
+        already-captured minutes look like gaps needing a redundant
+        re-fetch from main db. Not incorrect — nothing is lost, nothing
+        breaks — just wasted network/DB time for data already on hand.
+
+        Deliberately NOT just "check each table's min/max timestamp and
+        call the span between them covered" — a live table can have its
+        own internal gaps too (a WS drop, before or without the
+        priority/backpressure fixes elsewhere in this file), so min/max
+        alone could just as easily paper over a real hole as it could
+        correctly detect coverage. This runs the exact same LAG-based
+        first-suspicious-gap scan as session_gap_batch(), just against
+        the UNION of both tables' timestamps, so an internal gap in
+        EITHER table (or a genuine hole between where backfill's
+        coverage ends and live's coverage begins) is caught the same
+        way a within-backfill gap always was.
+
+        Returns the same shape as session_gap_batch():
+        {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None}}
+
+        Which decision this feeds (fetch_start_ms, phantom_range, etc.)
+        is entirely tick_gap_detector.py's job, same as always — this
+        method's only responsibility is running the merged-table scan
+        and handing back what it found.
+
+        Batching shape mirrors session_gap_batch(): one "which tables
+        exist" check (now against BOTH backfill and live table name
+        sets), then one UNION ALL per chunk, savepoint-isolated per
+        chunk, with a per-symbol fallback (_session_gap_single_combined())
+        for anything that fails.
+        """
+        if not symbols:
+            return {}
+
+        table_backfill_by_symbol = {s: self.table_name(s, kind, "backfill") for s in symbols}
+        table_live_by_symbol     = {s: self.table_name(s, kind, "live") for s in symbols}
+        time_col = self._time_col(kind)
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None} for s in symbols}
+        threshold_ms = int(threshold_secs) * 1000
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_gap_combined_exist_check")
+                try:
+                    all_tables = list(table_backfill_by_symbol.values()) + list(table_live_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_gap_combined_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_gap_combined_exist_check")
+                    raise
+
+                # A symbol only drops out entirely if NEITHER table
+                # exists — one missing table just means that symbol's
+                # branch scans the other one alone (see
+                # _session_gap_query_combined()).
+                tables_by_symbol = {}
+                for s in symbols:
+                    tb = table_backfill_by_symbol[s] if table_backfill_by_symbol[s] in existing_tables else None
+                    tl = table_live_by_symbol[s] if table_live_by_symbol[s] in existing_tables else None
+                    if tb or tl:
+                        tables_by_symbol[s] = (tb, tl)
+
+                if not tables_by_symbol:
+                    return result
+
+                _BATCH_CHUNK_SIZE = 100
+                existing_symbols = list(tables_by_symbol.keys())
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches, params = [], []
+                    for s in chunk:
+                        tb, tl = tables_by_symbol[s]
+                        branch_query, n_start_params = self._session_gap_query_combined(tb, tl, time_col)
+                        branches.append(branch_query)
+                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([int(start_ms)] * n_start_params)
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_gap_combined_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, earliest_ms, gap_prev_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms}
+                        cur.execute("RELEASE SAVEPOINT sp_gap_combined_chunk")
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_gap_combined_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] session_gap_batch_combined chunk failed ({exc}); "
+                            f"falling back to per-symbol queries for this chunk ({len(chunk)} symbols)",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            tb, tl = tables_by_symbol[s]
+                            result[s] = self._session_gap_single_combined(
+                                s, tb, tl, time_col, threshold_ms, start_ms, conn
+                            )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_batch_combined failed: {exc}", flush=True)
+            for s in symbols:
+                if result[s]["earliest_ms"] is None and result[s]["gap_prev_ms"] is None:
+                    tb = table_backfill_by_symbol.get(s)
+                    tl = table_live_by_symbol.get(s)
+                    fresh_conn = None
+                    try:
+                        fresh_conn = psycopg2.connect(**self._params)
+                        result[s] = self._session_gap_single_combined(
+                            s, tb, tl, time_col, threshold_ms, start_ms, fresh_conn
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        if fresh_conn is not None:
+                            fresh_conn.close()
+        return result
+
     def _read_ticks_chunk_with_bisection(self, cur, chunk, table_by_symbol, symbol_ranges,
                                           select_cols_sql, out_cols, result, conn, time_col="ts_ms",
                                           kind="quote", source="backfill", depth=0):
@@ -2792,15 +3050,88 @@ class PostgresTickWriter:
         excess = (fill_ratio - self._LIVE_PRESSURE_THRESHOLD) / (1.0 - self._LIVE_PRESSURE_THRESHOLD)
         time.sleep(self._LIVE_PRESSURE_MAX_SLEEP_SECS * min(1.0, excess))
 
+    def _help_drain_live_queue(self, conn, state: dict, label: str) -> bool:
+        """
+        Called by a bulk shard thread the MOMENT its own bulk queue is
+        empty — i.e. genuinely idle capacity that would otherwise just
+        poll nothing every 250ms and do nothing at all. This is what
+        makes "all workers write live ticks only once backfill is
+        done" happen automatically: there's no explicit backfill-done
+        flag or mode switch anywhere — the instant a shard's bulk queue
+        runs dry (which happens permanently, for every shard, the
+        moment the day's backfill finishes), that shard starts helping
+        drain the live queue on every subsequent idle iteration, for
+        the rest of the session, with zero special-casing.
+
+        Safe to run concurrently from multiple threads (up to
+        pool_size of them, plus the dedicated live thread itself, all
+        competing consumers on the SAME queue.Queue — exactly the
+        pattern queue.Queue exists for):
+          - Postgres's MVCC handles concurrent INSERTs into the same
+            `_live` table across separate connections/transactions
+            without any special handling needed here.
+          - Nothing downstream depends on cross-thread arrival order —
+            every read path (candle building, indicators) already does
+            ORDER BY timestamp off each row's own column, so which
+            thread happened to write a given row first is irrelevant.
+          - The dedicated live thread (_run_live()) just sees fewer
+            items per iteration when helpers are also draining the
+            same queue — aggregate live-write throughput only ever
+            goes up with more helpers, never down or at risk of a race.
+
+        Grabs up to BATCH_SIZE items non-blockingly and flushes them
+        through the exact same _flush_live() the dedicated live thread
+        uses. Returns True if it actually did anything (so the caller
+        skips its own idle-timeout bookkeeping that iteration), False
+        if the live queue was ALSO empty — genuinely nothing to do
+        anywhere right now.
+
+        Note: reuses this shard's own bulk `state` dict for commit
+        bookkeeping (pending_commit_rows/rows_written_total/etc.), so
+        get_metrics() folds a shard's live-helper contribution into its
+        bulk-shard row counts rather than tracking it separately — an
+        acceptable, minor imprecision in exchange for not needing a
+        third parallel state-dict shape just for this.
+        """
+        batch = []
+        try:
+            while len(batch) < self.BATCH_SIZE:
+                batch.append(self._live_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+        if not batch:
+            return False
+
+        self._note_inserted(self._flush_live(conn, batch, state), state)
+        self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+        return True
+
     def _run_bulk(self, shard_idx: int):
         """
-        One of self.pool_size bulk shard threads. Handles ONLY backfill
-        rows (enqueue_backfill_rows()) plus the DB-wide admin ops
-        (prune/delete/barrier/build_indexes) that piggyback on shard 0's
-        connection — see class docstring. Live ticks never flow through
-        here anymore (see _run_live()), so there's no batch-accumulation
-        or live/bulk priority juggling left to do beyond
-        _yield_to_live_if_pressured() below — just drain bulk_q.
+        One of self.pool_size bulk shard threads. Handles backfill rows
+        (enqueue_backfill_rows()), the DB-wide admin ops (prune/delete/
+        barrier/build_indexes) that piggyback on shard 0's connection —
+        see class docstring — AND helps drain the LIVE queue in TWO
+        ways, so live ticks get real priority rather than just
+        avoiding overflow:
+          1. Proactively, at the TOP of every single loop pass,
+             whenever the live queue has a real backlog
+             (_LIVE_PROACTIVE_DRAIN_MIN_QSIZE) — BEFORE this shard even
+             looks at its own next bulk item. This is what stops live
+             ticks from sitting in queue while every shard happens to
+             be busy with real backfill work: without this, a shard
+             mid-way through a stack of bulk items would only ever
+             glance at live once it ran completely dry, which could be
+             a while during a heavy backfill burst.
+          2. Reactively, whenever this shard's own queue is empty (the
+             original idle-helper behavior — see _help_drain_live_queue()).
+        In practice this means every bulk shard automatically becomes a
+        live-writing helper for the rest of the session the moment the
+        day's backfill work runs out — no separate "backfill complete"
+        signal needed anywhere — AND live ticks get attention from all
+        pool_size+1 threads whenever there's a real backlog, not just
+        the one dedicated live thread.
         """
         bulk_q = self._bulk_queues[shard_idx]
         state  = self._shard_state[shard_idx]
@@ -2809,18 +3140,38 @@ class PostgresTickWriter:
         conn = self._connect()
         try:
             while True:
-                stopping = self._stop.is_set() and bulk_q.empty()
+                stopping = self._stop.is_set() and bulk_q.empty() and self._live_queue.empty()
                 if stopping:
                     conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
                     break
 
+                # Live priority, checked FIRST, every pass — see
+                # docstring point 1 above. A single trickling tick
+                # below the threshold isn't worth interrupting real
+                # bulk work for, so this is a no-op far more often than
+                # not; it only actually does anything once a real
+                # backlog exists.
+                if self._live_queue.qsize() > self._LIVE_PROACTIVE_DRAIN_MIN_QSIZE:
+                    self._help_drain_live_queue(conn, state, label)
+
                 self._yield_to_live_if_pressured()
 
                 try:
-                    item = bulk_q.get(timeout=0.25)
+                    item = bulk_q.get_nowait()
                 except queue.Empty:
-                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
-                    continue
+                    # Genuinely nothing of our own pending — help the
+                    # live queue if it has anything waiting.
+                    if self._help_drain_live_queue(conn, state, label):
+                        continue
+                    # Live queue was empty too — actually idle. Same
+                    # 0.25s blocking wait as before, so this thread
+                    # isn't spinning a hot loop when there's truly
+                    # nothing for anyone to do.
+                    try:
+                        item = bulk_q.get(timeout=0.25)
+                    except queue.Empty:
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+                        continue
 
                 try:
                     kind0 = item[0]
