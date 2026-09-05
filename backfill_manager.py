@@ -581,7 +581,7 @@ class BackfillManager:
         # ── Phase D1: check local depth cache, flag gaps ──
         # Same helper as the quote-tick path — tick_gaps.scan_local_cache()
         # owns all local-cache reading, chunked, and hands back only
-        # small per-symbol facts (fetch-start ms, phantom range). No
+        # small per-symbol facts (fetch-start ms, gap_window). No
         # depth row (the heaviest row type — reconstructed order-book
         # dicts) is retained past the chunk it was read in.
         depth_cache_check_conn = self.tick_writer.open_read_connection() if self.tick_writer is not None else None
@@ -599,27 +599,18 @@ class BackfillManager:
                 except Exception as exc:
                     print(f"[BACKFILL][WARN] closing depth cache-check connection failed: {exc}", flush=True)
 
-        gap_flagged = [s for s, e in gap_map.items() if e["phantom_range"] is not None]
-        confirmed_outage_count = sum(1 for e in gap_map.values() if e["confirmed_outage"])
+        gap_flagged = [s for s, e in gap_map.items() if e["gap_window"] is not None]
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
             more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
-            confirmed_note = (
-                f" ({confirmed_outage_count} confirmed against connection log)"
-                if depth_outage_windows else " (connection log not available to verify)"
-            )
             print(
                 f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
                 f"(>{self.gap_threshold_secs}s within a session) in their cached "
-                f"depth data{confirmed_note} — will re-fetch and correct: "
+                f"depth data — checking main db for the exact window: "
                 f"{preview}{more}",
                 flush=True,
             )
 
-        depth_state = {
-            s: {"phantom_range": e["phantom_range"], "phantom_local_ts": e["phantom_local_ts"]}
-            for s, e in gap_map.items()
-        }
         fetch_starts = {
             s: datetime.fromtimestamp(e["fetch_start_ms"] / 1000, tz=tz_kolkata)
             for s, e in gap_map.items() if e["fetch_start_ms"] is not None
@@ -633,72 +624,71 @@ class BackfillManager:
             for s, e in gap_map.items() if e.get("fetch_end_ms") is not None
         }
 
-        if not fetch_starts:
+        if not fetch_starts and not gap_flagged:
             print("[BACKFILL] Depth backfill: nothing to fetch — all symbols fully cached", flush=True)
             return
 
-        # ── Phase D2 + D3, combined per chunk — fetch, write, phantom-
-        # check, forget, move on. Nothing survives past its own chunk;
-        # unlike the earlier version, `fetched`/`chunk_fetched` are no
-        # longer accumulated across the whole run just to run the
-        # phantom-row check once at the end — that check now happens
-        # immediately after each chunk's fetch, using only that
-        # chunk's data, then everything is discarded before the next
-        # chunk starts. Exactly mirrors sync_local_cache_with_main_db's
-        # quote-tick loop.
         depth_existing_tables = self._existing_tables_or_empty(
             self._load_existing_tables(self.conn, prefix="depth"), "depth", "depth backfill"
         )
-        fetch_items = list(fetch_starts.items())
-        total_phantom_rows = 0
-        phantom_symbols = set()
         last_fetch_failed_symbols = set()
 
+        # ── Phase D2: normal top-up (unrelated to gap resolution) ──
+        fetch_items = list(fetch_starts.items())
         for i in range(0, len(fetch_items), chunk_size):
             chunk_fetch_starts = dict(fetch_items[i:i + chunk_size])
             chunk_fetch_ends = {s: fetch_ends[s] for s in chunk_fetch_starts if s in fetch_ends}
             chunk_fetched = self._fetch_depth_batch(chunk_fetch_starts, depth_existing_tables, chunk_fetch_ends)
-            # _fetch_depth_batch sets self._last_fetch_failed_symbols
-            # fresh on every call — capture this chunk's failures
-            # before the next chunk's call overwrites it.
             last_fetch_failed_symbols |= self._last_fetch_failed_symbols
-
-            for symbol in chunk_fetch_starts:
-                state = depth_state.get(symbol, {})
-                phantom_range    = state.get("phantom_range")
-                phantom_local_ts = state.get("phantom_local_ts")
-                if not (phantom_range and phantom_local_ts):
-                    continue
-                if symbol in self._last_fetch_failed_symbols:
-                    # This symbol's confirming re-fetch never actually
-                    # reached main db this chunk — no basis to delete
-                    # anything, leave it for next run to retry.
-                    continue
-
-                fetched_ts = chunk_fetched.get(symbol, set())
-                pg_confirmed_ts = {
-                    t for t in fetched_ts
-                    if phantom_range[0] <= t <= phantom_range[1]
-                }
-                phantom_ts = phantom_local_ts - pg_confirmed_ts
-                if phantom_ts:
-                    total_phantom_rows += len(phantom_ts)
-                    phantom_symbols.add(symbol)
-                    self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="depth", wait=False)
-
-            # This chunk's fetched timestamp sets (and whatever
-            # DataFrame _fetch_depth_batch built internally) are done
-            # being used — discard before the next chunk's query runs.
             del chunk_fetched
             self._progress("Fetching + writing depth gaps", min(i + chunk_size, len(fetch_items)), len(fetch_items))
 
+        # ── Phase D3: gap resolution — narrow-window main-db check ──
+        # Same reasoning as sync_local_cache_with_main_db()'s Step 3:
+        # check main db for the EXACT narrow (gap_prev_ms+1,
+        # gap_next_ms-1) window instead of re-verifying everything
+        # since the gap on every run. No local-candle cross-check here
+        # — depth (order-book snapshots) has no candle equivalent.
+        resolved_symbols, settled_symbols = [], []
+        if gap_flagged:
+            gap_windows_ms = {s: gap_map[s]["gap_window"] for s in gap_flagged}
+            gap_items = list(gap_windows_ms.items())
+            for i in range(0, len(gap_items), chunk_size):
+                chunk = gap_items[i:i + chunk_size]
+                gap_starts_chunk = {s: datetime.fromtimestamp(w[0] / 1000, tz=tz_kolkata) for s, w in chunk}
+                gap_ends_chunk   = {s: datetime.fromtimestamp(w[1] / 1000, tz=tz_kolkata) for s, w in chunk}
+
+                gap_fetched = self._fetch_depth_batch(gap_starts_chunk, depth_existing_tables, gap_ends_chunk)
+                last_fetch_failed_symbols |= self._last_fetch_failed_symbols
+
+                for symbol, _ in chunk:
+                    if symbol in self._last_fetch_failed_symbols:
+                        continue  # never reached main db this run — try again next time
+                    if gap_fetched.get(symbol):
+                        resolved_symbols.append(symbol)
+                    else:
+                        settled_symbols.append(symbol)
+
+                del gap_fetched
+                self._progress("Checking + resolving depth gaps", min(i + chunk_size, len(gap_items)), len(gap_items))
+
         self._last_fetch_failed_symbols = last_fetch_failed_symbols
 
-        if total_phantom_rows:
+        if resolved_symbols:
+            preview = ", ".join(resolved_symbols[:10])
+            more = f" (+{len(resolved_symbols) - 10} more)" if len(resolved_symbols) - 10 > 0 else ""
             print(
-                f"[BACKFILL] Depth phantom-row check: {total_phantom_rows} row(s) "
-                f"removed across {len(phantom_symbols)} symbol(s) (locally cached "
-                f"but confirmed absent from main db)",
+                f"[BACKFILL] {len(resolved_symbols)} symbol(s) had a real depth gap — "
+                f"main db had data in the window, fetched + wrote it: {preview}{more}",
+                flush=True,
+            )
+        if settled_symbols:
+            preview = ", ".join(settled_symbols[:10])
+            more = f" (+{len(settled_symbols) - 10} more)" if len(settled_symbols) - 10 > 0 else ""
+            print(
+                f"[BACKFILL] {len(settled_symbols)} symbol(s)' depth gap confirmed real "
+                f"and permanent — main db has nothing there either (nothing to fetch, "
+                f"settled): {preview}{more}",
                 flush=True,
             )
 
@@ -1104,13 +1094,43 @@ class BackfillManager:
 
         Step 1 — tick_gaps.scan_local_cache() does ALL local-cache
         reading (read-only), chunked, and reports back only small
-        per-symbol facts (a fetch-start timestamp, maybe a phantom
-        range) — no tick data survives this step.
+        per-symbol facts (a fetch-start timestamp, maybe a narrow
+        gap_window) — no tick data survives this step.
 
-        Step 2 — for symbols that need it, fetch just the missing
-        range from Postgres, in the same chunk size, write it to
-        tick_writer, run the phantom-row check, then discard the
-        fetched DataFrame before moving to the next chunk.
+        Step 2 — normal top-up: for symbols with new data since last
+        run (fetch_start_ms), fetch just that range from main db and
+        write it. No re-verification of anything older — a silent gap
+        no longer drags the entire tail back into question (see below).
+
+        Step 3 — gap resolution: for symbols with a detected silent
+        gap (gap_window), check whether it's real by asking the ONE
+        source that actually knows — main db itself — for ticks in
+        that EXACT narrow window (not the whole span since the gap,
+        the way this used to work).
+          - Local connection_log.db is NOT used for this anymore: it
+            only records this local process's own websocket connects/
+            disconnects, and tells you nothing about whether the
+            upstream/main database itself ever had the data — a real
+            main-db-side outage (the actual scenario this exists to
+            handle) can easily leave no matching entry there at all.
+          - Also cheaply cross-checked against the local 1m history-
+            candle cache (candles_1m_<symbol> — HistoryCandleStore):
+            these candles get saved specifically to mark outage
+            periods, so one being present for this exact window is
+            EXTRA CONFIRMATION the gap is a genuine outage, not a
+            contradiction — it's expected to line up with the "main
+            db has no ticks either" case below, not with the
+            "resolved" case. Its absence proves nothing either way
+            (candles are saved occasionally, not for every gap), only
+            its presence is informative.
+          - If main db has ticks in the window → genuinely missing
+            data, fetch + write just that narrow slice.
+          - If main db has nothing there either → confirmed real,
+            permanent gap (a real outage, same as the Sep 2 example) —
+            nothing to fetch, nothing wrong, and because only the tiny
+            gap window itself gets re-checked (not everything since
+            it), this stays cheap on every future run instead of
+            re-verifying a ever-growing tail forever.
         """
         start_ms = int(start_ts.timestamp() * 1000)
         now_ms   = int(now.timestamp() * 1000)
@@ -1130,19 +1150,14 @@ class BackfillManager:
                 except Exception as exc:
                     print(f"[BACKFILL][WARN] closing cache-check connection failed: {exc}", flush=True)
 
-        gap_flagged = [s for s, e in gap_map.items() if e["phantom_range"] is not None]
-        confirmed_outage_count = sum(1 for e in gap_map.values() if e["confirmed_outage"])
+        gap_flagged = [s for s, e in gap_map.items() if e["gap_window"] is not None]
         if gap_flagged:
             preview = ", ".join(gap_flagged[:10])
             more = f" (+{len(gap_flagged) - 10} more)" if len(gap_flagged) - 10 > 0 else ""
-            confirmed_note = (
-                f" ({confirmed_outage_count} confirmed against connection log)"
-                if quote_outage_windows else " (connection log not available to verify)"
-            )
             print(
                 f"[BACKFILL][WARN] {len(gap_flagged)} symbol(s) had a silent gap "
                 f"(>{self.gap_threshold_secs}s within a session) in their cached "
-                f"ticks{confirmed_note} — will re-fetch and correct: "
+                f"ticks — checking main db for the exact window: "
                 f"{preview}{more}",
                 flush=True,
             )
@@ -1155,10 +1170,9 @@ class BackfillManager:
                 flush=True,
             )
 
+        # ── Step 2: normal top-up (unrelated to gap resolution) ──
         to_fetch = [s for s, e in gap_map.items() if e["fetch_start_ms"] is not None]
         total_fetched = 0
-        total_phantom_rows = 0
-        phantom_symbols = set()
         no_data_symbols = []
         self._last_fetch_failed_symbols = set()
 
@@ -1178,47 +1192,13 @@ class BackfillManager:
                 for s in chunk_symbols if gap_map[s].get("fetch_end_ms") is not None
             }
 
-            # _fetch_ticks_batch() already writes each symbol's rows to
-            # tick_writer as it goes (see its own body) — the DataFrame
-            # it returns here is only needed transiently, for the
-            # phantom-row comparison right below, then discarded.
             fetched = self._fetch_ticks_batch(fetch_starts_chunk, existing_tables, fetch_ends_chunk)
-
             for symbol in chunk_symbols:
                 fresh_df = fetched.get(symbol, pd.DataFrame())
-                entry = gap_map[symbol]
-
-                if fresh_df.empty and entry["phantom_range"] is None:
-                    continue
                 if fresh_df.empty:
                     no_data_symbols.append(symbol)
                 total_fetched += len(fresh_df)
 
-                phantom_range    = entry["phantom_range"]
-                phantom_local_ts = entry["phantom_local_ts"]
-                if phantom_range and phantom_local_ts:
-                    if symbol in self._last_fetch_failed_symbols:
-                        pass  # fetch genuinely failed — don't delete, retry next run
-                    elif not fresh_df.empty:
-                        in_range = fresh_df[
-                            (fresh_df["timestamp"] >= phantom_range[0])
-                            & (fresh_df["timestamp"] <= phantom_range[1])
-                        ]
-                        pg_confirmed_ts = set(int(t) for t in in_range["timestamp"])
-                        phantom_ts = phantom_local_ts - pg_confirmed_ts
-                        if phantom_ts:
-                            total_phantom_rows += len(phantom_ts)
-                            phantom_symbols.add(symbol)
-                            self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
-                    else:
-                        phantom_ts = phantom_local_ts
-                        total_phantom_rows += len(phantom_ts)
-                        phantom_symbols.add(symbol)
-                        self.tick_writer.delete_timestamps(symbol, phantom_ts, kind="quote", wait=False)
-
-            # This chunk's fetched DataFrames are done being used — drop
-            # them before the next chunk's fetch, instead of letting
-            # every chunk's result pile up for the rest of run().
             del fetched
             self._progress("Fetching + writing tick gaps", min(i + chunk_size, len(to_fetch)), len(to_fetch))
 
@@ -1232,11 +1212,84 @@ class BackfillManager:
                 f"tick data in main db: {preview}{more}",
                 flush=True,
             )
-        if total_phantom_rows:
+
+        # ── Step 3: gap resolution — narrow-window main-db check ──
+        if not gap_flagged:
+            return
+
+        gap_windows_ms = {s: gap_map[s]["gap_window"] for s in gap_flagged}
+
+        # Cheap local cross-check first, purely for the log line —
+        # candles_1m_<symbol> get saved specifically to mark outage
+        # periods, so one being present here is expected corroboration
+        # that this window really was an outage, not a red flag; its
+        # ABSENCE proves nothing (candles are saved occasionally, not
+        # for every gap — see HistoryCandleStore), so it's never used
+        # to skip the real main-db check below, only to annotate the
+        # outcome.
+        candle_confirmed = set()
+        if self.history_store is not None:
+            for symbol in gap_flagged:
+                g_start, g_end = gap_windows_ms[symbol]
+                if self.history_store.read_timestamps(symbol, g_start, g_end):
+                    candle_confirmed.add(symbol)
+
+        resolved_symbols = []      # main db had ticks here — fetched + written
+        settled_symbols = []       # main db confirmed genuinely empty too
+        gap_fetch_failed = set()
+
+        for i in range(0, len(gap_flagged), chunk_size):
+            chunk_symbols = gap_flagged[i:i + chunk_size]
+            gap_starts_chunk = {
+                s: datetime.fromtimestamp(gap_windows_ms[s][0] / 1000, tz=tz_kolkata)
+                for s in chunk_symbols
+            }
+            gap_ends_chunk = {
+                s: datetime.fromtimestamp(gap_windows_ms[s][1] / 1000, tz=tz_kolkata)
+                for s in chunk_symbols
+            }
+
+            gap_fetched = self._fetch_ticks_batch(gap_starts_chunk, existing_tables, gap_ends_chunk)
+            gap_fetch_failed |= self._last_fetch_failed_symbols
+
+            for symbol in chunk_symbols:
+                if symbol in self._last_fetch_failed_symbols:
+                    continue  # never reached main db this run — try again next time
+                gap_df = gap_fetched.get(symbol, pd.DataFrame())
+                if gap_df.empty:
+                    settled_symbols.append(symbol)
+                else:
+                    resolved_symbols.append(symbol)
+                    total_fetched += len(gap_df)
+
+            del gap_fetched
+            self._progress("Checking + resolving tick gaps", min(i + chunk_size, len(gap_flagged)), len(gap_flagged))
+
+        if resolved_symbols:
+            preview = ", ".join(resolved_symbols[:10])
+            more = f" (+{len(resolved_symbols) - 10} more)" if len(resolved_symbols) - 10 > 0 else ""
+            candle_note = f" ({sum(1 for s in resolved_symbols if s in candle_confirmed)} also had a local 1m candle there)" if candle_confirmed else ""
             print(
-                f"[BACKFILL] Phantom-row check: {total_phantom_rows} row(s) removed "
-                f"across {len(phantom_symbols)} symbol(s) (locally cached but "
-                f"confirmed absent from main db)",
+                f"[BACKFILL] {len(resolved_symbols)} symbol(s) had a real gap — "
+                f"main db had ticks in the window, fetched + wrote them{candle_note}: "
+                f"{preview}{more}",
+                flush=True,
+            )
+        if settled_symbols:
+            preview = ", ".join(settled_symbols[:10])
+            more = f" (+{len(settled_symbols) - 10} more)" if len(settled_symbols) - 10 > 0 else ""
+            candle_note = f" ({sum(1 for s in settled_symbols if s in candle_confirmed)} also had a local 1m candle there, consistent with a genuine outage — those candles get saved specifically to mark outage periods)" if any(s in candle_confirmed for s in settled_symbols) else ""
+            print(
+                f"[BACKFILL] {len(settled_symbols)} symbol(s)' gap confirmed real and "
+                f"permanent — main db has no ticks there either (nothing to fetch, "
+                f"settled){candle_note}: {preview}{more}",
+                flush=True,
+            )
+        if gap_fetch_failed:
+            preview = ", ".join(sorted(gap_fetch_failed)[:10])
+            print(
+                f"[BACKFILL][WARN] {len(gap_fetch_failed)} symbol(s)' gap check never "
+                f"reached main db this run — will retry next run: {preview}",
                 flush=True,
             )
 
@@ -1245,42 +1298,84 @@ class BackfillManager:
     ):
         """
         History-candle counterpart to sync_local_cache_with_main_db().
-        History-db candles are idempotent (upserted, not appended) —
-        see the module note where Phase 1h originally lived — so this
-        doesn't need gap/phantom-row detection, just "is the local
-        history_store cache caught up, and if not, top it up."
 
-        Reads local coverage (history_store.max_ts) per symbol —
-        cheap, local SQLite, no DataFrame involved — then fetches
-        whatever's missing from the history db in chunks of
-        `chunk_size`, discarding each chunk's fetched DataFrame right
-        after it's written to history_store (which
-        _fetch_history_candles_batch already does internally).
+        candles_1m_<symbol> is populated only OCCASIONALLY, by design —
+        it does NOT hold one row for every market minute. That rules
+        out diffing against a theoretical full bucket schedule
+        (GapDetector.expected_buckets(), the way tick/candle-building
+        gap checks do elsewhere) — every never-populated minute would
+        look "missing" and get endlessly, pointlessly re-fetched.
+
+        Gap-checking here instead means: whatever candle timestamps
+        upstream (market_history's quote_<symbol> table, via the
+        history db) actually has in [start_ts, now) — fetched cheaply,
+        timestamps only, via _fetch_history_timestamps_batch() — get
+        diffed directly against what's already cached locally
+        (history_store.read_timestamps()). Anything upstream that
+        isn't in the local set yet is genuinely missing and gets
+        fetched + written. Nothing is ever assumed missing just
+        because a given minute has no candle upstream at all — that's
+        expected, not a gap.
+
+        Two-phase per chunk: first the lightweight timestamp diff to
+        find which symbols actually have a gap, THEN — only for those
+        — the real OHLCV fetch (_fetch_history_candles_batch, which
+        pulls everything from the earliest missing timestamp onward
+        and upserts; already covers the intermediate gap along with
+        the tail, and re-upserting already-correct rows in between is
+        harmless — same idempotent-on-ts_ms guarantee as before).
         """
         start_ms = int(start_ts.timestamp() * 1000)
         now_ms   = int(now.timestamp() * 1000)
 
+        all_symbols = [inst["symbol"] for inst in symbols]
         fetch_starts = {}
         fully_covered = []
-        for inst in symbols:
-            symbol   = inst["symbol"]
-            last_hms = self.history_store.max_ts(symbol) if self.history_store is not None else None
+        gap_symbols = []
 
-            if last_hms is not None and last_hms >= start_ms:
-                h_fetch_start_ms = last_hms + 1
-            else:
-                h_fetch_start_ms = start_ms
+        for i in range(0, len(all_symbols), chunk_size):
+            chunk = all_symbols[i:i + chunk_size]
 
-            if h_fetch_start_ms < now_ms:
-                fetch_starts[symbol] = datetime.fromtimestamp(h_fetch_start_ms / 1000, tz=tz_kolkata)
-            else:
-                fully_covered.append(symbol)
+            upstream_ts_by_symbol = self._fetch_history_timestamps_batch(
+                chunk, start_ms, now_ms, history_existing_tables
+            )
+
+            for symbol in chunk:
+                upstream_ts = upstream_ts_by_symbol.get(symbol)
+                if not upstream_ts:
+                    # Nothing upstream in this window for this symbol at
+                    # all — nothing to compare against, nothing to fetch.
+                    fully_covered.append(symbol)
+                    continue
+
+                local_ts = (
+                    self.history_store.read_timestamps(symbol, start_ms, now_ms)
+                    if self.history_store is not None else set()
+                )
+                missing_ts = upstream_ts - local_ts
+
+                if missing_ts:
+                    gap_symbols.append(symbol)
+                    fetch_starts[symbol] = datetime.fromtimestamp(min(missing_ts) / 1000, tz=tz_kolkata)
+                else:
+                    fully_covered.append(symbol)
+
+            self._progress("Checking history-candle cache for gaps", min(i + chunk_size, len(all_symbols)), len(all_symbols))
 
         if fully_covered:
             print(
                 f"[BACKFILL] {len(fully_covered)}/{len(symbols)} symbol(s) fully "
                 f"caught up in the local history-candle cache — skipping history "
                 f"db fetch for them",
+                flush=True,
+            )
+        if gap_symbols:
+            preview = ", ".join(gap_symbols[:10])
+            more = f" (+{len(gap_symbols) - 10} more)" if len(gap_symbols) - 10 > 0 else ""
+            print(
+                f"[BACKFILL][WARN] {len(gap_symbols)} symbol(s) had candle(s) present "
+                f"upstream but missing from the local history-candle cache "
+                f"(candles_1m_<symbol>) — fetching + writing them: {preview}{more}",
                 flush=True,
             )
 
@@ -1864,6 +1959,103 @@ class BackfillManager:
 
         # (no "Batched history-db fetch: X/Y symbols returned data"
         # print here — see _fetch_ticks_batch()'s identical comment)
+        return out
+
+    def _fetch_history_timestamps_batch(self, symbols: list, start_ms: int, end_ms: int, existing_tables: set) -> dict:
+        """
+        Lightweight sibling of _fetch_history_candles_batch(): same
+        upstream table/window, but SELECTs only `timestamp` (no OHLCV
+        columns, no DataFrame, no history_store write) — just enough
+        to know EXACTLY which candle timestamps upstream actually has
+        in [start_ms, end_ms) for each symbol. Used to diff against
+        what's already cached locally (history_store.read_timestamps())
+        and find real gaps, without assuming a full per-minute schedule
+        — see sync_history_cache_with_main_db()'s docstring for why
+        that assumption doesn't hold here.
+
+        Returns {symbol: set(ts_ms)}. A symbol with nothing upstream in
+        the window (or no quote_<symbol> table at all) is simply absent
+        from the result rather than mapped to an empty set.
+        """
+        out = {}
+        conn = self._get_history_conn()
+        if conn is None or not symbols:
+            return out
+
+        chunk_size = self.batch_size if self.batch_size > 0 else max(len(symbols), 1)
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i:i + chunk_size]
+
+            clauses, params = [], []
+            for symbol in chunk:
+                safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
+                table = f"quote_{safe_sym}".lower()
+                if table not in existing_tables:
+                    continue
+                clauses.append(
+                    f"SELECT %s AS symbol, timestamp FROM {table} "
+                    f"WHERE timestamp >= %s AND timestamp < %s AND open IS NOT NULL"
+                )
+                params.extend([symbol, start_ms, end_ms])
+
+            if not clauses:
+                continue
+
+            query = " UNION ALL ".join(clauses)
+
+            try:
+                conn = self._get_history_conn()
+                if conn is None:
+                    raise psycopg2.OperationalError("no history-db connection available")
+                cur = conn.cursor()
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                cur.close()
+            except Exception as exc:
+                retried_ok = False
+                if self._is_connection_dead(exc):
+                    print(
+                        f"[BACKFILL][WARN] history-timestamp chunk: connection dropped "
+                        f"({exc}) — reconnecting and retrying this chunk once",
+                        flush=True,
+                    )
+                    self.conn_history = None
+                    self._history_connect_tried = False
+                    conn = self._get_history_conn()
+                    try:
+                        if conn is not None:
+                            cur = conn.cursor()
+                            cur.execute(query, params)
+                            rows = cur.fetchall()
+                            cur.close()
+                            retried_ok = True
+                        else:
+                            raise psycopg2.OperationalError("reconnect failed")
+                    except Exception as exc2:
+                        print(
+                            f"[BACKFILL][WARN] batched history-timestamp fetch failed "
+                            f"again after reconnect for a chunk of {len(chunk)} "
+                            f"symbol(s): {exc2}",
+                            flush=True,
+                        )
+                else:
+                    print(
+                        f"[BACKFILL][WARN] batched history-timestamp fetch failed for "
+                        f"a chunk of {len(chunk)} symbol(s): {exc}",
+                        flush=True,
+                    )
+
+                if not retried_ok:
+                    try:
+                        if conn is not None:
+                            conn.rollback()
+                    except Exception:
+                        pass
+                    continue
+
+            for symbol, ts_ms in rows:
+                out.setdefault(symbol, set()).add(int(ts_ms))
+
         return out
 
     # ─────────────────────────────────────────────

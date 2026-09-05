@@ -162,12 +162,25 @@ class TickGapDetector:
         Returns {symbol: entry} where entry is:
             {
                 "fetch_start_ms": int or None,   # None = fully covered locally
-                "phantom_range": (start_ms, end_ms) or None,
-                "phantom_local_ts": set[int] or None,
+                "gap_window": (start_ms, end_ms) or None,
                 "confirmed_outage": bool,
             }
-        No DataFrames are returned — only timestamps/sets, which are
-        cheap enough to hold for every symbol at once.
+        No DataFrames are returned — only timestamps, which are cheap
+        enough to hold for every symbol at once.
+
+        gap_window is the EXACT narrow span a detected silent gap
+        covers — (tick right before it) + 1, to (tick right after it)
+        - 1 — not a "everything from the gap through now" range. There
+        is nothing to read locally inside that span (that's the
+        definition of a gap: zero local rows there), so this method no
+        longer reads or returns a "phantom" tail to diff — the caller
+        (BackfillManager) is the one with a main-db connection, and
+        checking the ONE authoritative source of truth (does upstream
+        actually have anything in this exact window) is its job, not
+        something guessable from local data alone. See
+        BackfillManager.sync_local_cache_with_main_db()'s docstring for
+        the full reasoning and what replaced the old phantom-tail
+        design.
         """
         out = {}
         all_names = [s["symbol"] for s in symbols]
@@ -247,8 +260,7 @@ class TickGapDetector:
                 last_ms = last_ms_by_symbol.get(symbol)
 
                 cached_until_ms  = None
-                phantom_range    = None
-                phantom_local_ts = None
+                gap_window       = None
                 confirmed_outage = False
                 fetch_end_ms     = None
 
@@ -257,46 +269,30 @@ class TickGapDetector:
                         info = gap_info_chunk.get(symbol, {})
                         earliest_ms = info.get("earliest_ms")
                         gap_prev_ms = info.get("gap_prev_ms")
+                        gap_next_ms = info.get("gap_next_ms")
 
                         if gap_prev_ms is not None:
-                            cached_until_ms = gap_prev_ms
-                            phantom_range   = (gap_prev_ms + 1, last_ms)
-                            # The one place actual rows still have to
-                            # cross the network: we need the EXACT set of
-                            # locally-cached timestamps sitting past the
-                            # gap, so a later step can diff them against
-                            # a fresh re-fetch and delete whichever ones
-                            # don't get reconfirmed. But this only ever
-                            # runs for symbols where a gap was actually
-                            # found (rare) and only pulls the small tail
-                            # after it — never the full day.
-                            #
-                            # Combined path: the phantom tail can now
-                            # legitimately span BOTH tables (the gap
-                            # itself might be the cross-table seam this
-                            # feature exists to check), so this has to
-                            # read backfill AND live for that tail, not
-                            # backfill alone — read_ticks_combined()
-                            # already does exactly that (see its
-                            # docstring: built for full-history reads
-                            # like candle-building, and this phantom-tail
-                            # check is exactly that kind of read, NOT the
-                            # resume-point decision above it, which is
-                            # the one thing that must stay backfill-only
-                            # or single/combined-gap-aware).
-                            if use_combined_gap:
-                                tail_rows = tick_writer.read_ticks_combined(
-                                    symbol, gap_prev_ms + 1, last_ms, kind=kind
-                                )
-                            else:
-                                tail_rows = tick_writer.read_ticks_batch(
-                                    {symbol: (gap_prev_ms + 1, last_ms)}, kind=kind, conn=conn
-                                ).get(symbol, [])
-                            phantom_local_ts = set(int(r["timestamp"]) for r in tail_rows)
+                            # Trust everything already cached, gap
+                            # included — nothing local sits inside a gap
+                            # by definition, so there's nothing to
+                            # "un-trust" past it either. Only the exact
+                            # empty span itself is in question.
+                            cached_until_ms = last_ms
+                            gap_window = (
+                                (gap_prev_ms + 1, gap_next_ms - 1)
+                                if gap_next_ms is not None
+                                # Shouldn't happen — gap_next_ms comes from
+                                # the same FILTER predicate as gap_prev_ms,
+                                # so they're always both set or both None —
+                                # but fall back to the old "through last_ms"
+                                # span rather than silently dropping the
+                                # gap if it ever does.
+                                else (gap_prev_ms + 1, last_ms)
+                            )
 
                             if outage_windows:
-                                gap_start_dt = datetime.fromtimestamp(gap_prev_ms / 1000, tz=tz_kolkata)
-                                gap_end_dt   = datetime.fromtimestamp(last_ms / 1000, tz=tz_kolkata)
+                                gap_start_dt = datetime.fromtimestamp(gap_window[0] / 1000, tz=tz_kolkata)
+                                gap_end_dt   = datetime.fromtimestamp(gap_window[1] / 1000, tz=tz_kolkata)
                                 confirmed_outage = gap_matches_outage(gap_start_dt, gap_end_dt, outage_windows)
                         else:
                             cached_until_ms = last_ms
@@ -315,9 +311,19 @@ class TickGapDetector:
                         gap_result = self.find_cache_gap(cached_df, last_ms, threshold_secs, outage_windows)
 
                         if gap_result["gap_ms"] is not None:
+                            # Legacy/SQLite fallback only (no server-side
+                            # batched gap query to give us gap_next_ms
+                            # cheaply) — still uses the old, more
+                            # conservative "everything after the gap
+                            # through last_ms" span rather than the exact
+                            # narrow window, since finding the precise
+                            # next-tick boundary here would mean an extra
+                            # full pandas pass. SQLite has no network cost
+                            # to save the way a remote Postgres round trip
+                            # does, so this stays correct, just less
+                            # surgical than the server-side path above.
                             cached_until_ms  = gap_result["cached_until_ms"]
-                            phantom_range    = gap_result["phantom_range"]
-                            phantom_local_ts = gap_result["phantom_local_ts"]
+                            gap_window       = gap_result["phantom_range"]
                             confirmed_outage = gap_result["confirmed_outage"]
                         else:
                             cached_until_ms = last_ms
@@ -357,8 +363,7 @@ class TickGapDetector:
                 out[symbol] = {
                     "fetch_start_ms":   fetch_start_ms if fetch_start_ms < now_ms else None,
                     "fetch_end_ms":     fetch_end_ms,
-                    "phantom_range":    phantom_range,
-                    "phantom_local_ts": phantom_local_ts,
+                    "gap_window":       gap_window,
                     "confirmed_outage": confirmed_outage,
                 }
 
