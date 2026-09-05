@@ -2171,11 +2171,20 @@ class PostgresTickWriter:
         so a plain MIN() reproduces pandas' ".iloc[0]" without needing to
         materialize or sort anything client-side.
 
+        Also returns gap_next_ms — the timestamp of the tick immediately
+        AFTER that same gap (t.{time_col} itself on the qualifying row,
+        alongside t.prev_ts). Together, (gap_prev_ms, gap_next_ms) is the
+        exact narrow window the gap spans — callers use this to check
+        upstream for JUST that window instead of re-verifying everything
+        from gap_prev_ms all the way through to the current high-water
+        mark (see scan_local_cache()'s docstring for why that used to
+        happen and why it doesn't need to anymore).
+
         Param order per branch: (symbol_label, threshold_ms, MARKET_OPEN,
         MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE, start_ms).
         """
         return f"""
-            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms, agg.gap_next_ms
             FROM (
                 SELECT
                     MIN(t.{time_col}) AS earliest_ms,
@@ -2186,7 +2195,15 @@ class PostgresTickWriter:
                             = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
                           AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
                           AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
-                    ) AS gap_prev_ms
+                    ) AS gap_prev_ms,
+                    MIN(t.{time_col}) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_next_ms
                 FROM (
                     SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
                     FROM {table}
@@ -2202,19 +2219,21 @@ class PostgresTickWriter:
         try:
             cur = conn.cursor()
             query = self._session_gap_query(table, time_col)
-            cur.execute(query, [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE,
-                                 MARKET_OPEN, MARKET_CLOSE, int(start_ms)])
+            params = [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [int(start_ms)]
+            cur.execute(query, params)
             row = cur.fetchone()
             conn.commit()
             if row:
-                return {"earliest_ms": row[1], "gap_prev_ms": row[2]}
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2], "gap_next_ms": row[3]}
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] session_gap single-symbol query for {symbol} failed: {exc}", flush=True)
             try:
                 conn.rollback()
             except Exception:
                 pass
-        return {"earliest_ms": None, "gap_prev_ms": None}
+        return {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None}
 
     def session_gap_batch(self, symbols: list, kind: str = "quote", start_ms: int = 0,
                            threshold_secs: int = 300, source: str = "backfill",
@@ -2228,7 +2247,7 @@ class PostgresTickWriter:
         that work doesn't disappear — but only a couple of small numbers
         per symbol cross the wire instead of the whole cached range.
 
-        Returns {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None}}
+        Returns {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None, "gap_next_ms": int|None}}
           - earliest_ms: MIN(time_col) among rows >= start_ms, or None if
             the table has no rows in range (used by scan_local_cache() to
             detect a widened lookback whose leading edge was never
@@ -2238,6 +2257,9 @@ class PostgresTickWriter:
             market hours, gap > threshold_secs), or None if there isn't
             one. Same value first_suspicious_gap_ms() would have returned
             from the equivalent DataFrame.
+          - gap_next_ms: ts of the tick immediately after that same gap.
+            Together with gap_prev_ms this is the gap's exact narrow span
+            — see _session_gap_query()'s docstring.
 
         kind selects quote_<symbol>_<source> vs depth_<symbol>_<source>
         via table_name()/_time_col() exactly like max_ts_batch() and
@@ -2257,7 +2279,7 @@ class PostgresTickWriter:
 
         table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
         time_col = self._time_col(kind)
-        result = {s: {"earliest_ms": None, "gap_prev_ms": None} for s in symbols}
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None} for s in symbols}
         threshold_ms = int(threshold_secs) * 1000
 
         own_conn = conn is None
@@ -2290,15 +2312,16 @@ class PostgresTickWriter:
                     branches, params = [], []
                     for s in chunk:
                         branches.append(self._session_gap_query(table_by_symbol[s], time_col))
-                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE,
-                                        MARKET_OPEN, MARKET_CLOSE, int(start_ms)])
+                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.append(int(start_ms))
                     query = " UNION ALL ".join(branches)
 
                     cur.execute("SAVEPOINT sp_gap_chunk")
                     try:
                         cur.execute(query, params)
-                        for sym, earliest_ms, gap_prev_ms in cur.fetchall():
-                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms}
+                        for sym, earliest_ms, gap_prev_ms, gap_next_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms, "gap_next_ms": gap_next_ms}
                         cur.execute("RELEASE SAVEPOINT sp_gap_chunk")
                     except Exception as exc:
                         cur.execute("ROLLBACK TO SAVEPOINT sp_gap_chunk")
@@ -2365,6 +2388,10 @@ class PostgresTickWriter:
         n_start_params to know whether to supply the start_ms parameter
         once or twice when building this branch's param list, since
         that depends on whether both tables are actually being unioned.
+        Also returns gap_next_ms (ts of the tick right after the gap)
+        alongside gap_prev_ms — see _session_gap_query()'s docstring on
+        why callers need the narrow (gap_prev_ms, gap_next_ms) span
+        rather than just the leading edge.
         """
         if table_backfill and table_live:
             source_sql = (
@@ -2381,7 +2408,7 @@ class PostgresTickWriter:
             n_start_params = 1
 
         query = f"""
-            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms, agg.gap_next_ms
             FROM (
                 SELECT
                     MIN(t.{time_col}) AS earliest_ms,
@@ -2392,7 +2419,15 @@ class PostgresTickWriter:
                             = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
                           AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
                           AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
-                    ) AS gap_prev_ms
+                    ) AS gap_prev_ms,
+                    MIN(t.{time_col}) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_next_ms
                 FROM (
                     SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
                     FROM ({source_sql}) src
@@ -2411,19 +2446,20 @@ class PostgresTickWriter:
             cur = conn.cursor()
             query, n_start_params = self._session_gap_query_combined(table_backfill, table_live, time_col)
             params = [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
             params.extend([int(start_ms)] * n_start_params)
             cur.execute(query, params)
             row = cur.fetchone()
             conn.commit()
             if row:
-                return {"earliest_ms": row[1], "gap_prev_ms": row[2]}
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2], "gap_next_ms": row[3]}
         except Exception as exc:
             print(f"[PG_LOCAL_WRITER][WARN] session_gap_combined single-symbol query for {symbol} failed: {exc}", flush=True)
             try:
                 conn.rollback()
             except Exception:
                 pass
-        return {"earliest_ms": None, "gap_prev_ms": None}
+        return {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None}
 
     def session_gap_batch_combined(self, symbols: list, kind: str = "quote", start_ms: int = 0,
                                     threshold_secs: int = 300, conn=None) -> dict:
@@ -2459,7 +2495,7 @@ class PostgresTickWriter:
         way a within-backfill gap always was.
 
         Returns the same shape as session_gap_batch():
-        {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None}}
+        {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None, "gap_next_ms": int|None}}
 
         Which decision this feeds (fetch_start_ms, phantom_range, etc.)
         is entirely tick_gap_detector.py's job, same as always — this
@@ -2478,7 +2514,7 @@ class PostgresTickWriter:
         table_backfill_by_symbol = {s: self.table_name(s, kind, "backfill") for s in symbols}
         table_live_by_symbol     = {s: self.table_name(s, kind, "live") for s in symbols}
         time_col = self._time_col(kind)
-        result = {s: {"earliest_ms": None, "gap_prev_ms": None} for s in symbols}
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None} for s in symbols}
         threshold_ms = int(threshold_secs) * 1000
 
         own_conn = conn is None
@@ -2525,14 +2561,15 @@ class PostgresTickWriter:
                         branch_query, n_start_params = self._session_gap_query_combined(tb, tl, time_col)
                         branches.append(branch_query)
                         params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
                         params.extend([int(start_ms)] * n_start_params)
                     query = " UNION ALL ".join(branches)
 
                     cur.execute("SAVEPOINT sp_gap_combined_chunk")
                     try:
                         cur.execute(query, params)
-                        for sym, earliest_ms, gap_prev_ms in cur.fetchall():
-                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms}
+                        for sym, earliest_ms, gap_prev_ms, gap_next_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms, "gap_next_ms": gap_next_ms}
                         cur.execute("RELEASE SAVEPOINT sp_gap_combined_chunk")
                     except Exception as exc:
                         cur.execute("ROLLBACK TO SAVEPOINT sp_gap_combined_chunk")
@@ -3103,7 +3140,24 @@ class PostgresTickWriter:
         if not batch:
             return False
 
-        self._note_inserted(self._flush_live(conn, batch, state), state)
+        # The live queue also carries ("barrier", done_event) sentinels
+        # from flush_and_wait() (see class docstring / _run_live()) —
+        # split those out and set their events instead of handing them
+        # to _flush_live(), which only knows how to unpack real ticks
+        # ("live", symbol, kind, snapshot). Without this split, a
+        # barrier grabbed here during shutdown blows up _flush_live()
+        # with "not enough values to unpack" and the barrier's event
+        # never gets set, so flush_and_wait() times out too.
+        ticks = []
+        for item in batch:
+            if item[0] == "barrier":
+                _, done_event = item
+                done_event.set()
+            else:
+                ticks.append(item)
+
+        if ticks:
+            self._note_inserted(self._flush_live(conn, ticks, state), state)
         self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
         return True
 
@@ -3334,64 +3388,70 @@ def TickWriter(base_dir: str = "tickdata", **kwargs):
 # ═════════════════════════════════════════════════════════════════════
 # HistoryCandleStore
 #
-# Local SQLite cache for candles fetched from the history (fallback)
-# PostgreSQL DB — one table per symbol, `candles_<symbol>`, inside
-# history_candles.db (a separate file from ticks.db, same base_dir).
-# Mirrors TickWriter's per-symbol-table naming convention above, but
-# for pre-built candles instead of raw ticks, and with only ONE table
-# per symbol since the history db only ever holds one granularity
-# (self.history_native_tf in backfill_manager.py, default "1m" — see
-# that file's docstring on _fetch_history_candles_batch for how that's
-# confirmed).
+# Local Postgres cache for candles fetched from the history (fallback)
+# PostgreSQL DB — one table per symbol, `candles_1m_<symbol>`, in the
+# same local Postgres database every other local cache in this file
+# uses (PG_LOCAL_* env vars — see _conn_params()). Mirrors TickWriter's
+# per-symbol-table naming convention above, but for pre-built candles
+# instead of raw ticks, and with only ONE table per symbol since the
+# history db only ever holds one granularity (self.history_native_tf
+# in backfill_manager.py, default "1m" — see that file's docstring on
+# _fetch_history_candles_batch for how that's confirmed). "1m" is
+# baked into the table prefix rather than reusing history_native_tf so
+# the name stays stable even if that setting changes later.
 #
-# Rows are upserted (ts_ms is the PRIMARY KEY), unlike ticks.db's
-# append-only design — candles are idempotent (the same bucket always
-# has the same OHLCV once closed), so re-fetching an overlapping range
-# just overwrites in place instead of risking duplicate rows.
+# Deliberately a different table namespace than every other local
+# Postgres table already in use: quote_<symbol>_backfill/live and
+# depth_<symbol>_backfill/live (PostgresTickWriter above), and
+# daily_<symbol> (backfill_manager.py's fetch_daily_candles).
+#
+# Rows are upserted (ts_ms is the PRIMARY KEY) — candles are
+# idempotent (the same bucket always has the same OHLCV once closed),
+# so re-fetching an overlapping range just overwrites in place instead
+# of risking duplicate rows.
 #
 # Much lower write volume than raw ticks (~375 rows/symbol/day instead
-# of thousands), so this stays a simple synchronous SQLite wrapper
-# behind a lock — no dedicated background writer thread the way
-# TickWriter above has one.
+# of thousands), so this stays a simple synchronous psycopg2 wrapper —
+# no dedicated background writer thread the way TickWriter above has
+# one.
 # ═════════════════════════════════════════════════════════════════════
 
 class HistoryCandleStore:
 
-    DB_FILENAME = "history_candles.db"
+    # See module comment above for why this is its own namespace.
+    PG_TABLE_PREFIX = "candles_1m"
 
-    def __init__(self, base_dir):
-        self.base_dir = base_dir
-        self._lock = threading.Lock()
+    def __init__(self, base_dir=None):
+        # base_dir is accepted (and ignored) only so existing callers
+        # that still pass it don't need a conditional at every call
+        # site — there's no local file for it to matter to anymore.
         self._known_tables = set()
 
-    @staticmethod
-    def table_name(symbol: str) -> str:
-        return f"candles_{_safe_symbol(symbol)}"
-
-    def _db_path(self):
-        return os.path.join(self.base_dir, self.DB_FILENAME)
+    @classmethod
+    def table_name(cls, symbol: str) -> str:
+        return f"{cls.PG_TABLE_PREFIX}_{_safe_symbol(symbol)}"
 
     def _connect(self):
-        os.makedirs(self.base_dir, exist_ok=True)
-        conn = sqlite3.connect(self._db_path(), timeout=15)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.commit()
-        return conn
+        # Same PG_LOCAL_* env vars / defaults as every other local-cache
+        # table in this codebase (see _conn_params() above).
+        return psycopg2.connect(**_conn_params())
 
     def _ensure_table(self, conn, table: str):
         if table in self._known_tables:
             return
-        conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {table} (
-                ts_ms  INTEGER PRIMARY KEY,
-                open   REAL,
-                high   REAL,
-                low    REAL,
-                close  REAL,
-                volume REAL
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_quote_ident(table)} (
+                ts_ms  BIGINT PRIMARY KEY,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
             )
         """)
         conn.commit()
+        cur.close()
         self._known_tables.add(table)
 
     # ─────────────────────────────────────────────
@@ -3402,42 +3462,49 @@ class HistoryCandleStore:
         """
         rows: list of {"timestamp": ms_int, "open", "high", "low",
         "close", "volume"}. Upserts on ts_ms — safe to call repeatedly
-        with overlapping ranges.
+        with overlapping ranges. Writes straight to local Postgres,
+        table_name(symbol) (candles_1m_<symbol>).
         """
         if not rows:
             return
-        with self._lock:
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] save_candles({symbol}) connect failed: {exc}", flush=True)
+            return
+        try:
+            table = self.table_name(symbol)
+            self._ensure_table(conn, table)
+            cur = conn.cursor()
+            psycopg2.extras.execute_values(
+                cur,
+                f"""
+                INSERT INTO {_quote_ident(table)} (ts_ms, open, high, low, close, volume)
+                VALUES %s
+                ON CONFLICT (ts_ms) DO UPDATE SET
+                    open=EXCLUDED.open, high=EXCLUDED.high,
+                    low=EXCLUDED.low, close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
+                """,
+                [
+                    (
+                        int(r["timestamp"]),
+                        r.get("open"), r.get("high"),
+                        r.get("low"), r.get("close"), r.get("volume"),
+                    )
+                    for r in rows
+                ],
+            )
+            conn.commit()
+            cur.close()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] save_candles({symbol}) failed: {exc}", flush=True)
             try:
-                conn = self._connect()
-            except Exception as exc:
-                print(f"[HISTORY_STORE][WARN] save_candles({symbol}) connect failed: {exc}", flush=True)
-                return
-            try:
-                table = self.table_name(symbol)
-                self._ensure_table(conn, table)
-                conn.executemany(
-                    f"""
-                    INSERT INTO {table} (ts_ms, open, high, low, close, volume)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(ts_ms) DO UPDATE SET
-                        open=excluded.open, high=excluded.high,
-                        low=excluded.low, close=excluded.close,
-                        volume=excluded.volume
-                    """,
-                    [
-                        (
-                            int(r["timestamp"]),
-                            r.get("open"), r.get("high"),
-                            r.get("low"), r.get("close"), r.get("volume"),
-                        )
-                        for r in rows
-                    ],
-                )
-                conn.commit()
-            except Exception as exc:
-                print(f"[HISTORY_STORE][WARN] save_candles({symbol}) failed: {exc}", flush=True)
-            finally:
-                conn.close()
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            conn.close()
 
     # ─────────────────────────────────────────────
     # Reads
@@ -3445,26 +3512,69 @@ class HistoryCandleStore:
 
     def max_ts(self, symbol: str):
         """Most recent ts_ms already cached for symbol, or None."""
-        path = self._db_path()
-        if not os.path.exists(path):
-            return None
         table = self.table_name(symbol)
-        with self._lock:
-            try:
-                conn = sqlite3.connect(path, timeout=15)
-                try:
-                    exists = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                    ).fetchone()
-                    if not exists:
-                        return None
-                    row = conn.execute(f"SELECT MAX(ts_ms) FROM {table}").fetchone()
-                finally:
-                    conn.close()
-                return int(row[0]) if row and row[0] is not None else None
-            except Exception as exc:
-                print(f"[HISTORY_STORE][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] max_ts({symbol}) connect failed: {exc}", flush=True)
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
                 return None
+            cur.execute(f"SELECT MAX(ts_ms) FROM {_quote_ident(table)}")
+            row = cur.fetchone()
+            cur.close()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+            return None
+        finally:
+            conn.close()
+
+    def read_timestamps(self, symbol: str, start_ms: int = None, end_ms: int = None) -> set:
+        """
+        Just the ts_ms values already cached for symbol in [start_ms,
+        end_ms] (either bound optional), as a set — for diffing
+        against upstream's available timestamps to find genuinely
+        missing candles. Cheap on purpose: candles_1m_<symbol> is
+        populated occasionally, not one row per market minute, so
+        callers can't assume a full schedule and diff against that —
+        they diff this set directly against upstream's own timestamp
+        set instead (see BackfillManager.sync_history_cache_with_main_db).
+        Empty set if the table doesn't exist or nothing matches.
+        """
+        table = self.table_name(symbol)
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("ts_ms >= %s")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("ts_ms <= %s")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_timestamps({symbol}) connect failed: {exc}", flush=True)
+            return set()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return set()
+            cur.execute(f"SELECT ts_ms FROM {_quote_ident(table)}{where}", params)
+            rows = cur.fetchall()
+            cur.close()
+            return {int(r[0]) for r in rows}
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_timestamps({symbol}) failed: {exc}", flush=True)
+            return set()
+        finally:
+            conn.close()
 
     def read_candles(self, symbol: str, start_ms: int = None, end_ms: int = None):
         """
@@ -3472,45 +3582,45 @@ class HistoryCandleStore:
         optional), ascending by ts_ms. Empty list if the table doesn't
         exist or nothing matches.
         """
-        path = self._db_path()
-        if not os.path.exists(path):
-            return []
         table = self.table_name(symbol)
 
         clauses, params = [], []
         if start_ms is not None:
-            clauses.append("ts_ms >= ?")
+            clauses.append("ts_ms >= %s")
             params.append(int(start_ms))
         if end_ms is not None:
-            clauses.append("ts_ms <= ?")
+            clauses.append("ts_ms <= %s")
             params.append(int(end_ms))
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
 
-        with self._lock:
-            try:
-                conn = sqlite3.connect(path, timeout=15)
-                try:
-                    exists = conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                    ).fetchone()
-                    if not exists:
-                        return []
-                    rows = conn.execute(
-                        f"SELECT ts_ms, open, high, low, close, volume FROM {table}{where} ORDER BY ts_ms",
-                        params,
-                    ).fetchall()
-                finally:
-                    conn.close()
-                return [
-                    {
-                        "timestamp": r[0], "open": r[1], "high": r[2],
-                        "low": r[3], "close": r[4], "volume": r[5],
-                    }
-                    for r in rows
-                ]
-            except Exception as exc:
-                print(f"[HISTORY_STORE][WARN] read_candles({symbol}) failed: {exc}", flush=True)
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_candles({symbol}) connect failed: {exc}", flush=True)
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
                 return []
+            cur.execute(
+                f"SELECT ts_ms, open, high, low, close, volume FROM {_quote_ident(table)}{where} ORDER BY ts_ms",
+                params,
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [
+                {
+                    "timestamp": r[0], "open": r[1], "high": r[2],
+                    "low": r[3], "close": r[4], "volume": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_candles({symbol}) failed: {exc}", flush=True)
+            return []
+        finally:
+            conn.close()
 
 
 # Back-compat alias — old code importing DepthWriter from depth_writer.py
