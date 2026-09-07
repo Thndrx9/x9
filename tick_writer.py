@@ -27,6 +27,7 @@
 # on disk first, buffered live ticks next, future live ticks after —
 # row after row, timestamp after timestamp, never interleaved.
 
+import io
 import os
 import re
 import time
@@ -42,6 +43,8 @@ from typing import Optional
 
 import psycopg2
 import psycopg2.extras
+import pandas as pd
+import numpy as np
 
 from market_time import tz_kolkata, trading_day_n_back, MARKET_OPEN, MARKET_CLOSE
 
@@ -157,6 +160,35 @@ def _safe_bigint(value, table: str = "?", col: str = "?"):
             )
         return None
     return ival
+
+
+def _backfill_rows_empty(rows) -> bool:
+    """`rows` is either a list of dicts (the historical shape) or a
+    pandas DataFrame (BackfillManager now hands the fetched table
+    straight through instead of exploding it into per-row dicts first
+    — see _fetch_ticks_batch's groupby loop). Plain `not rows` raises
+    ValueError on a DataFrame ("truth value... is ambiguous"), so
+    emptiness has to be checked per-type."""
+    if isinstance(rows, pd.DataFrame):
+        return rows.empty
+    return not rows
+
+
+def _backfill_rows_for_queue(rows):
+    """Prepare `rows` to be put on a queue. For a DataFrame, pass a real
+    copy through (not just a fresh index — a genuine .copy() too),
+    rather than wrapping it in list(...) — list(a_dataframe) iterates
+    its COLUMN NAMES, not its rows, which would silently replace the
+    data with a list of strings like ["timestamp", "ltp", ...]. The
+    explicit .copy() matters because the caller (BackfillManager's
+    quote-backfill loop) keeps its own reference to this same
+    DataFrame (`out[symbol] = g`) for its own use after handing rows
+    off here — _flush_bulk() mutates columns on what it receives, and
+    that must never reach back into the caller's copy. Lists of dicts
+    keep the previous list(rows) copy-on-enqueue behavior unchanged."""
+    if isinstance(rows, pd.DataFrame):
+        return rows.reset_index(drop=True).copy()
+    return list(rows)
 
 
 def _flatten_depth_levels(levels, side):
@@ -335,8 +367,16 @@ class SQLiteTickWriter:
         returned by BackfillManager's PG fetch). Queued as a single unit
         so it flushes as one contiguous ordered block ahead of anything
         enqueued after it — see module docstring.
+
+        `rows` may also be a pandas DataFrame now (BackfillManager's
+        quote-backfill path hands the fetched table straight through
+        instead of building a list of per-row dicts first — see
+        _backfill_rows_empty/_backfill_rows_for_queue above). This
+        class's _flush_bulk() converts it to records internally, so
+        the rest of this method doesn't need to care which shape it
+        got.
         """
-        if not rows:
+        if _backfill_rows_empty(rows):
             return
         # Deliberately BLOCKS if the queue is full (default put()
         # behavior) — this is the real fix for RAM not freeing quickly
@@ -354,7 +394,7 @@ class SQLiteTickWriter:
         # fetch loops) runs via asyncio.to_thread(...), never directly
         # on the event loop — see enqueue_live()'s docstring for why
         # THAT path can't use the same blocking behavior.
-        self._queue.put(("bulk", symbol, list(rows), kind))
+        self._queue.put(("bulk", symbol, _backfill_rows_for_queue(rows), kind))
 
     # ─────────────────────────────────────────────
     # Hold/release gate
@@ -1138,6 +1178,13 @@ class SQLiteTickWriter:
         return n
 
     def _flush_bulk(self, conn, symbol, rows_in, kind="quote") -> int:
+        # BackfillManager's quote path can now hand this a DataFrame
+        # instead of a list of dicts (see enqueue_backfill_rows'
+        # docstring) — this class still processes rows as dicts, so
+        # adapt here rather than rewriting the loops below. Only
+        # exercised if the SQLite backend is the one actually in use.
+        if isinstance(rows_in, pd.DataFrame):
+            rows_in = rows_in.to_dict("records")
         table = self.table_name(symbol, kind)
         rows = []
         if kind == "depth":
@@ -1737,9 +1784,15 @@ class PostgresTickWriter:
     # ─────────────────────────────────────────────
 
     def enqueue_backfill_rows(self, symbol: str, rows: list, kind: str = "quote"):
-        if not rows:
+        """`rows` is either a list of dicts or a pandas DataFrame — see
+        _backfill_rows_empty/_backfill_rows_for_queue's docstrings for
+        why each needs different handling. _flush_bulk() (this class's
+        version) expects and works directly on a DataFrame; if a list
+        of dicts arrives instead, it gets turned into one there via
+        pd.DataFrame(rows_in), same as before."""
+        if _backfill_rows_empty(rows):
             return
-        self._bulk_queues[self._shard_for(symbol)].put(("bulk", symbol, list(rows), kind))
+        self._bulk_queues[self._shard_for(symbol)].put(("bulk", symbol, _backfill_rows_for_queue(rows), kind))
 
     def flush_and_wait(self, timeout: float = 120):
         """
@@ -2875,6 +2928,104 @@ class PostgresTickWriter:
             conn.rollback()
             return 0
 
+    # Above this row count, a single symbol's backfill chunk is big enough
+    # that dropping the table's timestamp index before the load and
+    # rebuilding it once afterward (see _copy_insert below) is a net win —
+    # below it, the index-drop/rebuild round trip itself isn't worth
+    # paying for. 80k-row single-symbol backfill chunks (the common case
+    # per BackfillManager's batch fetch) are comfortably above this.
+    _BULK_COPY_INDEX_REBUILD_MIN_ROWS = 5_000
+
+    def _copy_insert(self, conn, table, kind, df, time_col: str) -> int:
+        """
+        Backfill-only bulk loader — used by _flush_bulk() in place of
+        _insert()'s execute_values() path. Loads via Postgres's native
+        COPY protocol instead of parameterized INSERTs.
+
+        Takes a pandas DataFrame (already column-cleaned by
+        _flush_bulk — see that method's docstring) rather than a list
+        of row tuples: turning the whole DataFrame into COPY's
+        tab-separated text is one bulk pandas call (to_csv), not a
+        Python loop over rows — same reasoning as _flush_bulk's
+        vectorized cleanup, applied to the text-building step too.
+
+        Why COPY itself is faster than execute_values at backfill
+        volumes (routinely 80k+ rows for a single symbol in one
+        _flush_bulk call): execute_values still goes through the
+        normal query path — parse, plan, bind parameters — for every
+        page of rows. COPY skips all of that and streams rows straight
+        into the table, which is Postgres's actual bulk-load mechanism.
+
+        Also skips index-maintenance-per-row for large loads: above
+        _BULK_COPY_INDEX_REBUILD_MIN_ROWS, the table's existing timestamp
+        index (if any) is dropped before the COPY and rebuilt once after
+        — one bulk index build over rows already on disk, instead of the
+        index being updated incrementally as each of 80,000 rows lands.
+        Only ever touches THIS table's index; every symbol's backfill
+        table is owned by exactly one shard (see _shard_for()), so no
+        other thread can be reading/writing this same table concurrently.
+        Small (sub-threshold) loads and brand-new tables with no index
+        yet (see _ensure_table's is_fresh_db deferral) just COPY straight
+        in, unchanged.
+
+        NOT used for the live-tick path (_flush_live still uses _insert):
+        live batches are small (BATCH_SIZE=100) and arrive continuously,
+        so there's no backlog of rows to justify COPY's setup cost, an
+        index drop/rebuild cycle, or building a DataFrame — execute_values
+        is already fine there.
+        """
+        n = len(df)
+        if n == 0:
+            return 0
+        cols = list(df.columns)
+
+        index_name = f"idx_{table}_ts"
+        rebuild_index = n >= self._BULK_COPY_INDEX_REBUILD_MIN_ROWS
+        dropped_index = False
+        cur = conn.cursor()
+        try:
+            if rebuild_index:
+                cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index_name,))
+                dropped_index = cur.fetchone() is not None
+                if dropped_index:
+                    cur.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+            # Whole-DataFrame -> COPY text in one bulk call, instead of
+            # a Python loop joining one row at a time. "\N" is Postgres
+            # COPY text format's NULL marker; every column here is a
+            # plain number (BIGINT/DOUBLE PRECISION — see
+            # PG_LOCAL_QUOTE_COLUMNS/DEPTH_LEVEL_COLUMNS), so no
+            # quoting/escaping concerns the way there would be for text
+            # columns. lineterminator is forced to "\n" explicitly (not
+            # left to default) so this can't ever emit "\r\n", which
+            # COPY's text parser would otherwise fold into the last
+            # column's value. pandas renamed this kwarg at one point,
+            # so both spellings are tried for cross-version safety.
+            buf = io.StringIO()
+            try:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+            except TypeError:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", line_terminator="\n")
+            buf.seek(0)
+            cur.copy_expert(
+                f"COPY {table} ({', '.join(cols)}) FROM STDIN WITH (FORMAT text)",
+                buf,
+            )
+
+            if dropped_index:
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({time_col})")
+
+            return n
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] bulk COPY insert into {table} failed: {exc}", flush=True)
+            try:
+                sample = df.iloc[0].to_dict()
+            except Exception:
+                sample = "(no rows)"
+            print(f"[PG_LOCAL_WRITER][WARN] {table}: sample row from failed batch: {sample}", flush=True)
+            conn.rollback()
+            return 0
+
     def _flush_live(self, conn, batch, state) -> int:
         rows_by_table = {}
         for _, symbol, kind, snapshot in batch:
@@ -2903,27 +3054,90 @@ class PostgresTickWriter:
         return n
 
     def _flush_bulk(self, conn, symbol, rows_in, kind, state) -> int:
+        """
+        Backfill path. Used to loop over rows_in in plain Python,
+        calling _safe_bigint() per bigint-typed field per row — at
+        80k-rows-per-symbol backfill volumes (the common case per
+        BackfillManager's batch fetch) that's roughly a million
+        individual Python-level touches before a single byte reached
+        Postgres, all of it serialized by the GIL regardless of how
+        many shard threads exist. Replaced with a handful of
+        whole-column pandas operations instead: build one DataFrame
+        from rows_in, clean each bigint column in one vectorized pass,
+        and hand the whole thing to _copy_insert() to stream out via
+        COPY — same result, same NaN/inf/out-of-range NULL-safety
+        _safe_bigint used to give, just done column-at-a-time instead
+        of value-at-a-time.
+
+        (The reason that safety check exists at all — a single NaN
+        anywhere in a bigint-bound column silently upcasting the WHOLE
+        column to float64, see _safe_bigint's original docstring — is
+        itself a pandas quirk, so redoing it as a pandas-native
+        whole-column fix is the natural place for it to live now.)
+        """
         table = self.table_name(symbol, kind, "backfill")
-        rows = []
+        if _backfill_rows_empty(rows_in):
+            return 0
+
+        # rows_in is normally already a DataFrame now (see
+        # enqueue_backfill_rows) — avoid pd.DataFrame(rows_in)'s extra
+        # copy in that case; still accept a list of dicts for anything
+        # that hasn't been switched over (e.g. depth backfill still
+        # calls this with to_dict("records") lists as of this writing).
+        df = rows_in if isinstance(rows_in, pd.DataFrame) else pd.DataFrame(rows_in)
+        if "timestamp" not in df.columns:
+            return 0
+        df = df[df["timestamp"].notna()]
+        if df.empty:
+            return 0
+
         if kind == "depth":
-            for r in rows_in:
-                ts_ms = r.get("timestamp")
-                if ts_ms is None:
-                    continue
-                rows.append((int(ts_ms), r.get("ltp")) + tuple(r.get(c) for c in DEPTH_LEVEL_COLUMNS))
+            df["ts_ms"] = df["timestamp"].astype("int64")
+            for c in DEPTH_LEVEL_COLUMNS:
+                if c not in df.columns:
+                    df[c] = None
+            out_df = df[["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)]
         else:
-            for r in rows_in:
-                ts_ms = r.get("timestamp")
-                if ts_ms is None:
-                    continue
-                rows.append(tuple(
-                    int(ts_ms) if col == "timestamp"
-                    else _safe_bigint(r.get(col), table=table, col=col) if col in _QUOTE_EXTRA_INT_COLUMNS
-                    else r.get(col)
-                    for col in PG_LOCAL_QUOTE_COLUMNS
-                ))
+            for c in QUOTE_EXTRA_COLUMNS:
+                if c not in df.columns:
+                    df[c] = None
+            df["timestamp"] = df["timestamp"].astype("int64")
+            for col in _QUOTE_EXTRA_INT_COLUMNS:
+                # Same protection _safe_bigint() gave per-value, applied
+                # to the whole column at once: non-numeric -> NaN,
+                # +/-inf -> NaN, out-of-Postgres-bigint-range -> NaN,
+                # then round to the nearest whole number. Int64 (capital
+                # I — pandas' NULLABLE integer dtype, not plain int64)
+                # keeps NaN as a real missing value instead of forcing
+                # the column back to float, so to_csv below still
+                # writes clean integers (no trailing ".0") with "\N"
+                # for the missing ones.
+                s = pd.to_numeric(df[col], errors="coerce")
+                s = s.replace([np.inf, -np.inf], np.nan)
+                out_of_range = (s < _PG_BIGINT_MIN) | (s > _PG_BIGINT_MAX)
+                newly_invalid = out_of_range & s.notna()
+                if newly_invalid.any():
+                    key = (table, col)
+                    if key not in _bigint_warned_cols:
+                        _bigint_warned_cols.add(key)
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] {table}.{col}: "
+                            f"{int(newly_invalid.sum())} out-of-range/invalid "
+                            f"bigint value(s) in this batch — storing NULL "
+                            f"instead (further occurrences for this column "
+                            f"suppressed)",
+                            flush=True,
+                        )
+                s = s.mask(out_of_range)
+                df[col] = s.round().astype("Int64")
+            out_df = df[list(PG_LOCAL_QUOTE_COLUMNS)]
+
         self._ensure_table(conn, table, kind, state)
-        return self._insert(conn, table, kind, rows)
+        # Backfill path uses the COPY-based bulk loader (see
+        # _copy_insert's docstring) instead of _insert()'s
+        # execute_values — the live path (_flush_live) still uses
+        # _insert() unchanged, since it never sees this row volume.
+        return self._copy_insert(conn, table, kind, out_df, self._time_col(kind))
 
     def _delete_range(self, conn, symbol, start_ms, end_ms, kind, source):
         table = self.table_name(symbol, kind, source)
@@ -3427,6 +3641,25 @@ class HistoryCandleStore:
         # site — there's no local file for it to matter to anymore.
         self._known_tables = set()
 
+        # Dedicated connection for save_candles() specifically — see
+        # that method's docstring. NOT shared with read_candles()/
+        # max_ts()/read_timestamps() (those still open/close per call,
+        # unchanged), so there's no risk of two different threads (a
+        # live engine doing reads, a backfill/heal thread doing writes)
+        # fighting over one shared connection. save_candles() itself
+        # is only ever called from backfill_manager.py's single
+        # serialized backfill/heal thread (engine_runtime.py's
+        # backfill_lock — see run_targeted_heal()'s docstring), so
+        # caching a connection here needs no locking of its own.
+        self._save_conn = None
+        # Staging table used by save_candles()'s COPY-then-merge upsert
+        # — see that method's docstring for why a temp table exists at
+        # all. One shared TEMP TABLE reused (truncated between calls)
+        # across every symbol on self._save_conn, rather than one
+        # per-symbol temp table, so a long backfill run touching ~200
+        # symbols doesn't leave ~200 temp-table catalog entries behind.
+        self._STAGING_TABLE = "history_store_candle_stage"
+
     @classmethod
     def table_name(cls, symbol: str) -> str:
         return f"{cls.PG_TABLE_PREFIX}_{_safe_symbol(symbol)}"
@@ -3435,6 +3668,38 @@ class HistoryCandleStore:
         # Same PG_LOCAL_* env vars / defaults as every other local-cache
         # table in this codebase (see _conn_params() above).
         return psycopg2.connect(**_conn_params())
+
+    def _get_save_conn(self):
+        """Lazily connects, then reuses the SAME connection across every
+        save_candles() call — see __init__'s comment on why this is
+        safe without locking. Previously this reconnected (full TCP +
+        auth handshake) on EVERY call, i.e. once per symbol per
+        backfill/heal run — the single biggest cost in this class,
+        bigger than the actual write itself for how little data one
+        symbol's candles are."""
+        if self._save_conn is not None and not self._save_conn.closed:
+            return self._save_conn
+        self._save_conn = self._connect()
+        return self._save_conn
+
+    def _ensure_staging_table(self, conn):
+        """CREATE TEMP TABLE IF NOT EXISTS — a cheap no-op after the
+        first call on a given connection. Also transparently recreates
+        it after a reconnect (a fresh connection has no memory of the
+        old session's temp tables), so save_candles() can call this
+        unconditionally every time rather than tracking "did I already
+        set this up on the CURRENT connection" separately."""
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TEMP TABLE IF NOT EXISTS {self._STAGING_TABLE} (
+                ts_ms  BIGINT,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
+            )
+        """)
 
     def _ensure_table(self, conn, table: str):
         if table in self._known_tables:
@@ -3458,53 +3723,114 @@ class HistoryCandleStore:
     # Writes
     # ─────────────────────────────────────────────
 
-    def save_candles(self, symbol: str, rows: list):
+    def save_candles(self, symbol: str, rows):
         """
-        rows: list of {"timestamp": ms_int, "open", "high", "low",
-        "close", "volume"}. Upserts on ts_ms — safe to call repeatedly
-        with overlapping ranges. Writes straight to local Postgres,
-        table_name(symbol) (candles_1m_<symbol>).
+        rows: either a list of {"timestamp": ms_int, "open", "high",
+        "low", "close", "volume"} dicts, or a pandas DataFrame with
+        those same columns (BackfillManager's history-candle fetch
+        hands this a DataFrame directly now — see
+        _fetch_history_candles_batch). Upserts on ts_ms — safe to call
+        repeatedly with overlapping ranges.
+
+        Previously: opened a brand-new connection every single call
+        (one full TCP+auth handshake per symbol per backfill/heal run
+        — see _get_save_conn()) and upserted via execute_values with
+        an ON CONFLICT clause, i.e. Postgres checking/updating the
+        real table row by row as each one streamed in.
+
+        Now: reuses one connection across every symbol (_get_save_conn),
+        and writes via a two-step COPY-then-merge instead of a
+        row-by-row upsert:
+          1. COPY straight into a small reusable TEMP TABLE (see
+             _ensure_staging_table) — Postgres's actual bulk-load path,
+             same reasoning as PostgresTickWriter._copy_insert(), with
+             no ON CONFLICT to slow it down since the staging table has
+             no constraints at all.
+          2. ONE "INSERT ... SELECT ... ON CONFLICT DO UPDATE" merging
+             the staging table into the real candles_1m_<symbol> table
+             — the upsert logic still happens, just as a single bulk
+             operation over data already sitting in Postgres, instead
+             of psycopg2 sending and checking one row-batch at a time.
+        This is the standard way to get COPY's speed while keeping
+        upsert (ON CONFLICT) semantics, which plain COPY can't express
+        on its own.
+
+        If given a DataFrame, makes its own copy before touching it —
+        BackfillManager's fetch loop mutates and keeps using the same
+        DataFrame object after calling this (see that call site's
+        comment), so this must never modify the caller's copy.
         """
-        if not rows:
+        if isinstance(rows, pd.DataFrame):
+            if rows.empty:
+                return
+            df = rows.copy()
+        else:
+            if not rows:
+                return
+            df = pd.DataFrame(rows)
+
+        for c in ("timestamp", "open", "high", "low", "close", "volume"):
+            if c not in df.columns:
+                df[c] = None
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df[df["timestamp"].notna()]
+        if df.empty:
             return
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df = df.rename(columns={"timestamp": "ts_ms"})
+
         try:
-            conn = self._connect()
+            conn = self._get_save_conn()
         except Exception as exc:
             print(f"[HISTORY_STORE][WARN] save_candles({symbol}) connect failed: {exc}", flush=True)
             return
         try:
             table = self.table_name(symbol)
             self._ensure_table(conn, table)
+            self._ensure_staging_table(conn)
             cur = conn.cursor()
-            psycopg2.extras.execute_values(
-                cur,
-                f"""
+
+            # Staging table is reused across every symbol on this
+            # connection — clear out whatever the previous symbol left
+            # behind before loading this one's rows. Cheap: it's a temp
+            # table holding at most one symbol's worth of candles at a
+            # time (~375 rows/day), never accumulates.
+            cur.execute(f"TRUNCATE {self._STAGING_TABLE}")
+
+            buf = io.StringIO()
+            try:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+            except TypeError:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", line_terminator="\n")
+            buf.seek(0)
+            cur.copy_expert(
+                f"COPY {self._STAGING_TABLE} (ts_ms, open, high, low, close, volume) FROM STDIN WITH (FORMAT text)",
+                buf,
+            )
+
+            cur.execute(f"""
                 INSERT INTO {_quote_ident(table)} (ts_ms, open, high, low, close, volume)
-                VALUES %s
+                SELECT ts_ms, open, high, low, close, volume FROM {self._STAGING_TABLE}
                 ON CONFLICT (ts_ms) DO UPDATE SET
                     open=EXCLUDED.open, high=EXCLUDED.high,
                     low=EXCLUDED.low, close=EXCLUDED.close,
                     volume=EXCLUDED.volume
-                """,
-                [
-                    (
-                        int(r["timestamp"]),
-                        r.get("open"), r.get("high"),
-                        r.get("low"), r.get("close"), r.get("volume"),
-                    )
-                    for r in rows
-                ],
-            )
+            """)
             conn.commit()
-            cur.close()
         except Exception as exc:
             print(f"[HISTORY_STORE][WARN] save_candles({symbol}) failed: {exc}", flush=True)
             try:
                 conn.rollback()
             except Exception:
-                pass
-        finally:
-            conn.close()
+                # Rollback itself failed — the connection is almost
+                # certainly dead. Close it and drop the cache so the
+                # NEXT call reconnects fresh instead of repeatedly
+                # trying to reuse a broken connection forever.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._save_conn = None
 
     # ─────────────────────────────────────────────
     # Reads
