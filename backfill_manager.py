@@ -3,6 +3,7 @@
 import os
 import re
 import math
+import time
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -175,6 +176,23 @@ class BackfillManager:
         # cache; this is what tells it a range is actually missing.
         self.tick_gaps   = TickGapDetector()
         self.batch_size  = int(os.getenv("BACKFILL_BATCH_SIZE", "0"))  # 0 = no chunking, all symbols in one query
+
+        # Fetch-ahead pacing (quote/depth backfill only — see
+        # _wait_for_write_headroom()'s docstring). After each chunk is
+        # fetched+enqueued, the NEXT chunk's fetch starts immediately
+        # rather than waiting for those rows to actually be written —
+        # UNLESS the writer's backlog (rows already handed off but not
+        # yet on disk) has grown past this many symbols' worth, in
+        # which case the fetch loop pauses until the writer catches up.
+        # This is what lets network fetching and disk writing overlap
+        # (fetch chunk N+1 while chunk N is still being written)
+        # instead of strictly alternating "fetch, then wait for the
+        # write to finish, then fetch again" — while still capping how
+        # much fetched-but-unwritten data can ever pile up in RAM at
+        # once, the same way the old small per-shard queue did, just
+        # as a deliberate, chunk-aligned number instead of an
+        # accidental one.
+        self.fetch_ahead_max_pending = int(os.getenv("BACKFILL_FETCH_AHEAD_CAP", "5"))
 
         # How large a same-session silent gap in cached ticks (ticks.db)
         # has to be before we stop trusting the cache from that point
@@ -1396,6 +1414,57 @@ class BackfillManager:
                 flush=True,
             )
 
+    def _wait_for_write_headroom(self, poll_secs: float = 0.2, max_wait_secs: float = 60.0):
+        """
+        Called at the top of each chunk iteration in _fetch_ticks_batch()/
+        _fetch_depth_batch(), BEFORE that chunk's fetch — pauses the
+        fetch loop only if the writer's current backlog (rows already
+        handed to tick_writer but not yet actually written) has grown
+        past self.fetch_ahead_max_pending "symbols' worth". Below that,
+        returns immediately — the whole point is that fetching chunk
+        N+1 normally proceeds right away, overlapping with chunk N
+        still being written in the background, instead of the two
+        strictly alternating.
+
+        Uses tick_writer.get_metrics()["queue_depth"] as the backlog
+        signal — already exposed by both SQLiteTickWriter and
+        PostgresTickWriter, so this needs no changes to tick_writer.py.
+        One caveat, by design not a bug: this counts items still
+        SITTING in a queue, not the (at most pool_size) items a writer
+        thread may be actively mid-write on right now, and for
+        PostgresTickWriter it's shared with live-tick traffic too (the
+        same aggregate metric, not split by quote/depth) — both make
+        this an approximate, not exact, backlog count. That's fine
+        here: this is pacing (how eagerly should fetching run ahead of
+        writing), not a correctness guarantee, and get_metrics() itself
+        documents these numbers as best-effort.
+
+        max_wait_secs bounds how long this will ever wait before giving
+        up and proceeding anyway (with a warning) — a writer that's
+        stalled or dead should never be able to hang the fetch loop
+        forever; better to press on (and let the writer's own
+        error-handling/reconnect logic, or the next flush_and_wait(),
+        surface the real problem) than freeze backfill entirely here.
+        """
+        if self.tick_writer is None:
+            return
+        waited = 0.0
+        while waited < max_wait_secs:
+            try:
+                depth = self.tick_writer.get_metrics().get("queue_depth", 0)
+            except Exception:
+                return  # metrics unavailable — don't let pacing itself break the fetch loop
+            if depth < self.fetch_ahead_max_pending:
+                return
+            time.sleep(poll_secs)
+            waited += poll_secs
+        print(
+            f"[BACKFILL][WARN] fetch-ahead pacing waited {max_wait_secs}s for the writer "
+            f"to catch up (still {depth} item(s) backlogged) — proceeding with the next "
+            f"chunk anyway",
+            flush=True,
+        )
+
     def _fetch_ticks_batch(self, fetch_starts: dict, existing_tables: set, fetch_ends: dict = None) -> dict:
         """
         fetch_starts: {symbol: start_ts} — symbols needing a main-db tick
@@ -1436,6 +1505,13 @@ class BackfillManager:
 
         chunk_size = self.batch_size if self.batch_size > 0 else max(len(items), 1)
         for i in range(0, len(items), chunk_size):
+            # Pace fetching against how far the writer has fallen
+            # behind, NOT against this chunk's own write finishing —
+            # see _wait_for_write_headroom()'s docstring. Only actually
+            # pauses once genuinely backlogged; otherwise this chunk's
+            # fetch starts immediately, overlapping with the previous
+            # chunk still being written in the background.
+            self._wait_for_write_headroom()
             chunk = items[i:i + chunk_size]
 
             clauses = []
@@ -1563,24 +1639,26 @@ class BackfillManager:
                 g = group.drop(columns=["symbol"]).reset_index(drop=True)
                 out[symbol] = g
 
-                # Cache these PG-fetched ticks to the local SQLite tick
-                # store too. `g` is already ascending by timestamp (the
-                # query is ORDER BY symbol, timestamp), so this is a
-                # single ordered block — see tick_writer.py's ordering
-                # guarantee docstring for why that matters. Every column
-                # PG has (not just timestamp/ltp/qty) rides along so the
-                # local cache is a full mirror, not a stripped-down copy.
+                # Cache these PG-fetched ticks to the local tick store
+                # too. `g` is already ascending by timestamp (the query
+                # is ORDER BY symbol, timestamp), so this is a single
+                # ordered block — see tick_writer.py's ordering
+                # guarantee docstring for why that matters.
+                #
+                # Hands `g` straight to the writer instead of first
+                # exploding it into a list of per-row dicts (the old
+                # `for row in g.itertuples(...)` loop that used to be
+                # here) — that loop was a second full one-row-at-a-time
+                # pass over the same data we just finished building as
+                # a table, run single-threaded on this fetch thread (so
+                # all 9 writer shards sat idle while it ran), just so
+                # the writer's _flush_bulk() could immediately turn the
+                # dicts back into a DataFrame again. enqueue_backfill_rows()
+                # makes its own copy of `g` before queuing it (see
+                # _backfill_rows_for_queue), so mutating it further
+                # downstream can't affect `out[symbol]` above.
                 if self.tick_writer is not None:
-                    rows = [
-                        {
-                            "timestamp": int(row.timestamp),
-                            "ltp": row.ltp,
-                            "qty": row.qty,
-                            **{c: getattr(row, c) for c in QUOTE_EXTRA_COLUMNS},
-                        }
-                        for row in g.itertuples(index=False)
-                    ]
-                    self.tick_writer.enqueue_backfill_rows(symbol, rows)
+                    self.tick_writer.enqueue_backfill_rows(symbol, g)
 
         if skipped_no_table:
             preview = ", ".join(skipped_no_table[:10])
@@ -1653,6 +1731,9 @@ class BackfillManager:
 
         chunk_size = self.batch_size if self.batch_size > 0 else max(len(items), 1)
         for i in range(0, len(items), chunk_size):
+            # Same fetch-ahead pacing as the quote path — see
+            # _wait_for_write_headroom()'s docstring.
+            self._wait_for_write_headroom()
             chunk = items[i:i + chunk_size]
 
             clauses = []
@@ -1765,10 +1846,20 @@ class BackfillManager:
                 # quote row does. Nested bids/asks shape is only ever
                 # built where something in RAM actually needs it (see
                 # _seed_depth_ram), not on this hot fetch/write path.
-                bulk_rows = g.to_dict("records")
-
+                #
+                # Hands `g` straight to the writer instead of first
+                # calling g.to_dict("records") — same fix as the quote
+                # path above: that conversion was a second full pass
+                # over every row just so _flush_bulk() could
+                # immediately turn it back into a DataFrame again.
+                # Nothing else in this loop keeps a reference to `g`
+                # after this point (unlike the quote path's
+                # `out[symbol] = g`), and enqueue_backfill_rows() makes
+                # its own copy before queuing regardless (see
+                # _backfill_rows_for_queue), so there's no aliasing
+                # concern here either way.
                 if self.tick_writer is not None:
-                    self.tick_writer.enqueue_backfill_rows(symbol, bulk_rows, kind="depth")
+                    self.tick_writer.enqueue_backfill_rows(symbol, g, kind="depth")
 
                 # Only ever accumulate timestamps in `out`, NOT the full
                 # depth payload — the only caller (the phantom-row check
@@ -1933,17 +2024,19 @@ class BackfillManager:
                 # store BEFORE converting timestamp to a tz-aware
                 # Kolkata Timestamp — HistoryCandleStore wants raw ms
                 # ints, same convention as TickWriter.
+                #
+                # Hands `g` straight to save_candles() instead of first
+                # exploding it into a list of per-row dicts via
+                # itertuples() — same fix as the quote/depth backfill
+                # paths above: that loop was a second full row-by-row
+                # pass over data already sitting in a table, just to
+                # immediately rebuild it as one inside save_candles().
+                # save_candles() makes its own copy of the DataFrame it
+                # receives (see its docstring) before touching it, so
+                # the mutation two lines below (`g["timestamp"] = ...`)
+                # and `out[symbol] = g` are unaffected either way.
                 if self.history_store is not None:
-                    cache_rows = [
-                        {
-                            "timestamp": int(row.timestamp),
-                            "open": row.open, "high": row.high,
-                            "low": row.low, "close": row.close,
-                            "volume": row.volume,
-                        }
-                        for row in g.itertuples(index=False)
-                    ]
-                    self.history_store.save_candles(symbol, cache_rows)
+                    self.history_store.save_candles(symbol, g)
 
                 g["timestamp"] = pd.to_datetime(g["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
                 out[symbol] = g
