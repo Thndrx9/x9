@@ -14,7 +14,11 @@ from parquet_writer import ParquetWriter
 from gap_detector import (
     compute_bucket,
     compute_bucket_vectorized,
+    compute_tick_volume_vectorized,
     is_at_or_after_market_open_vectorized,
+    is_before_continuous_close_vectorized,
+    MARKET_CLOSE_SECS,
+    CAS_CONTINUOUS_CLOSE_SECS,
 )
 
 # 9:15:00 in seconds from midnight
@@ -140,6 +144,12 @@ class OHLCCollector:
         # raw_ticks[symbol] = deque of {timestamp, ltp, qty}
         self.raw_ticks = {}
 
+        # Per-symbol (date, last cumulative "volume" seen) — used by
+        # _process_tick() to diff the broker feed's cumulative volume
+        # into each tick's own incremental contribution. See that
+        # method's comment for why this beats summing last_trade_quantity.
+        self._last_cum_volume = {}
+
         # ── Backward-compat references ────────────────────────────────
         # executor.py / indicators.py / PreviousCandleGuard use these names directly.
         # They point to the SAME dict objects inside ohlc_data / current_candles
@@ -250,10 +260,18 @@ class OHLCCollector:
         df:         pd.DataFrame,
         tf_seconds: int,
         now:        datetime,
+        continuous_close_secs: int = MARKET_CLOSE_SECS,
     ) -> pd.DataFrame:
         """
         Group ticks into OHLC candles using market-open-aligned buckets.
         Excludes the currently-forming candle (bucket == current_bucket).
+
+        continuous_close_secs caps how late in the day (seconds since
+        IST midnight) a tick can still be bucketed into a candle —
+        pass CAS_CONTINUOUS_CLOSE_SECS (15:15) for F&O-eligible
+        symbols, the default MARKET_CLOSE_SECS (15:30) for everyone
+        else. See is_before_continuous_close_vectorized()'s docstring
+        in gap_detector.py and fo_symbols.py's module docstring for why.
         """
         df = df.copy()
 
@@ -261,6 +279,29 @@ class OHLCCollector:
             return pd.DataFrame(
                 columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
+
+        # The broker feed's "volume" is CUMULATIVE (volume traded so far
+        # today), not per-tick — see compute_tick_volume_vectorized()'s
+        # docstring in gap_detector.py for the full reasoning on why
+        # candle volume is diffed from this rather than summed from
+        # "qty" (last_trade_quantity).
+        # Sort by (ist_ts, timestamp) explicitly, not just ist_ts —
+        # ist_ts is now derived from "ltt" (last trade time), which is
+        # only second-precision, so multiple ticks can share an
+        # identical ist_ts. "timestamp" (millisecond packet time)
+        # breaks that tie in true arrival order, so open/close price
+        # attribution within a tied group stays deterministic rather
+        # than depending on whatever order the rows happened to arrive
+        # in from the DB/RAM buffer.
+        sort_cols = ["ist_ts", "timestamp"] if "timestamp" in df.columns else ["ist_ts"]
+        df = df.sort_values(sort_cols)
+        if "volume" in df.columns:
+            tiebreaker = df["timestamp"] if "timestamp" in df.columns else None
+            df["tick_volume"] = compute_tick_volume_vectorized(df["ist_ts"], df["volume"], tiebreaker=tiebreaker)
+        else:
+            # Fallback for any caller that hasn't been updated to pass
+            # a cumulative "volume" column through yet.
+            df["tick_volume"] = df.get("qty", 0)
 
         # Vectorized — was previously a per-row .apply(compute_bucket), which
         # is a pure-Python loop over every tick and dominated wall time
@@ -278,6 +319,13 @@ class OHLCCollector:
         # gap_detector.py; this was the dominant cost (~86%) of this method.
         df = df[is_at_or_after_market_open_vectorized(df["ist_ts"])]
 
+        # Drop any tick at/after this symbol's continuous-trading close
+        # (15:15 for F&O/CAS symbols, 15:30 otherwise) — see this
+        # method's docstring. A no-op when continuous_close_secs is the
+        # default MARKET_CLOSE_SECS and the data doesn't extend past
+        # 15:30 anyway, so this is safe to always apply.
+        df = df[is_before_continuous_close_vectorized(df["ist_ts"], continuous_close_secs)]
+
         # Exclude the currently-forming (incomplete) candle
         current_bucket = compute_bucket(now, tf_seconds)
         df = df[df["bucket"] < current_bucket]
@@ -294,7 +342,7 @@ class OHLCCollector:
                 high   = ("ltp", "max"),
                 low    = ("ltp", "min"),
                 close  = ("ltp", "last"),
-                volume = ("qty", "sum"),
+                volume = ("tick_volume", "sum"),
             )
             .reset_index()
             .rename(columns={"bucket": "timestamp"})
@@ -302,7 +350,7 @@ class OHLCCollector:
 
         return grouped.reset_index(drop=True)
 
-    def build_symbol_candles(self, ticks_df, history_df, start_ts, now, timeframes, history_native_tf, gaps):
+    def build_symbol_candles(self, ticks_df, history_df, start_ts, now, timeframes, history_native_tf, gaps, continuous_close_secs: int = MARKET_CLOSE_SECS):
         """
         For every configured TF: build candles giving priority to
         history-db data (history_df — already this symbol's full
@@ -327,6 +375,12 @@ class OHLCCollector:
         instance — this method builds candles, it delegates "what's
         missing" to gaps rather than computing that itself.
 
+        continuous_close_secs is passed straight through to every
+        aggregate_ticks_to_candles() call below — see that method's
+        docstring. Callers should pass CAS_CONTINUOUS_CLOSE_SECS for
+        F&O-eligible symbols (see fo_symbols.py), the default
+        MARKET_CLOSE_SECS otherwise.
+
         Returns per_tf: {tf_str: {"candles", "missing", "expected"}}
         """
         native_tf_seconds = dict(timeframes).get(history_native_tf)
@@ -338,7 +392,7 @@ class OHLCCollector:
         # roll-up base (nothing to merge it against).
         merged_1m = None
         if native_tf_seconds is not None:
-            tick_native = self.aggregate_ticks_to_candles(ticks_df, native_tf_seconds, now)
+            tick_native = self.aggregate_ticks_to_candles(ticks_df, native_tf_seconds, now, continuous_close_secs)
             merged_1m = (
                 gaps.merge_candles(history_df, tick_native)
                 if history_df is not None and not history_df.empty
@@ -352,13 +406,13 @@ class OHLCCollector:
             expected = gaps.expected_buckets(start_ts, now, tf_seconds)
 
             if tf_str == history_native_tf:
-                candles = merged_1m if merged_1m is not None else self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+                candles = merged_1m if merged_1m is not None else self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
             elif tf_seconds > 60 and merged_1m is not None and not merged_1m.empty:
                 derived     = gaps.derive_from_1m(merged_1m, expected, tf_seconds)
-                tick_direct = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+                tick_direct = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
                 candles     = gaps.merge_candles(derived, tick_direct)
             else:
-                candles = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now)
+                candles = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
 
             missing = gaps.find_missing(candles, expected)
             per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
@@ -473,12 +527,40 @@ class OHLCCollector:
         ts = datetime.fromtimestamp(data["ltt"] / 1000, tz=tz_kolkata)
 
         # ── Raw tick RAM store — flat rolling window, no MIN_CANDLES rule ──
+        # Reconstruct this tick's OWN incremental volume from the feed's
+        # cumulative "volume" (volume traded so far today), diffed
+        # against the last cumulative value seen for this symbol —
+        # NOT last_trade_quantity directly, since a depth-only/quote-
+        # refresh tick can re-broadcast the same last trade's size with
+        # no new trade having occurred, which would double-count if
+        # summed. Same reasoning as aggregate_ticks_to_candles() (the
+        # historical-rebuild path) — see that method's docstring.
+        raw_cum_volume = data.get("volume")
+        tick_day = ts.date()
+        if raw_cum_volume is not None:
+            prev_day, prev_cum_volume = self._last_cum_volume.get(symbol, (None, None))
+            if prev_day == tick_day and prev_cum_volume is not None:
+                tick_vol = max(raw_cum_volume - prev_cum_volume, 0)
+            else:
+                # First tick seen for this symbol today (or ever this
+                # run) — the exchange's cumulative counter starts at 0
+                # at day open, so this tick's own cumulative value
+                # already IS its full incremental contribution.
+                tick_vol = raw_cum_volume
+            self._last_cum_volume[symbol] = (tick_day, raw_cum_volume)
+        else:
+            # Feed didn't send a cumulative "volume" this tick —
+            # fall back to last_trade_quantity (imperfect: can
+            # double-count on a duplicate/depth-only re-broadcast, but
+            # better than silently dropping volume for this tick).
+            tick_vol = data.get("last_trade_quantity", 0) or 0
+
         with self._ram_lock:
             ticks = self.raw_ticks.setdefault(symbol, deque())
             ticks.append({
                 "timestamp": ts,
                 "ltp":       ltp,
-                "qty":       data.get("last_trade_quantity", 0),
+                "qty":       tick_vol,
             })
             cutoff = ts - timedelta(seconds=self.tick_ram_window_secs)
             while ticks and ticks[0]["timestamp"] < cutoff:
@@ -535,14 +617,14 @@ class OHLCCollector:
                     "high":      ltp,
                     "low":       ltp,
                     "close":     ltp,
-                    "volume":    data.get("last_trade_quantity", 0),
+                    "volume":    tick_vol,
                 }
             else:
                 # Update the existing forming candle
                 current["high"]    = max(current["high"], ltp)
                 current["low"]     = min(current["low"],  ltp)
                 current["close"]   = ltp
-                current["volume"] += data.get("last_trade_quantity", 0)
+                current["volume"] += tick_vol
 
     # =====================================================
     # SHUTDOWN

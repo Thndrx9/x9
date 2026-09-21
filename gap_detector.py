@@ -9,6 +9,12 @@ from market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day
 MARKET_OPEN_SECS = MARKET_OPEN.hour * 3600 + MARKET_OPEN.minute * 60  # 33300
 # 15:30:00 in seconds from midnight
 MARKET_CLOSE_SECS = MARKET_CLOSE.hour * 3600 + MARKET_CLOSE.minute * 60  # 55800
+# 15:15:00 in seconds from midnight — continuous-trading close for
+# F&O-eligible stocks under NSE's Closing Auction Session (CAS, live
+# since August 3, 2026). Non-F&O stocks still use MARKET_CLOSE_SECS
+# (15:30). See is_before_continuous_close_vectorized()'s docstring and
+# fo_symbols.py's module docstring.
+CAS_CONTINUOUS_CLOSE_SECS = 15 * 3600 + 15 * 60  # 54900
 
 _CANDLE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
@@ -119,6 +125,112 @@ def is_at_or_after_market_open_vectorized(ist_ts: pd.Series) -> pd.Series:
     _, secs_of_day = _local_ns_and_secs_of_day(ist_ts)
     result = (secs_of_day >= MARKET_OPEN_SECS) & ~ist_ts.isna().to_numpy()
     return pd.Series(result, index=ist_ts.index)
+
+
+def is_before_continuous_close_vectorized(ist_ts: pd.Series, close_secs: int) -> pd.Series:
+    """
+    Vectorized `ist_ts.dt.time < <close time>`, parameterized by
+    close_secs (seconds since IST midnight) rather than a fixed
+    constant — continuous-trading close isn't the same for every
+    symbol any more.
+
+    Since NSE's Closing Auction Session (CAS, live from August 3,
+    2026) started, F&O-eligible stocks stop continuous trading at
+    15:15 while every other stock continues to 15:30 as before — see
+    fo_symbols.py's module docstring and
+    https://www.nseindia.com/static/products-services/closing-auction-session.
+    A CAS-eligible stock's 15:15-15:35 auction produces one single
+    closing print, not continuous per-minute trading, so building a
+    normal OHLC candle from ticks in that window would misrepresent
+    it. Callers building candles for an F&O symbol should pass 15:15's
+    seconds-of-day (54900); everyone else passes 15:30's (55800), or
+    simply doesn't filter at all if the cutoff doesn't matter for
+    their use case.
+
+    NaT rows are explicitly forced to False (excluded), matching
+    is_at_or_after_market_open_vectorized()'s NaT handling.
+
+    ist_ts must be a tz-aware Series (Asia/Kolkata). Returns a boolean
+    Series of the same length/index.
+    """
+    if ist_ts.empty:
+        return pd.Series([], index=ist_ts.index, dtype=bool)
+
+    _, secs_of_day = _local_ns_and_secs_of_day(ist_ts)
+    result = (secs_of_day < close_secs) & ~ist_ts.isna().to_numpy()
+    return pd.Series(result, index=ist_ts.index)
+
+
+def compute_tick_volume_vectorized(ist_ts: pd.Series, cum_volume: pd.Series, tiebreaker: pd.Series = None) -> pd.Series:
+    """
+    Reconstruct each tick's OWN incremental volume contribution from
+    the broker feed's CUMULATIVE "volume" (volume traded so far today)
+    counter, by diffing consecutive readings — rather than trusting
+    "qty" (== last_trade_quantity, the size of the last individual
+    trade) directly.
+
+    Why this matters: a tick isn't guaranteed to correspond to a new
+    trade. A depth-only/quote-refresh update can re-broadcast the same
+    last trade's size again with no new trade having actually
+    happened, and naively summing last_trade_quantity across every
+    tick double-counts those. The exchange's own cumulative counter
+    only advances when a real trade occurs, so diffing it is immune to
+    duplicate/re-broadcast ticks.
+
+    Shared by every candle-building path (OHLCCollector's live and
+    historical-rebuild aggregation, and CandleBuilder's RAM tick-buffer
+    seeding) so the semantics stay identical everywhere a tick's
+    volume gets derived.
+
+    ist_ts, cum_volume, and (if given) tiebreaker must be aligned (same
+    index, same row order representing the same ticks) but do NOT need
+    to already be sorted chronologically — this sorts internally and
+    returns a Series re-indexed back to cum_volume's original
+    index/order, so callers can assign the result straight onto their
+    own (possibly unsorted) DataFrame column.
+
+    tiebreaker matters because ist_ts is commonly derived from "ltt"
+    (last trade time), which is only SECOND-precision — multiple ticks
+    can legitimately share an identical ist_ts while having genuinely
+    different cumulative volume readings (several trades within the
+    same second). Sorting by ist_ts alone can then shuffle those tied
+    rows into an order that doesn't match their true sequence, which
+    can turn a real (small, valid) diff into a spurious negative one
+    that then gets clipped to 0 below — silently UNDERcounting that
+    bucket's volume rather than just misordering it. Passing the
+    original millisecond "timestamp" column as tiebreaker resolves
+    ties in true arrival order and avoids that. If omitted, ties break
+    in whatever order pandas' sort produces (fine when ist_ts is
+    already at full tick-level precision and ties are genuinely rare).
+
+    Exchange cumulative counters reset every trading day, so the diff
+    is computed per calendar day (IST) rather than globally — a naive
+    global diff would produce a large bogus negative value at every
+    day boundary (new day's small cumulative volume minus the previous
+    day's much larger end-of-day cumulative volume). A day's first
+    tick has no prior row to diff against; the counter starts at 0 at
+    day open, so that tick's own raw cumulative value already IS its
+    full incremental contribution.
+
+    Any resulting negative diff (out-of-order tick, or a counter reset
+    mid-day) is clipped to 0 rather than allowed to produce negative
+    candle volume. Returns 0 for every row if cum_volume is empty.
+    """
+    if ist_ts.empty:
+        return pd.Series([], index=ist_ts.index, dtype=float)
+
+    sort_key = pd.DataFrame({"a": ist_ts, "b": tiebreaker if tiebreaker is not None else ist_ts})
+    order = sort_key.sort_values(["a", "b"]).index
+    sorted_ts  = ist_ts.loc[order]
+    sorted_vol = cum_volume.loc[order].fillna(0)
+
+    day = sorted_ts.dt.date
+    tick_volume = sorted_vol.groupby(day).diff()
+    first_of_day = sorted_vol.groupby(day).transform("first")
+    tick_volume = tick_volume.fillna(first_of_day)
+    tick_volume = tick_volume.clip(lower=0).fillna(0)
+
+    return tick_volume.reindex(cum_volume.index)
 
 
 def is_market_hours_weekday_vectorized(ist_ts: pd.Series) -> pd.Series:
