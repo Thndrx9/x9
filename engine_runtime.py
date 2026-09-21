@@ -108,6 +108,26 @@ async def _run_backfill_and_release(ohlc, symbols, tick_writer, backfill_lock: a
         await _run_backfill_safe(ohlc, symbols, backfill_lock)
     finally:
         tick_writer.release()
+        # Any table whose index got deferred THIS session (see
+        # _ensure_table()'s comment on _is_fresh_db) was almost
+        # certainly touched during the backfill burst that just
+        # finished — build those proactively now, off the hot live-
+        # tick path, rather than leaving them to build inline (with
+        # real, if now-bounded, latency — see _DDL_STATEMENT_TIMEOUT_MS)
+        # the next time a live tick happens to be the first thing that
+        # touches that table. Cheap no-op if nothing was deferred.
+        #
+        # build_pending_indexes() is a blocking call (threading.Event
+        # .wait()) — offloaded via asyncio.to_thread() rather than
+        # awaited inline, so it can't stall this event loop the way a
+        # direct synchronous call here would. Same GIL-starvation
+        # concern _run_backfill_safe()'s own docstring already flags
+        # for the backfill fetch itself.
+        if hasattr(tick_writer, "build_pending_indexes"):
+            try:
+                await asyncio.to_thread(tick_writer.build_pending_indexes)
+            except Exception as exc:
+                print(f"[SYSTEM][WARN] build_pending_indexes after backfill failed: {exc}", flush=True)
 
 
 async def _catchup_and_release(ohlc, symbols, tick_writer, backfill_lock: asyncio.Lock):

@@ -15,12 +15,15 @@ from market_time import (
     tz_kolkata, MARKET_OPEN, MARKET_CLOSE, is_trading_day, now_kolkata,
     is_market_open, trading_day_n_back,
 )
-from tick_writer import DEPTH_LEVEL_COLUMNS, QUOTE_EXTRA_COLUMNS
+from tick_writer import DEPTH_LEVEL_COLUMNS, QUOTE_EXTRA_COLUMNS, Candle1mCache
 from gap_detector import (
     GapDetector,
     is_market_hours_weekday_vectorized,
+    MARKET_CLOSE_SECS,
+    CAS_CONTINUOUS_CLOSE_SECS,
 )
 from tick_gap_detector import TickGapDetector
+from fo_symbols import get_fo_underlyings
 
 load_dotenv()
 
@@ -175,7 +178,34 @@ class BackfillManager:
         # BackfillManager only fetches from Postgres/reads the local
         # cache; this is what tells it a range is actually missing.
         self.tick_gaps   = TickGapDetector()
+        # Tier-2 pre-aggregated 1-minute candle cache (candle1m_<symbol>)
+        # — see sync_1m_candle_cache()'s docstring for the two-tier
+        # raw-ticks-vs-aggregated-candles design this feeds into.
+        self.candle1m_store = Candle1mCache()
         self.batch_size  = int(os.getenv("BACKFILL_BATCH_SIZE", "0"))  # 0 = no chunking, all symbols in one query
+
+        # F&O-eligible underlyings (uppercased) — determines, per
+        # symbol, whether continuous-trading candles should stop at
+        # 15:15 (NSE's Closing Auction Session) or 15:30. Refreshed
+        # once per sync_1m_candle_cache() run (that method's own
+        # get_fo_underlyings() call has a 24h internal cache, so this
+        # costs nothing extra beyond the first call of the day) — see
+        # OHLCCollector.aggregate_ticks_to_candles()'s docstring and
+        # fo_symbols.py's module docstring. Empty API_KEY -> empty set
+        # -> every symbol treated as non-F&O (15:30), the same safe
+        # default get_fo_underlyings() itself would produce.
+        self.api_key = os.getenv("API_KEY", "")
+        self._fo_underlyings = set()
+
+        # Retention for candle1m_<symbol> (Tier-2, 1-minute candles) —
+        # kept as TRADING days, same sizing convention as
+        # _daily_retention_cutoff_ms()'s 30-day window for daily_<symbol>.
+        # This table had NO pruning at all before this setting existed —
+        # sync_1m_candle_cache() kept adding a new rollover day every
+        # trading day with nothing ever removing old ones, so it grew
+        # without bound. See _candle1m_retention_cutoff_ms() and
+        # _prune_candle1m_before().
+        self.candle1m_retention_trading_days = int(os.getenv("CANDLE1M_RETENTION_TRADING_DAYS", "3"))
 
         # Fetch-ahead pacing (quote/depth backfill only — see
         # _wait_for_write_headroom()'s docstring). After each chunk is
@@ -464,6 +494,12 @@ class BackfillManager:
         tf_names = [tf for tf, _ in self.timeframes]
         start_ts = self._compute_lookback_start()
         now      = datetime.now(tz_kolkata)
+        # Tier-1 boundary — raw ticks are only ever fetched/kept from
+        # here onward (previous trading day at 9:15 IST). Everything
+        # between start_ts and this boundary is Tier 2's job, handled
+        # by sync_1m_candle_cache() below — see that method's
+        # docstring for the full two-tier design.
+        tier1_start = self._tier1_boundary_start(now)
 
         if is_market_open(now):
             mode = "market open"
@@ -492,9 +528,19 @@ class BackfillManager:
                 print(f"[BACKFILL][WARN] could not read connection log: {exc}", flush=True)
 
         # Step 1 — make the local tick cache correct (no candles yet).
+        # Only fetches/keeps raw ticks from the Tier-1 boundary onward
+        # — anything older is Tier 2's job (candle1m_<symbol>, synced
+        # below), never fetched here as raw ticks at all.
         self.sync_local_cache_with_main_db(
-            symbols, start_ts, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
+            symbols, tier1_start, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
         )
+
+        # Step 1b — Tier-2 daily rollover: whatever day(s) have aged
+        # out of the Tier-1 window since the last run get converted
+        # into candle1m_<symbol> (locally aggregated if that day's raw
+        # ticks are still cached+trusted, else fetched pre-aggregated
+        # from the main db) — see sync_1m_candle_cache()'s docstring.
+        self.sync_1m_candle_cache(symbols, start_ts, now, chunk_size=chunk_size)
 
         # History-db connection is opened here, right before it's
         # actually used — not up front. Step 1 above can take a while
@@ -521,13 +567,29 @@ class BackfillManager:
         # unchanged from the old run(), not part of the RAM problem.
         self.fetch_daily_candles(symbols)
 
-        # Step 3 — build + save candles from the now-correct local
-        # caches, chunked, discarding each symbol's raw ticks right
-        # after use (see build_candles_from_local_cache's docstring).
-        self.build_candles_from_local_cache(symbols, start_ts, now, chunk_size=chunk_size)
-
-        # Step 4 — depth backfill (already chunked — see _run_depth_backfill).
+        # Step 3 — depth backfill (already chunked — see _run_depth_backfill).
+        # Runs BEFORE candle building so that candle building only starts
+        # once every other backfill phase has fully completed.
         self._run_depth_backfill(symbols, now)
+
+        # Step 4 — build + save candles from the now-correct local
+        # caches, chunked, discarding each symbol's raw ticks right
+        # after use. Candle building itself now lives in
+        # candle_builder.py (CandleBuilder) — imported here, not at
+        # module level, to avoid a circular import (candle_builder.py
+        # imports BackfillManager for its own standalone-script entry
+        # point). Runs in-process (see CandleBuilder's module
+        # docstring for why it can't be a separate OS process here).
+        from candle_builder import CandleBuilder
+        candle_builder = CandleBuilder(
+            self.ohlc, self.timeframes, self.history_native_tf, self.gaps,
+            tick_writer=self.tick_writer, history_store=self.history_store,
+            candle1m_store=self.candle1m_store,
+        )
+        candle_builder.build_candles_from_local_cache(symbols, start_ts, now, chunk_size=chunk_size)
+        # _validate() reads self.missing_counts — merge CandleBuilder's
+        # own copy back in since it's a separate instance now.
+        self.missing_counts.update(candle_builder.missing_counts)
 
         self._validate(symbols)
 
@@ -836,217 +898,6 @@ class BackfillManager:
             self._fetch_ticks_batch(fetch_starts, existing_tables)
 
         print(f"[BACKFILL] Mid-session auto-heal ({mode}) complete", flush=True)
-
-    # ─────────────────────────────────────────────
-    # Per-symbol aggregation (Phase 3) — pure pandas, no DB
-    # ─────────────────────────────────────────────
-
-    def _ticks_rows_to_df(self, rows: list) -> pd.DataFrame:
-        """Shape a raw read_ticks()-style row list into the DataFrame
-        _cached_ticks_df() used to build directly — factored out so the
-        batched read_ticks_batch() path (which already has the rows
-        fetched) can build the same shape without a redundant DB call."""
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty"])
-        df["ist_ts"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-        return df
-
-    def _cached_ticks_df(self, symbol: str, start_ms: int, end_ms: int, conn=None) -> pd.DataFrame:
-        """
-        Read symbol's already-cached quote ticks back out of ticks.db
-        (TickWriter) for [start_ms, end_ms], shaped into the same
-        columns _fetch_ticks_batch()'s output uses (timestamp, ltp,
-        qty, ist_ts) so it can be concatenated directly with freshly
-        fetched rows before aggregation.
-
-        conn: optional pre-opened connection to pass through to
-        tick_writer.read_ticks() — see Phase 1's cache-check loop,
-        which opens one connection for the whole loop instead of one
-        per symbol. Prefer read_ticks_batch() + _ticks_rows_to_df() for
-        multiple symbols at once — this single-symbol path still does
-        one full network round-trip per call.
-        """
-        if self.tick_writer is None:
-            return pd.DataFrame()
-
-        rows = self.tick_writer.read_ticks(symbol, start_ms=start_ms, end_ms=end_ms, kind="quote", conn=conn)
-        return self._ticks_rows_to_df(rows)
-
-    def _cached_history_df(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
-        """
-        Read symbol's already-cached history-db candles back out of
-        history_candles.db (HistoryCandleStore) for [start_ms, end_ms],
-        shaped into the same columns _fetch_history_candles_batch()'s
-        output uses (timestamp as tz-aware Kolkata, open/high/low/close/
-        volume) so it can be concatenated directly with freshly fetched
-        rows.
-        """
-        if self.history_store is None:
-            return pd.DataFrame()
-
-        rows = self.history_store.read_candles(symbol, start_ms=start_ms, end_ms=end_ms)
-        if not rows:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
-        return df
-
-    def _aggregate_symbol_with_history(self, ticks_df, history_df, start_ts, now):
-        """
-        Thin pass-through to OHLCCollector.build_symbol_candles() —
-        candle building itself lives in ohlc.py now; this file only
-        supplies what it fetched (ticks_df/history_df) plus its own
-        config (timeframes, history_native_tf) and its GapDetector.
-        """
-        return self.ohlc.build_symbol_candles(
-            ticks_df, history_df, start_ts, now,
-            self.timeframes, self.history_native_tf, self.gaps,
-        )
-
-    # ─────────────────────────────────────────────
-    # Per-symbol finalization (Phase 4) — save to ohlc + report
-    # whatever's still missing after the history-priority merge in
-    # _aggregate_symbol_with_history(). No DB calls in here at all.
-    # ─────────────────────────────────────────────
-
-    def _finalize_symbol(self, symbol, per_tf):
-        """
-        Saves every aggregated candle to ohlc and tracks missing-bucket /
-        zero-candle counts on self for run() to report as one aggregate
-        summary afterward — no per-symbol/per-tf lines printed here.
-        """
-        zero_candle_tfs = []
-
-        for tf_str, tf_seconds in self.timeframes:
-            state   = per_tf[tf_str]
-            candles = state["candles"]
-            missing = state["missing"]
-
-            if missing:
-                self.missing_counts[(symbol, tf_str)] = len(missing)
-
-            if candles.empty:
-                zero_candle_tfs.append(tf_str)
-                continue
-
-            # Bulk save — ONE call for the whole symbol/timeframe's
-            # candle set instead of one save_candle() call per row.
-            # save_candle() (still used for live ticks) triggers a full
-            # parquet read+rewrite EVERY call; looping it here meant N
-            # historical candles cost O(N^2) file I/O — the dominant
-            # cost of backfill's candle-building phase. save_candles_bulk()
-            # does one read-merge-write for the entire batch instead.
-            self.ohlc.save_candles_bulk(symbol, tf_str, candles)
-
-        return zero_candle_tfs
-
-    # ─────────────────────────────────────────────
-    # Candle building from the (now gap-free) local cache — meant to be
-    # called from candle_builder.py, a SEPARATE process from the one
-    # that ran sync_local_cache_with_main_db(). Reads fresh from local
-    # cache/history_store per chunk, builds + saves, discards before
-    # the next chunk. Never touches Postgres/main db.
-    # ─────────────────────────────────────────────
-
-    def build_candles_from_local_cache(self, symbols, start_ts, now, chunk_size: int = 20):
-        start_ms = int(start_ts.timestamp() * 1000)
-        now_ms   = int(now.timestamp() * 1000)
-        window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
-        seed_stats = {"seeded": 0, "empty": 0, "ticks": 0}
-
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i:i + chunk_size]
-
-            for inst in chunk:
-                symbol = inst["symbol"]
-
-                ticks_df = self._cached_ticks_df(symbol, start_ms, now_ms)
-                history_df = self._cached_history_df(symbol, start_ms, now_ms)
-
-                per_tf = self._aggregate_symbol_with_history(ticks_df, history_df, start_ts, now)
-                self._finalize_symbol(symbol, per_tf)
-
-                # Only the trailing seed window is worth keeping in RAM
-                # after this — not the full lookback range.
-                if not ticks_df.empty:
-                    cutoff_ms = now_ms - window_secs * 1000
-                    seed_df = ticks_df[ticks_df["timestamp"] >= cutoff_ms]
-                    n = self._seed_recent_ticks(symbol, seed_df)
-                    if n:
-                        seed_stats["seeded"] += 1
-                        seed_stats["ticks"] += n
-                    else:
-                        seed_stats["empty"] += 1
-                else:
-                    seed_stats["empty"] += 1
-
-                # ticks_df/history_df/per_tf all die with this loop
-                # iteration — nothing accumulates across symbols.
-                del ticks_df, history_df, per_tf
-
-            self._progress("Building candles", min(i + chunk_size, len(symbols)), len(symbols))
-
-        total_missing = sum(self.missing_counts.values())
-        if total_missing:
-            print(
-                f"[CANDLE_BUILDER][WARN] {total_missing} candle(s) still missing "
-                f"across {len(self.missing_counts)} symbol/TF pair(s)",
-                flush=True,
-            )
-        print(
-            f"[CANDLE_BUILDER] Tick RAM buffers seeded: {seed_stats['seeded']}/{len(symbols)} "
-            f"symbol(s), {seed_stats['ticks']} total tick(s), "
-            f"{seed_stats['empty']} symbol(s) had none ({window_secs // 60:.0f} min window)",
-            flush=True,
-        )
-
-    # ─────────────────────────────────────────────
-    # Tick-buffer seeding (OHLCCollector.raw_ticks)
-    # ─────────────────────────────────────────────
-
-    def _seed_recent_ticks(self, symbol: str, ticks_df: Optional[pd.DataFrame] = None) -> int:
-        """
-        Pre-populate OHLCCollector.raw_ticks[symbol] with the last
-        tick_ram_window_secs (TICK_RAM_WINDOW_MINUTES, 9 min by default)
-        of ticks, anchored to the latest tick actually present rather
-        than wall-clock now — so the in-RAM tick buffer other modules
-        read via ohlc.get_recent_ticks()/ohlc.raw_ticks is already warm
-        at startup, whether the market is currently open or closed.
-
-        Called from build_candles_from_local_cache() with each symbol's
-        own trailing-window slice of its local-cache ticks — no extra
-        DB round trip needed.
-
-        Returns the number of ticks loaded (0 if none) — the caller
-        aggregates this across every symbol into a single summary print
-        instead of one line per symbol.
-        """
-        window_secs = getattr(self.ohlc, "tick_ram_window_secs", 9 * 60)
-
-        if ticks_df is None or ticks_df.empty:
-            return 0
-
-        cutoff = ticks_df["ist_ts"].max() - timedelta(seconds=window_secs)
-        window_df = ticks_df[ticks_df["ist_ts"] >= cutoff]
-        return self._load_ticks_into_ram(symbol, window_df)
-
-    def _load_ticks_into_ram(self, symbol, df) -> int:
-        if df.empty:
-            return 0
-
-        entries = [
-            {"timestamp": row.ist_ts, "ltp": row.ltp, "qty": row.qty}
-            for row in df.itertuples(index=False)
-        ]
-
-        with self.ohlc._ram_lock:
-            dq = self.ohlc.raw_ticks.setdefault(symbol, deque())
-            dq.clear()
-            dq.extend(entries)
-
-        return len(entries)
 
     # ─────────────────────────────────────────────
     # Standalone catch-up: fetch PG ticks since each symbol's last
@@ -2643,6 +2494,527 @@ class BackfillManager:
                 counted += 1
 
         return datetime.combine(day, dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
+
+    # ─────────────────────────────────────────────
+    # Two-tier candle cache: Tier 1 = raw ticks for a small rolling
+    # recent window (quote_<symbol> — read fine-grained, needed for
+    # RAM-seeding + the still-forming candle). Tier 2 = pre-aggregated
+    # 1-minute candles for everything older (candle1m_<symbol> via
+    # self.candle1m_store) — never re-fetched as raw ticks once a day
+    # has rolled into this tier.
+    #
+    # Tier-1 boundary = the previous trading day at 9:15 IST (see
+    # _previous_trading_day()). Raw ticks are only ever kept/fetched
+    # from that boundary onward — i.e. "yesterday's full session +
+    # today so far" once today's session has started, or just
+    # "yesterday" if today hasn't started yet (pre-market) or isn't a
+    # trading day. Everything strictly older than that boundary is
+    # Tier 2's job.
+    #
+    # Daily rollover (sync_1m_candle_cache): each day, as the Tier-1
+    # boundary advances by one trading day, whatever day just fell out
+    # of Tier 1 needs to land in Tier 2. Priority order:
+    #   1. That day's raw ticks already sitting locally in
+    #      quote_<symbol> (fetched yesterday, while it was still
+    #      Tier 1)? Gap-check them; if clean (or the gap matches a
+    #      confirmed outage), aggregate LOCALLY into 1m candles — no
+    #      network hit at all — then delete those raw ticks (Tier 1
+    #      only ever needs the last ~1-2 days, so they've served their
+    #      purpose).
+    #   2. Not present locally, or the gap check found an untrusted
+    #      hole? Ask the main db to aggregate that day server-side
+    #      (_fetch_1m_candles_from_main_db) instead of trusting an
+    #      incomplete/suspect local copy.
+    # Either way, once a day is in candle1m_<symbol>, it's never
+    # touched again — see has_range()'s use in sync_1m_candle_cache().
+    # ─────────────────────────────────────────────
+
+    def _previous_trading_day(self, ref_date):
+        """
+        The most recent trading day strictly before ref_date if
+        ref_date itself is a trading day (e.g. Monday -> Friday,
+        skipping the weekend); otherwise the most recent trading day
+        AT OR before ref_date (e.g. Saturday -> Friday, Sunday ->
+        Friday) — so a non-trading "today" still resolves to the last
+        real session instead of skipping past it.
+        """
+        if is_trading_day(ref_date):
+            return trading_day_n_back(1, ref_date)
+        return trading_day_n_back(0, ref_date)
+
+    def _tier1_boundary_start(self, now: datetime) -> datetime:
+        """
+        Start of the Tier-1 raw-tick window: the previous trading
+        day at 9:15 IST. Raw ticks from here up to `now` are what
+        Tier 1 covers — "yesterday full + today so far" once today's
+        session is under way, or just "yesterday" before today opens
+        (see _previous_trading_day()). The end of the window is
+        simply `now` itself; there's nothing to fetch past that.
+        """
+        boundary_date = self._previous_trading_day(now.date())
+        return datetime.combine(boundary_date, dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
+
+    def _day_bounds_ms(self, day):
+        """Full calendar-day [start_ms, end_ms) in IST for `day` (a
+        date), for local-cache range reads/deletes and Tier-2 range
+        keys. The upstream/local aggregation itself still clamps to
+        market-open (9:15) internally — this is just the outer
+        fetch/delete boundary, wide enough to also catch any stray
+        pre-open tick so pruning doesn't leave orphans behind."""
+        start_dt = datetime.combine(day, dtime(0, 0, 0)).replace(tzinfo=tz_kolkata)
+        end_dt   = start_dt + timedelta(days=1)
+        return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000) - 1
+
+    def _fetch_1m_candles_from_main_db(self, symbol: str, day_start_ms: int, day_end_ms: int) -> pd.DataFrame:
+        """
+        Tier-2 fallback path: get this day's 1-minute candles from the
+        MAIN db, preferring the upstream x9_data_fetcher's own
+        pre-built candle1m_<symbol> table (a plain indexed SELECT — no
+        aggregation) over building them here from raw ticks. Used only
+        when the local raw-tick cache for this day is missing or
+        failed its gap check (see sync_1m_candle_cache()).
+
+        candle1m_<symbol> is written by x9_data_fetcher's
+        candle_archiver.py, which archives any trading day older than
+        its KEEP_RAW_TICK_TRADING_DAYS setting (default 1 — i.e.
+        "yesterday and older") using the exact same subtraction-method
+        volume and ltt-based bucketing this file's own aggregation
+        uses, BEFORE that day's raw ticks age out of
+        pg_writer.purge_old_data()'s retention window. Measured ~280x
+        faster than the tick-aggregation query below for an equivalent
+        day/symbol (45.3s vs 0.16s across 199 symbols in testing) —
+        the whole point of building it once upstream is to never pay
+        that aggregation cost again downstream.
+
+        Falls back to _build_1m_candles_from_main_db_ticks() (the raw
+        SQL aggregation, see its own docstring) when candle1m_<symbol>
+        doesn't exist yet or has no rows for this exact day — most
+        commonly because the day is still within the archiver's
+        "recent, stays raw-tick-only" window and hasn't been archived
+        yet. That fallback query is now unreachable for any day the
+        archiver has already gotten to, but is kept as the safety net
+        for whatever hasn't been archived yet, and for any environment
+        running an older x9_data_fetcher without candle_archiver.py at
+        all (candle1m_<symbol> simply won't exist there, and this
+        falls straight through to the same behavior as before).
+
+        Returns an empty DataFrame (columns: timestamp/open/high/low/
+        close/volume) on any failure or if the main db has no rows for
+        this symbol/range from either source — callers must treat that
+        as "couldn't confirm this day," not as "day is genuinely empty."
+        """
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        if self.conn is None:
+            return pd.DataFrame(columns=cols)
+
+        safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
+        candle_table = f"candle1m_{safe_sym}".lower()
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (candle_table,))
+            if cur.fetchone():
+                cur.execute(
+                    f"SELECT ts_ms, open, high, low, close, volume FROM {candle_table} "
+                    f"WHERE ts_ms >= %s AND ts_ms <= %s ORDER BY ts_ms",
+                    (day_start_ms, day_end_ms),
+                )
+                rows = cur.fetchall()
+                cur.close()
+                self.conn.commit()
+                if rows:
+                    return pd.DataFrame(rows, columns=cols)
+                # Table exists but has nothing for this exact day — not
+                # yet archived (still in the "keep raw" window) rather
+                # than a genuine empty day; fall through to the
+                # tick-aggregation path below rather than returning
+                # empty and having the caller mistake this for a
+                # confirmed-empty day.
+            else:
+                cur.close()
+        except Exception as exc:
+            print(f"[BACKFILL][WARN] candle1m_{safe_sym} prebuilt fetch failed, falling back to tick aggregation: {exc}", flush=True)
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+
+        return self._build_1m_candles_from_main_db_ticks(symbol, day_start_ms, day_end_ms)
+
+    def _build_1m_candles_from_main_db_ticks(self, symbol: str, day_start_ms: int, day_end_ms: int) -> pd.DataFrame:
+        """
+        Fallback for _fetch_1m_candles_from_main_db() when the
+        upstream candle1m_<symbol> table doesn't have this day yet:
+        ask the MAIN db to bucket+aggregate its own quote_<symbol>
+        ticks into 1-minute candles server-side and hand back just the
+        finished candle rows, instead of pulling every raw tick across
+        the network to aggregate locally. This is the one query in
+        this file that does aggregation in SQL rather than in pandas.
+
+        Bucket math replicates gap_detector.compute_bucket_vectorized()
+        for tf_seconds=60 exactly, in plain integer ms arithmetic
+        (IST is UTC+5:30 — 19,800,000 ms, a whole number of minutes,
+        so this needs no timezone-aware SQL functions):
+            local_ms          = timestamp + 19_800_000
+            day_start_local_ms = local_ms - (local_ms % 86_400_000)
+            secs_since_open_ms = GREATEST(local_ms % 86_400_000 - 33_300_000, 0)
+            bucket_local_ms    = day_start_local_ms + 33_300_000
+                                 + (secs_since_open_ms / 60000) * 60000
+            bucket_ms          = bucket_local_ms - 19_800_000
+        Pre-market ticks (local time-of-day < 9:15) are dropped via
+        the WHERE clause — matching
+        is_at_or_after_market_open_vectorized()'s filter in the local
+        pandas path, so a day built this way is indistinguishable from
+        one built by aggregating local ticks with
+        ohlc.aggregate_ticks_to_candles().
+
+        Also caps the OTHER end of the day at this symbol's
+        continuous-trading close — 15:15 for F&O/CAS-eligible symbols
+        (self._fo_underlyings, refreshed once per sync_1m_candle_cache()
+        run), 15:30 otherwise — matching
+        is_before_continuous_close_vectorized()'s filter in the local
+        pandas path. See that function's docstring and fo_symbols.py's
+        module docstring for why F&O stocks need a different cutoff
+        since NSE's Closing Auction Session (CAS) launched.
+
+        Returns an empty DataFrame (columns: timestamp/open/high/low/
+        close/volume) on any failure or if the main db has no rows for
+        this symbol/range — callers must treat that as "couldn't
+        confirm this day," not as "day is genuinely empty."
+        """
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        if self.conn is None:
+            return pd.DataFrame(columns=cols)
+
+        safe_sym = "".join(c for c in symbol if c.isalnum() or c == "_")
+        table = f"quote_{safe_sym}".lower()
+        continuous_close_secs = (
+            CAS_CONTINUOUS_CLOSE_SECS if symbol.upper() in self._fo_underlyings
+            else MARKET_CLOSE_SECS
+        )
+        continuous_close_offset_ms = continuous_close_secs * 1000
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return pd.DataFrame(columns=cols)
+
+            cur.execute(f"""
+                WITH b AS (
+                    SELECT
+                        timestamp,
+                        -- Bucket by "ltt" (last TRADE time), not "timestamp"
+                        -- (packet/quote broadcast time) — ltt only changes
+                        -- when a genuine new trade occurs, attributing each
+                        -- trade to the minute it actually executed in.
+                        -- Falls back to "timestamp" only if ltt is null.
+                        -- Must match OHLCCollector._process_tick()'s live
+                        -- bucket assignment in ohlc.py (already keyed off
+                        -- ltt) — otherwise a candle rebuilt here from raw
+                        -- ticks could disagree with the same candle as
+                        -- originally built live, right at minute boundaries.
+                        COALESCE(ltt, timestamp) AS eff_ts,
+                        ltp,
+                        COALESCE(volume, 0) AS cum_volume,
+                        (
+                            (COALESCE(ltt, timestamp) + 19800000) - MOD(COALESCE(ltt, timestamp) + 19800000, 86400000)
+                            + 33300000
+                            + (GREATEST(MOD(COALESCE(ltt, timestamp) + 19800000, 86400000) - 33300000, 0) / 60000) * 60000
+                            - 19800000
+                        ) AS bucket_ms
+                    FROM {table}
+                    WHERE timestamp >= %s AND timestamp <= %s
+                      AND ltp IS NOT NULL
+                      AND MOD(COALESCE(ltt, timestamp) + 19800000, 86400000) >= 33300000
+                      AND MOD(COALESCE(ltt, timestamp) + 19800000, 86400000) < %s
+                ),
+                d AS (
+                    -- "volume" is the feed's CUMULATIVE volume-traded-
+                    -- today counter, not a per-tick quantity (see
+                    -- OHLCCollector.aggregate_ticks_to_candles()'s
+                    -- docstring) — diff consecutive readings to recover
+                    -- each tick's own contribution. This query is
+                    -- already scoped to a single calendar day (b's
+                    -- WHERE clause), so no cross-day-boundary reset to
+                    -- worry about here. The day's first in-session tick
+                    -- has no prior row within this window — the
+                    -- counter starts at 0 at day open, so that tick's
+                    -- own cumulative value already IS its full
+                    -- incremental contribution (LAG → NULL → COALESCE
+                    -- to 0 baseline). GREATEST guards against any
+                    -- out-of-order tick producing a spurious negative
+                    -- diff. Ordered by (eff_ts, timestamp) — eff_ts
+                    -- (ltt) is only second-precision, so timestamp
+                    -- breaks ties between ticks sharing the same
+                    -- trade-second in true arrival order.
+                    SELECT
+                        timestamp,
+                        eff_ts,
+                        ltp,
+                        bucket_ms,
+                        GREATEST(cum_volume - COALESCE(LAG(cum_volume) OVER (ORDER BY eff_ts ASC, timestamp ASC), 0), 0) AS tick_volume
+                    FROM b
+                )
+                SELECT
+                    bucket_ms,
+                    (array_agg(ltp ORDER BY eff_ts ASC, timestamp ASC))[1]   AS open,
+                    MAX(ltp) AS high,
+                    MIN(ltp) AS low,
+                    (array_agg(ltp ORDER BY eff_ts DESC, timestamp DESC))[1] AS close,
+                    SUM(tick_volume) AS volume
+                FROM d
+                GROUP BY bucket_ms
+                ORDER BY bucket_ms
+            """, (day_start_ms, day_end_ms, continuous_close_offset_ms))
+            rows = cur.fetchall()
+            cur.close()
+            self.conn.commit()
+        except Exception as exc:
+            print(f"[BACKFILL][WARN] _build_1m_candles_from_main_db_ticks({symbol}) failed: {exc}", flush=True)
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return pd.DataFrame(columns=cols)
+
+        if not rows:
+            return pd.DataFrame(columns=cols)
+        return pd.DataFrame(rows, columns=cols)
+
+    def _aggregate_local_ticks_to_1m(self, symbol: str, day_start_ms: int, day_end_ms: int):
+        """
+        Tier-2 preferred path: read this day's raw ticks straight out
+        of the LOCAL cache (quote_<symbol> — no network involved),
+        gap-check them, and if trustworthy aggregate to 1-minute
+        candles via ohlc.aggregate_ticks_to_candles() (the exact same
+        aggregation the live/Tier-1 path uses, so a Tier-2 day looks
+        identical to a Tier-1 day once built).
+
+        Returns (candles_df, trusted: bool). trusted=False means the
+        local ticks are missing or failed the gap check — the caller
+        (sync_1m_candle_cache) falls back to
+        _fetch_1m_candles_from_main_db() instead of using candles_df
+        (which will be empty in that case anyway).
+        """
+        cols = ["timestamp", "open", "high", "low", "close", "volume"]
+        if self.tick_writer is None:
+            return pd.DataFrame(columns=cols), False
+
+        # PostgresTickWriter physically splits live-feed ticks from
+        # BackfillManager-fetched ticks into separate tables
+        # (quote_<symbol>_live / quote_<symbol>_backfill — see
+        # PostgresTickWriter.read_ticks_combined()'s docstring). A day
+        # can easily have rows in BOTH by the time it's old enough to
+        # roll over, so this must read the merged view, not just the
+        # backfill-sourced half — read_ticks(source="backfill")
+        # default would silently miss anything the live feed wrote.
+        # SQLiteTickWriter has no such split (one unified table), so
+        # it has no read_ticks_combined() at all — fall back to its
+        # plain read_ticks(), which already IS the full picture.
+        read_combined = getattr(self.tick_writer, "read_ticks_combined", None)
+        if read_combined is not None:
+            rows = read_combined(symbol, day_start_ms, day_end_ms, kind="quote")
+        else:
+            rows = self.tick_writer.read_ticks(symbol, start_ms=day_start_ms, end_ms=day_end_ms, kind="quote")
+        if not rows:
+            return pd.DataFrame(columns=cols), False
+
+        ticks_df = pd.DataFrame(rows, columns=["timestamp", "ltp", "qty", "volume", "ltt"])
+        # Bucket/order by "ltt" (last TRADE time), not "timestamp" (packet
+        # time) — see OHLCCollector.aggregate_ticks_to_candles()'s
+        # docstring for why, and _fetch_1m_candles_from_main_db()'s SQL
+        # comment for the same fix on the main-DB fallback path. Falls
+        # back to "timestamp" only if ltt is null.
+        eff_ts_ms = ticks_df["ltt"].fillna(ticks_df["timestamp"])
+        ticks_df["ist_ts"] = pd.to_datetime(eff_ts_ms, unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+
+        day_date = ticks_df["ist_ts"].iloc[0].date()
+        outage_windows = []
+        if self.conn_log_dir:
+            try:
+                from gap_detector import connection_outage_windows
+                outage_windows = connection_outage_windows(self.conn_log_dir, day_date, "Quote")
+            except Exception:
+                outage_windows = []
+
+        last_ms = int(ticks_df["timestamp"].max())
+        gap_result = self.tick_gaps.find_cache_gap(ticks_df, last_ms, self.gap_threshold_secs, outage_windows)
+        trusted = gap_result["gap_ms"] is None or gap_result["confirmed_outage"]
+
+        if not trusted:
+            return pd.DataFrame(columns=cols), False
+
+        # Aggregate as if "now" were safely after this (fully past)
+        # day's close — nothing in an old day should ever be excluded
+        # as a "still forming" candle, which is the only thing `now`
+        # controls here (see aggregate_ticks_to_candles()'s docstring).
+        day_end_dt = datetime.fromtimestamp(day_end_ms / 1000, tz=tz_kolkata) + timedelta(days=1)
+        continuous_close_secs = (
+            CAS_CONTINUOUS_CLOSE_SECS if symbol.upper() in self._fo_underlyings
+            else MARKET_CLOSE_SECS
+        )
+        candles = self.ohlc.aggregate_ticks_to_candles(ticks_df, 60, day_end_dt, continuous_close_secs)
+        return candles, True
+
+    def _prune_local_ticks_before(self, symbols: list, boundary_ms: int):
+        """
+        ONE query total (well, one per source) — not one per symbol,
+        and not one per day — removing every raw tick strictly older
+        than boundary_ms across every given symbol at once. Called
+        once from sync_1m_candle_cache() with the full list of symbols
+        that had EVERY rollover day confirmed present in
+        candle1m_<symbol> this run (either freshly filled, or already
+        there from a previous run) — so this always covers everything
+        older than the Tier-1 boundary for those symbols, not just the
+        specific days touched this run. That also cleans up any day
+        whose local ticks were untrusted (gap check failed) and fell
+        back to the upstream-aggregated fetch path — those raw ticks
+        were never going to get re-checked, so they're safe to drop
+        here too now that candle1m_<symbol> holds the trustworthy
+        version instead.
+
+        LOCAL cache only — never touches the main/upstream db (see
+        this class's module-level design notes). On PostgresTickWriter
+        this runs as a single server-side PL/pgSQL loop covering both
+        quote_<symbol>_live and quote_<symbol>_backfill for every
+        symbol in one round trip (see
+        PostgresTickWriter.delete_before_bulk()'s docstring — a day's
+        ticks can be split across both tables, so both need pruning).
+        SQLiteTickWriter has no live/backfill split and no equivalent
+        server-side looping construct, so its delete_before_bulk()
+        instead batches every symbol into one connection/transaction
+        on the writer thread — still one queued call instead of N.
+        """
+        if self.tick_writer is None or not symbols:
+            return
+        if not hasattr(self.tick_writer, "delete_before_bulk"):
+            return  # backend too old / doesn't support the bulk path
+        self.tick_writer.delete_before_bulk(symbols, boundary_ms, kind="quote")
+
+    def _candle1m_retention_cutoff_ms(self, now: datetime) -> int:
+        """
+        Epoch-ms cutoff for candle1m_<symbol>'s (Tier-2) retention
+        window: keep only the most recent self.candle1m_retention_trading_days
+        TRADING days — same trading-day sizing convention as
+        _daily_retention_cutoff_ms()'s 30-day window for daily_<symbol>,
+        just a separate (and by default much longer) setting, since
+        candle1m_<symbol> is the actual chart/backtest data rather than
+        a short-lived working cache. Anything timestamped before this
+        cutoff gets pruned by _prune_candle1m_before().
+        """
+        cutoff_date = trading_day_n_back(self.candle1m_retention_trading_days, from_date=now.date())
+        cutoff_dt   = datetime.combine(cutoff_date, dtime.min, tzinfo=tz_kolkata)
+        return int(cutoff_dt.timestamp() * 1000)
+
+    def _prune_candle1m_before(self, symbols: list, cutoff_ms: int):
+        """
+        ONE bulk call across every given symbol's candle1m_<symbol>
+        table, removing rows older than cutoff_ms — the Tier-2
+        retention counterpart to _prune_local_ticks_before() (which
+        prunes Tier-1 raw ticks). Called once per sync_1m_candle_cache()
+        run for the FULL symbol list, independent of whether this
+        run's rollover fill succeeded for any of them — retention is
+        about the table not growing forever, not about this run's
+        coverage status, so a symbol whose fill failed this run still
+        gets its old rows pruned same as any other.
+
+        See Candle1mCache.delete_before_bulk()'s docstring for why this
+        batches per-symbol rather than one shared DO block for every
+        symbol at once — this codebase already hit that exact timeout
+        bug once on the raw-tick version of this operation.
+        """
+        if not symbols:
+            return
+        if not hasattr(self.candle1m_store, "delete_before_bulk"):
+            return  # backend too old / doesn't support the bulk path
+        self.candle1m_store.delete_before_bulk(symbols, cutoff_ms)
+
+    def sync_1m_candle_cache(self, symbols, lookback_start: datetime, now: datetime, chunk_size: int = 20):
+        """
+        Daily rollover into Tier 2 (candle1m_<symbol>) — see the block
+        comment above _previous_trading_day() for the full two-tier
+        design. For every trading day between lookback_start (how far
+        back MIN_CANDLES needs) and the Tier-1 boundary (exclusive —
+        Tier 1 owns that day and everything after it), make sure
+        candle1m_<symbol> already has it; if not, fill it in (locally
+        aggregated if the raw ticks are cached+trusted, else fetched
+        pre-aggregated from the main db). Symbols that end up with
+        every rollover day covered get their raw ticks older than the
+        Tier-1 boundary pruned in ONE bulk call across ALL of them at
+        the end (see _prune_local_ticks_before()) — not one delete per
+        symbol, and not skipped for days that only got covered via the
+        upstream fallback path.
+        """
+        tier1_start    = self._tier1_boundary_start(now)
+        tier1_start_ms = int(tier1_start.timestamp() * 1000)
+
+        rollover_days = []
+        d = lookback_start.date()
+        while d < tier1_start.date():
+            if is_trading_day(d):
+                rollover_days.append(d)
+            d += timedelta(days=1)
+
+        if not rollover_days:
+            return
+
+        # Refreshed once per run — get_fo_underlyings() has its own 24h
+        # internal cache, so this costs nothing extra beyond the first
+        # call of the day. See __init__'s comment on self.api_key.
+        self._fo_underlyings = get_fo_underlyings(self.api_key) if self.api_key else set()
+
+        covered_symbols = []
+        total = len(symbols)
+        for i in range(0, total, chunk_size):
+            chunk = symbols[i:i + chunk_size]
+            for inst in chunk:
+                symbol = inst["symbol"]
+                all_days_covered = True
+
+                for day in rollover_days:
+                    day_start_ms, day_end_ms = self._day_bounds_ms(day)
+
+                    if self.candle1m_store.has_range(symbol, day_start_ms, day_end_ms):
+                        continue  # already rolled over — never re-fetched
+
+                    candles, trusted = self._aggregate_local_ticks_to_1m(symbol, day_start_ms, day_end_ms)
+                    if trusted and not candles.empty:
+                        self.candle1m_store.save_candles(symbol, candles)
+                        continue
+
+                    # Local ticks missing or untrusted — fall back to
+                    # server-side aggregation against the main db.
+                    candles = self._fetch_1m_candles_from_main_db(symbol, day_start_ms, day_end_ms)
+                    if not candles.empty:
+                        self.candle1m_store.save_candles(symbol, candles)
+                    else:
+                        # Neither path produced this day — don't prune
+                        # ANYTHING for this symbol this run (better to
+                        # keep the raw ticks and retry next run than
+                        # delete a day that isn't actually captured
+                        # anywhere yet).
+                        all_days_covered = False
+
+                if all_days_covered:
+                    covered_symbols.append(symbol)
+
+            self._progress("Syncing 1m candle cache", min(i + chunk_size, total), total)
+
+        # One bulk prune across every fully-covered symbol, instead of
+        # one delete per symbol as the loop above went — see
+        # _prune_local_ticks_before()'s docstring.
+        self._prune_local_ticks_before(covered_symbols, tier1_start_ms)
+
+        # Tier-2 retention — candle1m_<symbol> itself has no natural
+        # ceiling otherwise; this table gets a new rollover day added
+        # every trading day and nothing else ever removes old ones.
+        # Runs for the FULL symbol list, not just covered_symbols —
+        # retention isn't conditional on this run's fill succeeding.
+        # See _prune_candle1m_before()'s docstring.
+        all_symbol_names = [inst["symbol"] for inst in symbols]
+        candle1m_cutoff_ms = self._candle1m_retention_cutoff_ms(now)
+        self._prune_candle1m_before(all_symbol_names, candle1m_cutoff_ms)
 
     # ─────────────────────────────────────────────
     # Validation
