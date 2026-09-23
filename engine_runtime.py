@@ -280,6 +280,15 @@ async def run_engine(enable_trading: bool):
         while not stop_event.is_set():
             for s in symbols:
                 indicators.update(s["symbol"])
+                # indicators.update() is synchronous pandas work (~10ms+
+                # per symbol). Without this yield the whole 199-symbol
+                # pass runs as ONE uninterrupted block (seconds) on the
+                # event loop, during which the websocket readers and the
+                # OHLCCollector/DepthStore consumers can't run at all —
+                # that's what left market_data_queue / depth_data_queue
+                # sitting at ~1000 in the [WS][HEARTBEAT] lines. Yielding
+                # once per symbol lets them drain in between.
+                await asyncio.sleep(0)
             await asyncio.sleep(1)
 
     async def _on_reconnect(mode_label: str, disconnect_dt, reconnect_dt):
