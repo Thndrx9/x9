@@ -94,9 +94,13 @@ class BackfillManager:
                 to lowercase anyway so this matters cosmetically only)
         cols  : timestamp BIGINT (exchange ms, indexed), ingest_ns BIGINT,
                 ltp DOUBLE PRECISION, ltt BIGINT, volume BIGINT,
-                open/high/low/close DOUBLE PRECISION,
-                last_quantity BIGINT, oi BIGINT,
-                upper_circuit/lower_circuit DOUBLE PRECISION
+                oi BIGINT, upper_circuit/lower_circuit DOUBLE PRECISION
+                (open/high/low/close/last_quantity DROPPED from this
+                table — daily-snapshot OHLC and an unused qty field,
+                never read by candle building; see QUOTE_EXTRA_COLUMNS
+                in tick_writer.py. NOTE: the HISTORY db's quote_{symbol}
+                table below is unrelated and still has real per-candle
+                open/high/low/close — do not drop those.)
 
     Schema (history db, PG_HDBNAME) — confirmed against x9_data_fetcher's
     own BackfillManager (writes here) and pg_writer.py (defines the
@@ -510,7 +514,10 @@ class BackfillManager:
 
         print(
             f"[BACKFILL] Mode: {mode} | symbols={len(symbols)} "
-            f"| TFs={tf_names} | from={start_ts.strftime('%Y-%m-%d %H:%M %Z')} "
+            f"| TFs={tf_names} "
+            f"| ticks from={tier1_start.strftime('%Y-%m-%d %H:%M %Z')} "
+            f"| 1m candles from={start_ts.strftime('%Y-%m-%d %H:%M %Z')} "
+            f"(up to tick window) "
             f"| low-memory chunked path (chunk_size={chunk_size})",
             flush=True,
         )
@@ -1379,7 +1386,7 @@ class BackfillManager:
                     end_ms = int(end_ts.timestamp() * 1000)
                     clauses.append(
                         f"SELECT %s AS symbol, timestamp, ltp, "
-                        f"COALESCE(last_quantity, 0) AS qty, "
+                        f"0 AS qty, "  # last_quantity dropped upstream — see QUOTE_EXTRA_COLUMNS
                         f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
                         f"WHERE timestamp >= %s AND timestamp <= %s AND ltp IS NOT NULL"
                     )
@@ -1387,7 +1394,7 @@ class BackfillManager:
                 else:
                     clauses.append(
                         f"SELECT %s AS symbol, timestamp, ltp, "
-                        f"COALESCE(last_quantity, 0) AS qty, "
+                        f"0 AS qty, "  # last_quantity dropped upstream — see QUOTE_EXTRA_COLUMNS
                         f"{_QUOTE_EXTRA_SELECT_COLS} FROM {table} "
                         f"WHERE timestamp >= %s AND ltp IS NOT NULL"
                     )

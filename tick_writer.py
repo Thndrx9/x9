@@ -81,33 +81,41 @@ DEPTH_LEVEL_COLUMNS = tuple(
 # unchanged; this just widens what also gets written/read alongside them.
 # Name-for-name match with the PG source table (see backfill_manager.py's
 # BackfillManager docstring: "timestamp BIGINT, ingest_ns BIGINT, ltp
-# DOUBLE PRECISION, ltt BIGINT, volume BIGINT, open/high/low/close DOUBLE
-# PRECISION, last_quantity BIGINT, oi BIGINT, upper_circuit/lower_circuit
-# DOUBLE PRECISION").
+# DOUBLE PRECISION, ltt BIGINT, volume BIGINT, oi BIGINT,
+# upper_circuit/lower_circuit DOUBLE PRECISION").
+#
+# open/high/low/close/last_quantity were DROPPED from the upstream main-db
+# quote_<symbol> table (confirmed: daily-snapshot OHLC, not per-tick, and
+# never read by candle_builder.py's tick->candle aggregation, which keys
+# off timestamp/ltp/qty/volume/ltt only — qty itself is unused too, since
+# tick volume is diffed from cumulative "volume", not summed from
+# last_quantity; see candle_builder._ticks_rows_to_df()'s docstring).
+# "qty" is kept as an output key everywhere below for backward
+# compatibility with existing consumers, just always 0 now.
 QUOTE_EXTRA_COLUMNS = (
-    "ingest_ns", "ltt", "volume", "open", "high", "low", "close",
-    "last_quantity", "oi", "upper_circuit", "lower_circuit",
+    "ingest_ns", "ltt", "volume", "oi", "upper_circuit", "lower_circuit",
 )
 
 # SQLite/Postgres column type for each QUOTE_EXTRA_COLUMNS entry, in the
 # same order — BIGINT-ish fields as INTEGER, everything else as
 # REAL/DOUBLE PRECISION.
-_QUOTE_EXTRA_INT_COLUMNS = {"ingest_ns", "ltt", "volume", "last_quantity", "oi"}
+_QUOTE_EXTRA_INT_COLUMNS = {"ingest_ns", "ltt", "volume", "oi"}
 
 # Exact column set/order for PostgresTickWriter's LOCAL quote_<symbol>
 # table specifically — column-for-column identical to the source AWS
 # Postgres quote_<symbol> table (timestamp, ingest_ns, ltp, ltt, volume,
-# open, high, low, close, last_quantity, oi, upper_circuit,
-# lower_circuit). No "id" primary key, no "ts_ms"/"qty" aliases, nothing
-# extra — deliberately NOT a superset the way SQLiteTickWriter's schema
-# is (see QUOTE_EXTRA_COLUMNS above), per explicit request that the
+# oi, upper_circuit, lower_circuit — open/high/low/close/last_quantity
+# dropped upstream, see QUOTE_EXTRA_COLUMNS above). No "id" primary key,
+# no "ts_ms"/"qty" aliases, nothing extra — deliberately NOT a superset
+# the way SQLiteTickWriter's schema is, per explicit request that the
 # local Postgres cache mirror the source table exactly. "qty" is still
-# derived on READ (from last_quantity) so existing consumers that expect
-# a "qty" key from read_ticks() keep working unchanged — that's an
+# produced on READ (always 0 now — last_quantity no longer exists
+# upstream to derive it from) so existing consumers that expect a "qty"
+# key from read_ticks() keep working unchanged — that's an
 # application-level dict key, not a stored column.
 PG_LOCAL_QUOTE_COLUMNS = (
-    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "open", "high",
-    "low", "close", "last_quantity", "oi", "upper_circuit", "lower_circuit",
+    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "oi",
+    "upper_circuit", "lower_circuit",
 )
 
 
@@ -2337,7 +2345,7 @@ class PostgresTickWriter:
             out = []
             for r in rows:
                 d = dict(zip(PG_LOCAL_QUOTE_COLUMNS, r))
-                d["qty"] = d["last_quantity"] if d.get("last_quantity") is not None else 0
+                d["qty"] = 0  # last_quantity dropped upstream, see QUOTE_EXTRA_COLUMNS
                 out.append(d)
             return out
         except Exception as exc:
@@ -3179,7 +3187,7 @@ class PostgresTickWriter:
             for rows in result.values():
                 for d in rows:
                     if "qty" not in d:
-                        d["qty"] = d["last_quantity"] if d.get("last_quantity") is not None else 0
+                        d["qty"] = 0  # last_quantity dropped upstream, see QUOTE_EXTRA_COLUMNS
         return result
 
     # ─────────────────────────────────────────────
