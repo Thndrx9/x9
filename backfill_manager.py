@@ -23,6 +23,7 @@ from gap_detector import (
     CAS_CONTINUOUS_CLOSE_SECS,
 )
 from tick_gap_detector import TickGapDetector
+from archive_sync import ArchiveSync
 from fo_symbols import get_fo_underlyings
 
 load_dotenv()
@@ -182,6 +183,7 @@ class BackfillManager:
         # BackfillManager only fetches from Postgres/reads the local
         # cache; this is what tells it a range is actually missing.
         self.tick_gaps   = TickGapDetector()
+        self._archive    = ArchiveSync()   # completed-day Parquet bulk loader — see archive_sync.py
         # Tier-2 pre-aggregated 1-minute candle cache (candle1m_<symbol>)
         # — see sync_1m_candle_cache()'s docstring for the two-tier
         # raw-ticks-vs-aggregated-candles design this feeds into.
@@ -211,6 +213,16 @@ class BackfillManager:
         # _prune_candle1m_before().
         self.candle1m_retention_trading_days = int(os.getenv("CANDLE1M_RETENTION_TRADING_DAYS", "3"))
 
+        # Retention for candles_1m_<symbol> (HistoryCandleStore's
+        # history-db-sourced candle cache — a different table from
+        # candle1m_<symbol> above despite the similar name). This table
+        # had NO pruning at all before this setting existed either —
+        # sync_history_cache_with_main_db() keeps adding newly confirmed
+        # candles every run with nothing ever removing old ones, so it
+        # grew without bound. See _history_candle_retention_cutoff_ms()
+        # and _prune_history_candles_before().
+        self.history_candle_retention_trading_days = int(os.getenv("HISTORY_CANDLE_RETENTION_TRADING_DAYS", "30"))
+
         # Fetch-ahead pacing (quote/depth backfill only — see
         # _wait_for_write_headroom()'s docstring). After each chunk is
         # fetched+enqueued, the NEXT chunk's fetch starts immediately
@@ -235,6 +247,18 @@ class BackfillManager:
         # is actually present (crash mid-write, a failed insert batch,
         # etc.) — see run()'s Phase 1 and TickGapDetector.find_cache_gap().
         self.gap_threshold_secs = int(os.getenv("TICK_CACHE_GAP_THRESHOLD_SECS", "180"))
+        # OFF ("0") stops sync_local_cache_with_main_db() from ever
+        # pulling PREVIOUS-trading-day quote ticks from the main db --
+        # both the normal top-up and gap-resolution fetches are clamped
+        # to not go earlier than today at 09:15 IST. Anything still
+        # missing before today is then left to the Parquet archive
+        # alone; if the archive cannot cover it either, that portion
+        # stays an unresolved gap rather than falling back to Postgres.
+        # Today's own ticks, mid-session auto-heal, and depth are
+        # UNAFFECTED by this -- it only touches the previous-day slice
+        # of the quote-tick fetch. Defaults to ON ("1"), i.e. today's
+        # existing behavior.
+        self.prev_day_pg_fetch_enabled = os.getenv("PREV_DAY_POSTGRES_FETCH_ENABLED", "1").strip() not in ("0", "false", "False", "")
         # Populated by _fetch_ticks_batch()/_fetch_depth_batch() each run —
         # symbols whose main-db re-fetch chunk genuinely failed (network/
         # connection error), as opposed to symbols confirmed to have zero
@@ -340,7 +364,7 @@ class BackfillManager:
     def _get_history_conn(self):
         """
         Lazily connects to the history DB (PG_HDBNAME) — cached after
-        the first call. run_low_memory() calls this right before its
+        the first call. run_backfill() calls this right before its
         history-candle step (not up front) so the connection doesn't
         sit idle through the earlier tick-fetch phase and get dropped
         for being idle by the time it's actually used — see the call
@@ -479,7 +503,186 @@ class BackfillManager:
     # Entry point
     # ─────────────────────────────────────────────
 
-    def run_low_memory(self, symbols, chunk_size: int = 20):
+    # ─────────────────────────────────────────────
+    # Parquet archive preload (completed days only)
+    #
+    # The main db is still the source of truth for TODAY (live session,
+    # mid-session auto-heal, mid-market start) and for gap resolution.
+    # But a day that has already ended doesn't need a row-by-row Postgres
+    # pull at all: upstream publishes it as two combined Parquet files
+    # (quote + depth, every symbol), which come down in one rsync call
+    # and are ~26x faster to turn into a DataFrame than a psycopg2 fetch
+    # (see archive_sync.py). This step drops those rows into the local
+    # cache through the same enqueue_backfill_rows() the Postgres fetch
+    # uses, so the normal scan/top-up that runs right after simply finds
+    # the completed day already covered and only pulls what's left
+    # (today) from the main db.
+    #
+    # Duplicate safety: the local writer has no dedup-on-timestamp, so
+    # each symbol is loaded for EXACTLY the range the normal path would
+    # have fetched from the main db for it — [fetch_start_ms,
+    # fetch_end_ms or end of day] as reported by scan_local_cache() —
+    # never blindly re-inserting rows that are already cached.
+    #
+    # A completed day is considered "already covered" for a symbol once
+    # its local cache reaches _ARCHIVE_COVERED_UNTIL. A symbol that
+    # stops printing earlier than that just triggers a (harmless,
+    # zero-row) archive read; the tail is left to the main-db top-up.
+    #
+    # Any failure here (host unreachable, file missing/corrupt, rsync
+    # absent) is logged and swallowed — the main-db path covers it.
+    # ─────────────────────────────────────────────
+    _ARCHIVE_COVERED_UNTIL = dtime(15, 0)
+
+    def _archive_needs(self, kind, symbols, window_start, day, chunk_size):
+        """{symbol: (from_ms, to_ms)} still missing from the local cache
+        for `day`, per scan_local_cache(). Empty = nothing to load."""
+        start_ms   = int(window_start.timestamp() * 1000)
+        covered_ms = int(datetime.combine(day, self._ARCHIVE_COVERED_UNTIL).replace(tzinfo=tz_kolkata).timestamp() * 1000)
+        day_end_ms = self._day_bounds_ms(day)[1]
+
+        conn = self.tick_writer.open_read_connection()
+        try:
+            gap_map = self.tick_gaps.scan_local_cache(
+                symbols, self.tick_writer, start_ms, covered_ms,
+                self.gap_threshold_secs, [], chunk_size=chunk_size, conn=conn, kind=kind,
+            )
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception as exc:
+                    print(f"[BACKFILL][WARN] closing archive cache-check connection failed: {exc}", flush=True)
+
+        need = {}
+        for symbol, e in gap_map.items():
+            if e["fetch_start_ms"] is None:
+                continue
+            need[symbol] = (e["fetch_start_ms"], e.get("fetch_end_ms") or day_end_ms)
+        return need
+
+    def _load_archive_kind(self, kind, path, need, chunk_size):
+        """Read `need`'s symbols out of the archive file in chunks and
+        enqueue them to the local writer. Returns (symbols_loaded, rows)."""
+        names = list(need)
+        loaded, rows_total = 0, 0
+
+        # Say which symbols the archive file doesn't contain at all, rather
+        # than leaving a bare "195/199" to puzzle over. They are not lost —
+        # the normal main-db path below picks them up.
+        missing = self._archive.unmatched(path, names)
+        if missing:
+            shown = ", ".join(missing[:10])
+            more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+            print(
+                f"[BACKFILL][ARCHIVE][WARN] {kind}: {len(missing)} symbol(s) not found "
+                f"in the archive file, will come from the main db: {shown}{more}",
+                flush=True,
+            )
+
+        for i in range(0, len(names), chunk_size):
+            chunk = names[i:i + chunk_size]
+            frames = self._archive.read_chunk(kind, path, chunk)
+            for symbol, g in frames.items():
+                lo, hi = need[symbol]
+                g = g[(g["timestamp"] >= lo) & (g["timestamp"] <= hi)]
+                if g.empty:
+                    continue
+                g = g.copy()
+                g["ist_ts"] = pd.to_datetime(g["timestamp"], unit="ms", utc=True).dt.tz_convert(tz_kolkata)
+                # Same market-hours/weekday filter the main-db fetch applies.
+                g = g[is_market_hours_weekday_vectorized(g["ist_ts"])]
+                if g.empty:
+                    continue
+                if kind == "depth":
+                    g = g.drop(columns=["ist_ts"])   # depth path never carried it
+                self.tick_writer.enqueue_backfill_rows(symbol, g.reset_index(drop=True), kind=kind)
+                loaded += 1
+                rows_total += len(g)
+            del frames
+            self._progress(f"Loading {kind} archive", min(i + chunk_size, len(names)), len(names))
+        return loaded, rows_total
+
+    def _preload_one_kind_from_archive(self, kind, window_start, symbols, now, chunk_size: int) -> bool:
+        """
+        Download + load ONE kind ("quote" or "depth") for its own
+        window, start to finish — its own rsync call, its own local-db
+        writes. Returns True if anything was actually attempted (an
+        rsync call was made), False if this kind had nothing to do
+        (window is today, or nothing missing locally) — purely so the
+        caller can print one "nothing to load at all" line instead of
+        a redundant line per kind when both are no-ops.
+        """
+        day = window_start.date()
+        if day >= now.date():
+            return False  # today is never served from the archive
+
+        need = self._archive_needs(kind, symbols, window_start, day, chunk_size)
+        if not need:
+            return False
+
+        path = self._archive.ensure_files(day, [kind]).get(kind)
+        if path is None:
+            print(
+                f"[BACKFILL][ARCHIVE][WARN] no {kind} archive for {day} — "
+                f"{len(need)} symbol(s) will come from the main db instead",
+                flush=True,
+            )
+            return True
+
+        try:
+            loaded, rows = self._load_archive_kind(kind, path, need, chunk_size)
+        except Exception as exc:
+            # Unreadable/truncated file — drop it so the next run
+            # re-downloads, and let the main db cover it.
+            self._archive.discard_local(day, kind)
+            print(
+                f"[BACKFILL][ARCHIVE][WARN] could not read {kind} archive for {day} "
+                f"({exc}) — discarded local copy; main db will cover it",
+                flush=True,
+            )
+            return True
+
+        print(
+            f"[BACKFILL][ARCHIVE] {kind} {day}: {loaded}/{len(need)} symbol(s) "
+            f"loaded from Parquet ({rows} row(s)); the rest (if any) come from the main db",
+            flush=True,
+        )
+        return True
+
+    def _preload_from_archive(self, symbols, now, chunk_size: int = 20):
+        """
+        Quote, then depth, one after another — a separate rsync call
+        and a separate set of local-db writes for each, quote fully
+        finished before depth even starts checking what it needs. Only
+        once BOTH are done does run_backfill move on to Step 1. (Not
+        combined into one rsync call for both files together, even on
+        the common case where they land on the same day — kept
+        sequential and independent on purpose: quote's outcome is
+        never gated on depth's, or the other way around.)
+        """
+        if self.tick_writer is None or not getattr(self._archive, "enabled", False):
+            return
+        try:
+            did_quote = self._preload_one_kind_from_archive(
+                "quote", self._tier1_boundary_start(now), symbols, now, chunk_size
+            )
+            did_depth = self._preload_one_kind_from_archive(
+                "depth", self._compute_depth_lookback_start(now), symbols, now, chunk_size
+            )
+
+            if not did_quote and not did_depth:
+                print("[BACKFILL][ARCHIVE] nothing to load from the Parquet archive", flush=True)
+                return
+
+            # Everything enqueued (from either or both kinds) must be
+            # committed before the scan that runs next reads the local
+            # cache back.
+            self.tick_writer.flush_and_wait()
+        except Exception as exc:
+            print(f"[BACKFILL][ARCHIVE][WARN] archive preload skipped: {exc}", flush=True)
+
+    def run_backfill(self, symbols, chunk_size: int = 20):
         """
         Same end result as run() — local caches synced against the
         main/history db, candles built and saved — but every phase is
@@ -518,7 +721,7 @@ class BackfillManager:
             f"| ticks from={tier1_start.strftime('%Y-%m-%d %H:%M %Z')} "
             f"| 1m candles from={start_ts.strftime('%Y-%m-%d %H:%M %Z')} "
             f"(up to tick window) "
-            f"| low-memory chunked path (chunk_size={chunk_size})",
+            f"| chunked, {chunk_size} symbols per chunk",
             flush=True,
         )
 
@@ -533,6 +736,13 @@ class BackfillManager:
                 quote_outage_windows = connection_outage_windows(self.conn_log_dir, now.date(), "Quote")
             except Exception as exc:
                 print(f"[BACKFILL][WARN] could not read connection log: {exc}", flush=True)
+
+        # Step 0 — bulk-load any COMPLETED day inside the tick/depth
+        # windows from the upstream Parquet archive (one rsync call)
+        # instead of pulling it row-by-row out of the main db. Purely an
+        # accelerator: whatever it can't or doesn't load is picked up by
+        # the normal main-db path below exactly as before.
+        self._preload_from_archive(symbols, now, chunk_size=chunk_size)
 
         # Step 1 — make the local tick cache correct (no candles yet).
         # Only fetches/keeps raw ticks from the Tier-1 boundary onward
@@ -568,6 +778,10 @@ class BackfillManager:
         if history_conn is not None:
             self.sync_history_cache_with_main_db(
                 symbols, start_ts, now, history_existing_tables, chunk_size=chunk_size
+            )
+            self._prune_history_candles_before(
+                [s["symbol"] for s in symbols],
+                self._history_candle_retention_cutoff_ms(now),
             )
 
         # Step 2d: mirror market_history's daily_<symbol> tables locally —
@@ -631,15 +845,21 @@ class BackfillManager:
 
     def _compute_depth_lookback_start(self, now) -> datetime:
         """
-        Start of the most recent trading day (09:15 IST) — today's, if
-        today is itself a trading day (even before market open), else
-        the most recent prior trading day. This is deliberately NOT
-        the same window Quote uses (_compute_lookback_start) — see
-        the note above.
+        Start of the depth backfill window (09:15 IST). This is
+        deliberately NOT the same window Quote uses
+        (_compute_lookback_start) — see the note above.
+
+        ALWAYS the PREVIOUS completed trading day — every run, in every
+        mode (pre-market, mid-session, post-close, weekend/holiday),
+        unconditionally. This is a separate, additional window from
+        today: today's own depth still flows live over the websocket +
+        Postgres auto-heal regardless, so this isn't replacing that —
+        it just guarantees a full previous day of depth (served from
+        the Parquet archive — see archive_sync.py — falling back to
+        the main db) is always on hand too, every single run, rather
+        than only on the runs where the market happened to be closed.
         """
-        day = now.date()
-        while not is_trading_day(day):
-            day -= timedelta(days=1)
+        day = self._previous_trading_day(now.date())
         return datetime.combine(day, dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
 
     def _run_depth_backfill(self, symbols, now):
@@ -954,6 +1174,32 @@ class BackfillManager:
     # Fetch ticks from PostgreSQL (main db) — BATCHED across symbols
     # ─────────────────────────────────────────────
 
+    def _clamp_prev_day_pg_fetch(self, starts: dict, ends: dict, now) -> tuple:
+        """
+        When self.prev_day_pg_fetch_enabled is False, drop the part of
+        each symbol's [start, end] window that falls before today's
+        09:15 IST -- the previous-trading-day slice -- so it never goes
+        to the main db. A symbol whose whole window is before today is
+        removed entirely (nothing left to fetch from Postgres for it);
+        a symbol straddling the boundary keeps only its today part.
+        No-op (returns starts/ends unchanged) when the flag is True.
+        Returns (starts, ends, skipped_count).
+        """
+        if self.prev_day_pg_fetch_enabled:
+            return starts, ends, 0
+
+        today_open = datetime.combine(now.date(), dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
+        clamped_starts, clamped_ends, skipped = {}, {}, 0
+        for symbol, start in starts.items():
+            end = ends.get(symbol, now)
+            if end <= today_open:
+                skipped += 1
+                continue
+            clamped_starts[symbol] = max(start, today_open)
+            if symbol in ends:
+                clamped_ends[symbol] = ends[symbol]
+        return clamped_starts, clamped_ends, skipped
+
     def sync_local_cache_with_main_db(
         self, symbols, start_ts, now, existing_tables, quote_outage_windows, chunk_size: int = 20
     ):
@@ -1050,6 +1296,7 @@ class BackfillManager:
         to_fetch = [s for s, e in gap_map.items() if e["fetch_start_ms"] is not None]
         total_fetched = 0
         no_data_symbols = []
+        prev_day_pg_skipped = 0
         self._last_fetch_failed_symbols = set()
 
         for i in range(0, len(to_fetch), chunk_size):
@@ -1068,8 +1315,20 @@ class BackfillManager:
                 for s in chunk_symbols if gap_map[s].get("fetch_end_ms") is not None
             }
 
+            fetch_starts_chunk, fetch_ends_chunk, clamp_skipped = self._clamp_prev_day_pg_fetch(
+                fetch_starts_chunk, fetch_ends_chunk, now
+            )
+            prev_day_pg_skipped += clamp_skipped
             fetched = self._fetch_ticks_batch(fetch_starts_chunk, existing_tables, fetch_ends_chunk)
             for symbol in chunk_symbols:
+                if symbol not in fetch_starts_chunk:
+                    # Never queried — PREV_DAY_POSTGRES_FETCH_ENABLED=0 clamped this
+                    # symbol's whole window away. Kept OUT of no_data_symbols on
+                    # purpose: that list means "asked main db, got nothing", and
+                    # folding this in would make a deliberate skip look like a
+                    # main-db problem. Already covered by the dedicated
+                    # prev_day_pg_skipped summary below.
+                    continue
                 fresh_df = fetched.get(symbol, pd.DataFrame())
                 if fresh_df.empty:
                     no_data_symbols.append(symbol)
@@ -1086,6 +1345,14 @@ class BackfillManager:
             print(
                 f"[BACKFILL][WARN] {len(no_data_symbols)} symbol(s) had no new "
                 f"tick data in main db: {preview}{more}",
+                flush=True,
+            )
+        if prev_day_pg_skipped:
+            print(
+                f"[BACKFILL] PREV_DAY_POSTGRES_FETCH_ENABLED=0 — skipped the "
+                f"previous-trading-day portion of the main-db fetch for "
+                f"{prev_day_pg_skipped} symbol(s); only today's ticks were "
+                f"checked against Postgres, the rest is left to the Parquet archive",
                 flush=True,
             )
 
@@ -1125,10 +1392,16 @@ class BackfillManager:
                 for s in chunk_symbols
             }
 
+            gap_starts_chunk, gap_ends_chunk, clamp_skipped = self._clamp_prev_day_pg_fetch(
+                gap_starts_chunk, gap_ends_chunk, now
+            )
+            prev_day_pg_skipped += clamp_skipped
             gap_fetched = self._fetch_ticks_batch(gap_starts_chunk, existing_tables, gap_ends_chunk)
             gap_fetch_failed |= self._last_fetch_failed_symbols
 
             for symbol in chunk_symbols:
+                if symbol not in gap_starts_chunk:
+                    continue  # entirely previous-day — left to the archive, PREV_DAY_POSTGRES_FETCH_ENABLED=0
                 if symbol in self._last_fetch_failed_symbols:
                     continue  # never reached main db this run — try again next time
                 gap_df = gap_fetched.get(symbol, pd.DataFrame())
@@ -2936,6 +3209,38 @@ class BackfillManager:
         if not hasattr(self.candle1m_store, "delete_before_bulk"):
             return  # backend too old / doesn't support the bulk path
         self.candle1m_store.delete_before_bulk(symbols, cutoff_ms)
+
+    def _history_candle_retention_cutoff_ms(self, now: datetime) -> int:
+        """
+        Epoch-ms cutoff for candles_1m_<symbol>'s (HistoryCandleStore)
+        retention window: keep only the most recent
+        self.history_candle_retention_trading_days TRADING days. Same
+        idea as _candle1m_retention_cutoff_ms() just above, for the
+        other, similarly-named candle cache — see that method's
+        docstring and HistoryCandleStore.delete_before_bulk()'s for why
+        this one needs its own pruning too. Anything timestamped before
+        this cutoff gets pruned by _prune_history_candles_before().
+        """
+        cutoff_date = trading_day_n_back(self.history_candle_retention_trading_days, from_date=now.date())
+        cutoff_dt   = datetime.combine(cutoff_date, dtime.min, tzinfo=tz_kolkata)
+        return int(cutoff_dt.timestamp() * 1000)
+
+    def _prune_history_candles_before(self, symbols: list, cutoff_ms: int):
+        """
+        ONE bulk call across every given symbol's candles_1m_<symbol>
+        table, removing rows older than cutoff_ms — see
+        _prune_candle1m_before() just above for the identical reasoning
+        (batched per-symbol DO blocks, run once per
+        sync_history_cache_with_main_db() call for the full symbol
+        list regardless of this run's own fetch/gap-fill outcome).
+        """
+        if not symbols:
+            return
+        if self.history_store is None:
+            return
+        if not hasattr(self.history_store, "delete_before_bulk"):
+            return  # backend too old / doesn't support the bulk path
+        self.history_store.delete_before_bulk(symbols, cutoff_ms)
 
     def sync_1m_candle_cache(self, symbols, lookback_start: datetime, now: datetime, chunk_size: int = 20):
         """
