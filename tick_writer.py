@@ -4153,6 +4153,11 @@ class HistoryCandleStore:
     # See module comment above for why this is its own namespace.
     PG_TABLE_PREFIX = "candles_1m"
 
+    # See delete_before_bulk()'s docstring — same batching/timeout
+    # reasoning as Candle1mCache's own copy of these two constants.
+    _DELETE_BEFORE_BULK_BATCH_SIZE = 20
+    _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS = 120_000
+
     def __init__(self, base_dir=None):
         # base_dir is accepted (and ignored) only so existing callers
         # that still pass it don't need a conditional at every call
@@ -4465,6 +4470,119 @@ class HistoryCandleStore:
             return []
         finally:
             conn.close()
+
+    def delete_before_bulk(self, symbols: list, cutoff_ms: int) -> int:
+        """
+        Prune every symbol's candles_1m_<symbol> rows older than
+        cutoff_ms. Nothing pruned this table before this method
+        existed: sync_history_cache_with_main_db() keeps adding newly
+        confirmed candles to this table every run and nothing was ever
+        removing old ones, so — unlike candle1m_<symbol>
+        (Candle1mCache.delete_before_bulk, which DOES get pruned) —
+        it grew without bound.
+
+        Same pattern as Candle1mCache.delete_before_bulk() (see that
+        method's docstring for the full reasoning): one PL/pgSQL DO
+        block per BATCH of symbols, server-side, its own transaction,
+        to_regclass() skipping any symbol with no candles_1m_<symbol>
+        table yet (read_timestamps()'s docstring notes this table is
+        populated only occasionally, so plenty of symbols won't have
+        one every run) rather than erroring the whole batch, and its
+        own generous statement_timeout for the same reason as the
+        other two delete_before_bulk() implementations in this file.
+
+        safe_syms is sanitized via _safe_symbol() (alnum/underscore
+        only) before being embedded in the array literal — see that
+        function's own docstring.
+
+        Returns the total row count deleted across every symbol and
+        every batch that succeeded (0 on total failure — logged, never
+        raised; a batch that fails still lets later batches run).
+        """
+        if not symbols:
+            return 0
+
+        safe_syms  = sorted({_safe_symbol(s) for s in symbols})
+        cutoff     = int(cutoff_ms)
+        batch_size = self._DELETE_BEFORE_BULK_BATCH_SIZE
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] delete_before_bulk connect failed: {exc}", flush=True)
+            return 0
+
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] could not raise statement_timeout on delete_before_bulk connection: {exc}", flush=True)
+
+        grand_total = 0
+        try:
+            for i in range(0, len(safe_syms), batch_size):
+                batch = safe_syms[i:i + batch_size]
+                syms_array_sql = "ARRAY[" + ",".join(f"'{s}'" for s in batch) + "]::text[]"
+
+                do_block = f"""
+                    DO $do$
+                    DECLARE
+                        sym   TEXT;
+                        tbl   TEXT;
+                        total BIGINT := 0;
+                        n     BIGINT;
+                    BEGIN
+                        FOREACH sym IN ARRAY {syms_array_sql}
+                        LOOP
+                            tbl := '{self.PG_TABLE_PREFIX}_' || sym;
+                            IF to_regclass(tbl) IS NOT NULL THEN
+                                EXECUTE format('DELETE FROM %I WHERE ts_ms < {cutoff}', tbl);
+                                GET DIAGNOSTICS n = ROW_COUNT;
+                                total := total + n;
+                            END IF;
+                        END LOOP;
+                        RAISE NOTICE 'DELETE_BEFORE_BULK_TOTAL:%', total;
+                    END
+                    $do$;
+                """
+
+                try:
+                    conn.notices.clear()
+                    cur.execute(do_block)
+                    batch_total = 0
+                    for notice in reversed(conn.notices):
+                        if "DELETE_BEFORE_BULK_TOTAL:" in notice:
+                            try:
+                                batch_total = int(notice.strip().split("DELETE_BEFORE_BULK_TOTAL:")[-1].strip())
+                            except ValueError:
+                                pass
+                            break
+                    conn.commit()
+                    grand_total += batch_total
+                except Exception as exc:
+                    print(
+                        f"[HISTORY_STORE][WARN] delete_before_bulk batch "
+                        f"{i // batch_size + 1} ({len(batch)} symbol(s)) failed: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            if grand_total:
+                print(
+                    f"[HISTORY_STORE] delete_before_bulk: {grand_total} row(s) across "
+                    f"{len(safe_syms)} symbol(s), ts_ms < {cutoff}",
+                    flush=True,
+                )
+            return grand_total
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class Candle1mCache:

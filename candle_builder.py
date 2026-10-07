@@ -7,7 +7,7 @@
 # (TIMEFRAMES, OPENALGO_HISTORY_INTERVAL, MIN_CANDLES) is read
 # directly from the environment (.env), the same env vars
 # backfill_manager.py reads, but independently — there's no shared
-# object between the two files. BackfillManager.run_low_memory()
+# object between the two files. BackfillManager.run_backfill()
 # imports CandleBuilder (the class) and calls it in-process, passing
 # in whatever config it already loaded; this file never reaches back
 # into backfill_manager.py to get that config itself.
@@ -16,7 +16,7 @@
 # run directly — NOT part of the live startup path. Do NOT run it
 # before starting live trading.
 #
-# Why in-process matters (for the BackfillManager.run_low_memory()
+# Why in-process matters (for the BackfillManager.run_backfill()
 # call path): save_candles_bulk() (ohlc.py) writes candles to BOTH the
 # parquet files on disk AND the in-RAM ohlc_data dict that indicators/
 # signal_generator read from live. Running candle building in a
@@ -536,7 +536,7 @@ def main():
     # Builds purely from whatever's already in the local tick/history
     # cache — this script never syncs against the main Postgres db
     # itself (that's the live process's job, via
-    # BackfillManager.run_low_memory()). Run the live process first
+    # BackfillManager.run_backfill()). Run the live process first
     # (or recently) if the local cache needs topping up.
     candle_builder = CandleBuilder(
         ohlc, timeframes, history_native_tf, gaps,
