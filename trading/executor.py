@@ -2,7 +2,7 @@ import asyncio
 import os
 from dotenv import load_dotenv
 from openalgo import api
-from event_bus import signal_queue
+from engine.event_bus import signal_queue
 
 load_dotenv()
 

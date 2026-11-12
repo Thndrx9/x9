@@ -22,7 +22,7 @@ holes in it — i.e. verifying that a cache's high-water mark
 import pandas as pd
 from datetime import datetime
 from engine.market_time import tz_kolkata, MARKET_OPEN, MARKET_CLOSE
-from backfill.gap_detector import gap_matches_outage
+from candles.gap_detector import gap_matches_outage
 
 
 class TickGapDetector:

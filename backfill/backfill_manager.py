@@ -20,13 +20,13 @@ from engine.market_time import (
     is_market_open, trading_day_n_back,
 )
 from storage.tick_writer import DEPTH_LEVEL_COLUMNS, QUOTE_EXTRA_COLUMNS, Candle1mCache
-from verification.gap_detector import (
+from candles.gap_detector import (
     GapDetector,
     is_market_hours_weekday_vectorized,
     MARKET_CLOSE_SECS,
     CAS_CONTINUOUS_CLOSE_SECS,
 )
-from verification.tick_gap_detector import TickGapDetector
+from backfill.tick_gap_detector import TickGapDetector
 from backfill.archive_sync import ArchiveSync
 from engine.fo_symbols import get_fo_underlyings
 
@@ -722,9 +722,9 @@ class BackfillManager:
 
         if not _env_on("ARCHIVE_VERIFY_ENABLED"):
             return
-        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "verification", "parquet_verify.py")
+        script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backfill", "parquet_verify.py")
         if not os.path.isfile(script):
-            print("[ARCHIVE][VERIFY][WARN] verification/parquet_verify.py not found — skipping", flush=True)
+            print("[ARCHIVE][VERIFY][WARN] backfill/parquet_verify.py not found — skipping", flush=True)
             return
         check_ltt = _env_on("ARCHIVE_VERIFY_CHECK_LTT")
         max_gap = os.getenv("ARCHIVE_VERIFY_MAX_GAP", "3").strip() or "3"
@@ -926,7 +926,7 @@ class BackfillManager:
         quote_outage_windows = []
         if self.conn_log_dir:
             try:
-                from verification.gap_detector import connection_outage_windows
+                from candles.gap_detector import connection_outage_windows
                 quote_outage_windows = connection_outage_windows(self.conn_log_dir, now.date(), "Quote")
             except Exception as exc:
                 print(f"[BACKFILL][WARN] could not read connection log: {exc}", flush=True)
@@ -1141,7 +1141,7 @@ class BackfillManager:
         depth_outage_windows = []
         if self.conn_log_dir:
             try:
-                from verification.gap_detector import connection_outage_windows
+                from candles.gap_detector import connection_outage_windows
                 depth_outage_windows = connection_outage_windows(self.conn_log_dir, now.date(), "Depth")
             except Exception as exc:
                 print(f"[BACKFILL][WARN] could not read connection log for depth: {exc}", flush=True)
@@ -3416,7 +3416,7 @@ class BackfillManager:
         outage_windows = []
         if self.conn_log_dir:
             try:
-                from verification.gap_detector import connection_outage_windows
+                from candles.gap_detector import connection_outage_windows
                 outage_windows = connection_outage_windows(self.conn_log_dir, day_date, "Quote")
             except Exception:
                 outage_windows = []

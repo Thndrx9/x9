@@ -7,10 +7,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from engine.utils import load_symbols
 from market_data.websocket_connect import run_market_data_feeds
-from market_data.ohlc import OHLCCollector, PreviousCandleGuard
+from candles.ohlc import OHLCCollector, PreviousCandleGuard
 from market_data.depth_store import DepthStore
 from storage.tick_writer import TickWriter, HistoryCandleStore
-from trading.indicators import IndicatorEngine
+from candles.indicators import IndicatorEngine
 from trading.signal_generator import SignalGenerator
 from trading.executor import TradeExecutor
 from engine.market_time import (

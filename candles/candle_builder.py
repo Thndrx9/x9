@@ -48,7 +48,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from engine.market_time import tz_kolkata, is_trading_day
-from verification.gap_detector import compute_tick_volume_vectorized, MARKET_CLOSE_SECS, CAS_CONTINUOUS_CLOSE_SECS
+from candles.gap_detector import compute_tick_volume_vectorized, MARKET_CLOSE_SECS, CAS_CONTINUOUS_CLOSE_SECS
 from engine.fo_symbols import get_fo_underlyings
 
 load_dotenv()
@@ -505,7 +505,7 @@ def main():
     from engine.utils import load_symbols
     from storage.tick_writer import TickWriter, HistoryCandleStore
     from candles.ohlc import OHLCCollector
-    from verification.gap_detector import GapDetector
+    from candles.gap_detector import GapDetector
 
     symbols = load_symbols("symbols.csv")
     if not symbols:

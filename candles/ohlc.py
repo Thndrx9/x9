@@ -11,7 +11,7 @@ import asyncio
 import threading
 from collections import deque
 from candles.parquet_writer import ParquetWriter
-from verification.gap_detector import (
+from candles.gap_detector import (
     compute_bucket,
     compute_bucket_vectorized,
     compute_tick_volume_vectorized,

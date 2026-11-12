@@ -1,6 +1,6 @@
 import asyncio
-from event_bus import signal_queue
-from utils import load_symbols
+from engine.event_bus import signal_queue
+from engine.utils import load_symbols
 
 
 class SignalGenerator:
