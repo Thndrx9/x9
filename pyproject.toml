@@ -1,0 +1,21 @@
+[project]
+name = "x9"
+version = "0.1.0"
+description = "x9 trading engine"
+requires-python = ">=3.9"
+dependencies = [
+    "python-dotenv",
+    "openalgo",
+    "pandas",
+    "websockets",
+    "pyarrow",
+    "psycopg2-binary",
+    "pytz; python_version<'3.9'",
+]
+
+[tool.uv]
+# This repo is a set of top-level scripts (start_data.py/start_trade.py,
+# etc.), not an installable library — this tells uv to just resolve and
+# install the dependencies above into .venv, without trying to build a
+# wheel for the project itself (no [build-system] needed at all).
+package = false
