@@ -1,0 +1,4955 @@
+# tick_writer.py
+#
+# Replaces depth_writer.py. Same dedicated-background-thread /
+# batched-commit SQLite design, but now backs BOTH quote ticks and
+# depth snapshots — each symbol getting its own two tables,
+# quote_<symbol> and depth_<symbol>, inside a single ticks.db file.
+# This mirrors the quote_{symbol} table convention backfill_manager.py
+# already uses against the main PostgreSQL db, instead of the old
+# single shared `ticks` table with symbol/kind columns.
+#
+# ── Ordering guarantee ──────────────────────────────────────────────
+# Two different producers feed this writer:
+#   1. Historical "catch-up" ticks fetched from PostgreSQL in bulk
+#      (already ascending-timestamp, per symbol) — via enqueue_backfill_rows().
+#   2. Live ticks arriving one at a time off the websocket, in real
+#      time — via enqueue_live().
+#
+# A PG fetch takes real wall-clock time (network round trip). If live
+# ticks were allowed to enqueue directly while a catch-up fetch is in
+# flight, they'd land in the write queue BEFORE the (earlier-timestamp)
+# historical rows the fetch eventually returns — rows on disk would go
+# out of timestamp order. hold()/release() close that gap: while held,
+# enqueue_live() buffers in RAM instead of touching the queue; release()
+# drains that buffer onto the queue (in arrival order, which is also
+# timestamp order) immediately after the caller's catch-up fetch has
+# been enqueued via enqueue_backfill_rows(). Net effect: PG rows land
+# on disk first, buffered live ticks next, future live ticks after —
+# row after row, timestamp after timestamp, never interleaved.
+
+import io
+import os
+import re
+import time
+import queue
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import zlib
+from datetime import datetime, timedelta
+from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+import pandas as pd
+import numpy as np
+
+from engine.market_time import tz_kolkata, trading_day_n_back, MARKET_OPEN, MARKET_CLOSE
+
+
+def _safe_symbol(symbol: str) -> str:
+    """Same sanitization backfill_manager.py uses for quote_{symbol}
+    PG table names, so the SQLite table names line up with it."""
+    return "".join(c for c in str(symbol) if c.isalnum() or c == "_").lower()
+
+
+# depth_<symbol> columns — deliberately identical, name-for-name, to
+# PostgreSQL's depth_<symbol> layout (see pg_writer.py's
+# _DEPTH_COLUMN_DEFS / backfill_manager.py's old _DEPTH_LEVEL_COLUMNS,
+# which now imports this instead of keeping its own copy). Rows are
+# stored as plain flat columns — NOT reassembled into nested
+# bids/asks dicts and NOT JSON-serialized — so a depth row costs the
+# same "just numbers" write as a quote row instead of paying a
+# per-row json.dumps() and a much heavier TEXT payload. Nested
+# bids/asks shape is only ever reconstructed where something actually
+# needs it in memory (DepthStore's RAM window), not on the hot
+# fetch/write path.
+DEPTH_LEVEL_COLUMNS = tuple(
+    f"{side}{lvl}_{field}"
+    for side in ("buy", "sell")
+    for lvl in range(5)
+    for field in ("price", "qty", "orders")
+)
+
+# quote_<symbol> extra columns — everything PostgreSQL's quote_<symbol>
+# table has beyond the original (ts_ms, ltp, qty) trio backfill_manager.py
+# used to select. Kept as ADDITIONAL columns rather than replacing
+# ts_ms/ltp/qty so every existing reader (gap detection, RAM seeding,
+# candle building — all of which key off ltp/qty by name) keeps working
+# unchanged; this just widens what also gets written/read alongside them.
+# Name-for-name match with the PG source table (see backfill_manager.py's
+# BackfillManager docstring: "timestamp BIGINT, ingest_ns BIGINT, ltp
+# DOUBLE PRECISION, ltt BIGINT, volume BIGINT, oi BIGINT,
+# upper_circuit/lower_circuit DOUBLE PRECISION").
+#
+# open/high/low/close/last_quantity were DROPPED from the upstream main-db
+# quote_<symbol> table (confirmed: daily-snapshot OHLC, not per-tick, and
+# never read by candle_builder.py's tick->candle aggregation, which keys
+# off timestamp/ltp/qty/volume/ltt only — qty itself is unused too, since
+# tick volume is diffed from cumulative "volume", not summed from
+# last_quantity; see candle_builder._ticks_rows_to_df()'s docstring).
+# "qty" is kept as an output key everywhere below for backward
+# compatibility with existing consumers, just always 0 now.
+QUOTE_EXTRA_COLUMNS = (
+    "ingest_ns", "ltt", "volume", "oi", "upper_circuit", "lower_circuit",
+)
+
+# SQLite/Postgres column type for each QUOTE_EXTRA_COLUMNS entry, in the
+# same order — BIGINT-ish fields as INTEGER, everything else as
+# REAL/DOUBLE PRECISION.
+_QUOTE_EXTRA_INT_COLUMNS = {"ingest_ns", "ltt", "volume", "oi"}
+
+# Exact column set/order for PostgresTickWriter's LOCAL quote_<symbol>
+# table specifically — column-for-column identical to the source AWS
+# Postgres quote_<symbol> table (timestamp, ingest_ns, ltp, ltt, volume,
+# oi, upper_circuit, lower_circuit — open/high/low/close/last_quantity
+# dropped upstream, see QUOTE_EXTRA_COLUMNS above). No "id" primary key,
+# no "ts_ms"/"qty" aliases, nothing extra — deliberately NOT a superset
+# the way SQLiteTickWriter's schema is, per explicit request that the
+# local Postgres cache mirror the source table exactly. "qty" is still
+# produced on READ (always 0 now — last_quantity no longer exists
+# upstream to derive it from) so existing consumers that expect a "qty"
+# key from read_ticks() keep working unchanged — that's an
+# application-level dict key, not a stored column.
+PG_LOCAL_QUOTE_COLUMNS = (
+    "timestamp", "ingest_ns", "ltp", "ltt", "volume", "oi",
+    "upper_circuit", "lower_circuit",
+)
+
+
+_PG_BIGINT_MIN = -(2 ** 63)
+_PG_BIGINT_MAX = 2 ** 63 - 1
+_bigint_warned_cols = set()  # (table_col) pairs already warned about, to avoid log spam
+
+
+def _safe_bigint(value, table: str = "?", col: str = "?"):
+    """Coerce a value bound for a BIGINT column into either a genuine
+    Python int within Postgres's int8 range, or None.
+
+    Why this exists: values reaching here started life as plain Python
+    ints/None from psycopg2 (see PG source table), but pass through a
+    shared multi-symbol pandas DataFrame in backfill_manager._fetch_ticks_batch()
+    on the way here. Pandas infers column dtype across the WHOLE merged
+    chunk (every symbol in that fetch), not per symbol — so a single
+    NULL anywhere in a BIGINT-destined column (ingest_ns/ltt/volume/
+    last_quantity/oi is enough for a NaN, one for equities where OI is
+    always NULL) silently upcasts that entire column to float64 for
+    every row/symbol in the chunk. Those numpy floats (NaN, inf, or
+    just imprecise) were previously handed straight to psycopg2 with no
+    cast, which is what produced "bigint out of range" / "cannot
+    convert NaN to integer" batch-insert failures — see this class's
+    _insert()/_flush_bulk() history. This function is the single choke
+    point that normalizes any of that back into something Postgres's
+    BIGINT columns can actually accept, instead of letting a bad column
+    quietly poison every row's insert in a chunk that includes it.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+                return None
+            value = round(value)
+        ival = int(value)
+    except (ValueError, TypeError, OverflowError):
+        ival = None
+
+    if ival is None or not (_PG_BIGINT_MIN <= ival <= _PG_BIGINT_MAX):
+        key = (table, col)
+        if key not in _bigint_warned_cols:
+            _bigint_warned_cols.add(key)
+            print(
+                f"[PG_LOCAL_WRITER][WARN] {table}.{col}: value {value!r} is not a "
+                f"valid bigint (NULL/NaN/inf/out-of-range) — storing NULL instead "
+                f"(further occurrences for this column suppressed)",
+                flush=True,
+            )
+        return None
+    return ival
+
+
+def _backfill_rows_empty(rows) -> bool:
+    """`rows` is either a list of dicts (the historical shape) or a
+    pandas DataFrame (BackfillManager now hands the fetched table
+    straight through instead of exploding it into per-row dicts first
+    — see _fetch_ticks_batch's groupby loop). Plain `not rows` raises
+    ValueError on a DataFrame ("truth value... is ambiguous"), so
+    emptiness has to be checked per-type."""
+    if isinstance(rows, pd.DataFrame):
+        return rows.empty
+    return not rows
+
+
+def _backfill_rows_for_queue(rows):
+    """Prepare `rows` to be put on a queue. For a DataFrame, pass a real
+    copy through (not just a fresh index — a genuine .copy() too),
+    rather than wrapping it in list(...) — list(a_dataframe) iterates
+    its COLUMN NAMES, not its rows, which would silently replace the
+    data with a list of strings like ["timestamp", "ltp", ...]. The
+    explicit .copy() matters because the caller (BackfillManager's
+    quote-backfill loop) keeps its own reference to this same
+    DataFrame (`out[symbol] = g`) for its own use after handing rows
+    off here — _flush_bulk() mutates columns on what it receives, and
+    that must never reach back into the caller's copy. Lists of dicts
+    keep the previous list(rows) copy-on-enqueue behavior unchanged."""
+    if isinstance(rows, pd.DataFrame):
+        return rows.reset_index(drop=True).copy()
+    return list(rows)
+
+
+def _flatten_depth_levels(levels, side):
+    """levels: list of up to 5 {"price","quantity"/"qty","orders"} dicts
+    (bids or asks, best-first) as DepthStore hands them to enqueue_live().
+    Returns a flat {"<side>0_price": ..., ..., "<side>4_orders": ...}
+    dict — same column names as DEPTH_LEVEL_COLUMNS — so live ticks land
+    in the same flat schema the batched PG backfill path writes into.
+    Missing levels are filled with None."""
+    out = {}
+    for i in range(5):
+        lvl = levels[i] if i < len(levels) and levels[i] else {}
+        out[f"{side}{i}_price"]  = lvl.get("price")
+        out[f"{side}{i}_qty"]    = lvl.get("quantity", lvl.get("qty"))
+        out[f"{side}{i}_orders"] = lvl.get("orders")
+    return out
+
+
+class SQLiteTickWriter:
+    """
+    SQLite-backed tick writer — dedicated background thread, one DB
+    file per base_dir. Two tables PER SYMBOL:
+        quote_<symbol>  (ts_ms, ltp, qty, ingest_ns, ltt, volume, open,
+                          high, low, close, last_quantity, oi,
+                          upper_circuit, lower_circuit) — full column
+                          parity with PostgreSQL's quote_<symbol> layout
+                          (see QUOTE_EXTRA_COLUMNS)
+        depth_<symbol>  (ts_ms, ltp, buy0_price, buy0_qty, buy0_orders, ...,
+                          sell4_price, sell4_qty, sell4_orders) — flat
+                          columns matching PostgreSQL's depth_<symbol>
+                          layout name-for-name (see DEPTH_LEVEL_COLUMNS)
+    instead of one shared `ticks` table for every symbol/kind.
+    """
+
+    DB_FILENAME    = "ticks.db"
+    BATCH_SIZE     = 100    # live snapshots buffered before one executemany() insert
+    BATCH_MAX_SECS = 1.0    # max staleness before that insert is forced
+
+    # Commit (transaction) boundary — decoupled from the insert grouping
+    # above. Multiple _flush_live()/_flush_bulk() inserts accumulate in
+    # ONE open transaction until either threshold below is hit, instead
+    # of committing (fsync-ing) after every single insert. This is the
+    # main lever on writer throughput: fewer commits = fewer real disk
+    # waits, since each commit is a hard wait on the disk, not CPU work.
+    COMMIT_MAX_ROWS = 50_000  # rows accumulated in the open txn before a commit
+    COMMIT_MAX_SECS = 1.0     # max time an insert can sit uncommitted
+
+    # A single executemany() over hundreds of thousands of rows can
+    # stall the writer thread for a long, unresponsive stretch (no
+    # chance to notice stop signals, service prune/delete_range/barrier
+    # requests, etc). Paging keeps each individual executemany() call
+    # bounded while still landing all pages inside the same transaction
+    # — same commit count, just a responsive writer in between.
+    INSERT_PAGE_SIZE = 10_000
+
+    # Caps how many queue ITEMS (not rows) can sit unwritten at once.
+    # Each "bulk" item can itself be an entire symbol's worth of rows
+    # for one chunk, so this doesn't need to be large to meaningfully
+    # cap RAM — it needs to be small enough that the fetch loop
+    # actually feels backpressure instead of racing arbitrarily far
+    # ahead of the writer. See enqueue_backfill_rows() for why this is
+    # safe to block on, and enqueue_live()/enqueue() for why live ticks
+    # deliberately do NOT block on this same limit.
+    QUEUE_MAXSIZE = 40
+
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self._queue   = queue.Queue(maxsize=self.QUEUE_MAXSIZE)
+        self._stop    = threading.Event()
+
+        # ── hold/release gate (see module docstring) ───────────────
+        self._gate_lock   = threading.Lock()
+        self._hold_count   = 0
+        self._held_buffer = []   # [(symbol, kind, snapshot), ...] arrival order
+
+        # tracks which quote_<symbol>/depth_<symbol> tables already
+        # exist, so the writer thread doesn't re-run CREATE TABLE IF
+        # NOT EXISTS on every single insert
+        self._known_tables = set()
+
+        # Tables created without a timestamp index yet (only populated
+        # when this is a brand-new/empty ticks.db — see _run()'s
+        # is_fresh_db check and build_pending_indexes()). Empty on an
+        # existing/incremental db, where indexes are still created
+        # immediately as before.
+        self._pending_index_tables = set()
+        self._is_fresh_db = False  # actual value set at the top of _run()
+
+        # ── writer metrics (see get_metrics()) — best-effort, not
+        # lock-protected; only the writer thread mutates these, and
+        # a reader racing a torn read of a float/int is harmless here. ──
+        self._metrics_started_at   = time.time()
+        self._dropped_live_ticks   = 0
+        self._rows_written_total   = 0
+        self._commits_total        = 0
+        self._commit_time_total    = 0.0
+        self._last_commit_duration = 0.0
+        self._last_commit_rows     = 0
+        self._last_txn_duration    = 0.0
+
+        self._thread = threading.Thread(target=self._run, name="tick-writer", daemon=True)
+        self._thread.start()
+
+    # ─────────────────────────────────────────────
+    # Table naming
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    def table_name(symbol: str, kind: str) -> str:
+        """kind: 'quote' or 'depth' -> e.g. 'quote_reliance', 'depth_reliance'."""
+        return f"{kind}_{_safe_symbol(symbol)}"
+
+    # ─────────────────────────────────────────────
+    # Live tick ingestion (websocket path)
+    # ─────────────────────────────────────────────
+
+    def enqueue_live(self, symbol: str, kind: str, snapshot: dict):
+        """kind: 'quote' or 'depth'. Buffers in RAM instead of writing
+        while the gate is held (see hold()).
+
+        Uses put_nowait(), NOT put() — this runs synchronously on the
+        asyncio event loop (called directly from OhlcEngine.run() /
+        DepthStore.run()'s tick-processing loops), so blocking here
+        when the queue is full would freeze the entire event loop —
+        every symbol, every websocket connection, everything — not
+        just this one tick. enqueue_backfill_rows() safely blocks
+        instead because it only ever runs via asyncio.to_thread(), off
+        the event loop.
+
+        On QueueFull (writer thread badly behind), this tick is
+        dropped rather than risking that freeze. That should be rare
+        in practice — live volume is naturally rate-limited by the
+        market feed, unlike backfill's "dump months of history at
+        once" pattern — but it's a real, deliberate tradeoff: a
+        dropped live tick during writer overload vs. a frozen engine.
+        """
+        item = (symbol, kind, dict(snapshot))
+        with self._gate_lock:
+            if self._hold_count > 0:
+                self._held_buffer.append(item)
+                return
+        try:
+            self._queue.put_nowait(("live", *item))
+        except queue.Full:
+            self._dropped_live_ticks += 1
+            if self._dropped_live_ticks == 1 or self._dropped_live_ticks % 500 == 0:
+                print(
+                    f"[TICK_WRITER][WARN] write queue full — dropped live tick "
+                    f"for {symbol} ({self._dropped_live_ticks} dropped total). "
+                    f"Writer thread is behind; see get_metrics().",
+                    flush=True,
+                )
+
+    # Back-compat alias — depth_store.py used to call this on DepthWriter.
+    def enqueue(self, symbol: str, snapshot: dict):
+        self.enqueue_live(symbol, "depth", snapshot)
+
+    # ─────────────────────────────────────────────
+    # Bulk catch-up ingestion (PG-fetched historical ticks)
+    # ─────────────────────────────────────────────
+
+    def enqueue_backfill_rows(self, symbol: str, rows: list, kind: str = "quote"):
+        """
+        kind='quote' (default): rows is a list of
+        {"timestamp": ms_int, "ltp": float, "qty": float}, written into
+        quote_<symbol>.
+
+        kind='depth': rows is a list of flat dicts —
+        {"timestamp": ms_int, "ltp": float, "buy0_price": ..., "buy0_qty": ...,
+        "buy0_orders": ..., ..., "sell4_orders": ...} — same column
+        names as DEPTH_LEVEL_COLUMNS / PostgreSQL's depth_<symbol>
+        table, written into depth_<symbol> as-is (no bids/asks nesting,
+        no JSON encoding).
+
+        Either way, rows must already be ascending by timestamp (as
+        returned by BackfillManager's PG fetch). Queued as a single unit
+        so it flushes as one contiguous ordered block ahead of anything
+        enqueued after it — see module docstring.
+
+        `rows` may also be a pandas DataFrame now (BackfillManager's
+        quote-backfill path hands the fetched table straight through
+        instead of building a list of per-row dicts first — see
+        _backfill_rows_empty/_backfill_rows_for_queue above). This
+        class's _flush_bulk() converts it to records internally, so
+        the rest of this method doesn't need to care which shape it
+        got.
+        """
+        if _backfill_rows_empty(rows):
+            return
+        # Deliberately BLOCKS if the queue is full (default put()
+        # behavior) — this is the real fix for RAM not freeing quickly
+        # during backfill. Without this, the fetch loop in
+        # BackfillManager could dump chunk after chunk onto the queue
+        # far faster than the writer thread drains them, so fetched
+        # data just piled up in RAM for the whole fetch phase and only
+        # started draining once flush_and_wait() forced a catch-up at
+        # the very end. Blocking here means the fetch loop now pauses
+        # naturally whenever the writer falls behind, capping how much
+        # can ever be queued at once — real backpressure instead of an
+        # unbounded buffer.
+        #
+        # Safe to block: every caller of this method (BackfillManager's
+        # fetch loops) runs via asyncio.to_thread(...), never directly
+        # on the event loop — see enqueue_live()'s docstring for why
+        # THAT path can't use the same blocking behavior.
+        self._queue.put(("bulk", symbol, _backfill_rows_for_queue(rows), kind))
+
+    # ─────────────────────────────────────────────
+    # Hold/release gate
+    # ─────────────────────────────────────────────
+
+    def hold(self):
+        """Start buffering live ticks in RAM instead of writing them."""
+        with self._gate_lock:
+            self._hold_count += 1
+
+    def release(self):
+        """
+        Decrements the hold count; only actually stops buffering and
+        drains the buffer once the count reaches zero. Reference-counted
+        rather than a simple flag because more than one caller can hold
+        the gate concurrently — e.g. Quote's and Depth's mid-session
+        auto-heal can both be in flight at once (both connections
+        dropping around the same time is a real, not rare, scenario).
+        With a plain boolean, whichever finishes first would release()
+        and prematurely resume direct writes while the OTHER heal is
+        still in progress, defeating the whole point of the gate for
+        that other mode. A simple counter fixes this: the buffer only
+        actually drains once every concurrent holder has released.
+
+        Call this AFTER the corresponding catch-up
+        enqueue_backfill_rows() call so the buffered ticks land after
+        the historical rows they followed in real time.
+
+        Like enqueue_live(), this is called directly on the event loop
+        (engine_runtime.py calls it without asyncio.to_thread), so it
+        must not block on a full queue either — same put_nowait/drop
+        tradeoff as enqueue_live().
+        """
+        with self._gate_lock:
+            self._hold_count = max(0, self._hold_count - 1)
+            if self._hold_count > 0:
+                return  # still held by another concurrent caller — don't drain yet
+            buffered = self._held_buffer
+            self._held_buffer = []
+        for symbol, kind, snapshot in buffered:
+            try:
+                self._queue.put_nowait(("live", symbol, kind, snapshot))
+            except queue.Full:
+                self._dropped_live_ticks += 1
+                print(
+                    f"[TICK_WRITER][WARN] write queue full during release() — "
+                    f"dropped a buffered live tick for {symbol}",
+                    flush=True,
+                )
+
+    def flush_and_wait(self, timeout: float = 120):
+        """
+        Block until every item enqueued so far (bulk backfill rows AND
+        live ticks) has actually been written to disk by the writer
+        thread — not just handed to the queue.
+
+        enqueue_backfill_rows()/enqueue_live() are fire-and-forget:
+        put() returns immediately, regardless of how far behind the
+        writer thread is. Callers that fetch data, enqueue it, then
+        immediately try to READ it back (e.g. BackfillManager's
+        _seed_depth_ram, which reads depth_<symbol> right after
+        _fetch_depth_batch enqueues it) would otherwise race the
+        writer thread and see stale/empty results — this is exactly
+        why depth RAM seeding was logging "0/199 symbols, 0 snapshots"
+        even though the fetch itself had succeeded: the read ran
+        before the writer thread had drained the backlog. It also
+        means the fetched data was still sitting in the queue, in
+        RAM, well after "[BACKFILL] ... complete" printed.
+
+        Since queue items are processed strictly in order, putting a
+        barrier item on the queue and waiting for the writer thread to
+        reach it guarantees everything enqueued BEFORE this call has
+        been committed to SQLite by the time this returns.
+        """
+        done = threading.Event()
+        self._queue.put(("barrier", done))
+        if not done.wait(timeout=timeout):
+            print(
+                f"[TICK_WRITER][WARN] flush_and_wait timed out after {timeout}s "
+                f"— writer thread still behind; proceeding anyway",
+                flush=True,
+            )
+        return done.is_set()
+
+    def build_pending_indexes(self, timeout: float = 300):
+        """
+        For a brand-new/empty ticks.db, _ensure_table() deliberately
+        skips creating each table's timestamp index at CREATE TABLE
+        time — building an index while millions of rows are still
+        being bulk-inserted during the very first backfill import is
+        wasted, repeated work (the index gets rebalanced continuously
+        as rows stream in) and slows that initial import down for no
+        benefit, since nothing is querying these tables yet anyway.
+
+        Call this once, after the initial startup backfill has fully
+        finished (for both quote_* and depth_*), to build all of those
+        deferred indexes in one pass over the now-settled tables. A
+        no-op (returns immediately) on an existing/incremental
+        ticks.db, where indexes were already created immediately as
+        rows arrived, same as before — see _run()'s is_fresh_db check.
+        """
+        done = threading.Event()
+        self._queue.put(("build_indexes", done))
+        if not done.wait(timeout=timeout):
+            print(
+                f"[TICK_WRITER][WARN] build_pending_indexes timed out after {timeout}s",
+                flush=True,
+            )
+        return done.is_set()
+
+    def get_metrics(self) -> dict:
+        """
+        Best-effort snapshot of writer throughput, for diagnosing
+        whether disk sync, indexes, or data conversion is the current
+        bottleneck (see plan item 5). Safe to call from any thread.
+        """
+        elapsed = max(time.time() - self._metrics_started_at, 1e-9)
+        return {
+            "queue_depth":            self._queue.qsize(),
+            "rows_written_total":     self._rows_written_total,
+            "rows_per_sec_avg":       self._rows_written_total / elapsed,
+            "commits_total":          self._commits_total,
+            "avg_commit_secs":        (self._commit_time_total / self._commits_total) if self._commits_total else 0.0,
+            "last_commit_secs":       self._last_commit_duration,
+            "last_commit_rows":       self._last_commit_rows,
+            "last_txn_secs":          self._last_txn_duration,
+            "pending_index_tables":   len(self._pending_index_tables),
+            "dropped_live_ticks":     self._dropped_live_ticks,
+        }
+
+    def shutdown(self, timeout=60):
+        """
+        timeout: how long to wait for the writer thread to drain its
+        queue and exit. Default is generous (rather than the old 10s)
+        because a prune_older_than_days() call immediately beforehand
+        may still be running in the writer thread — see
+        prune_older_than_days()'s docstring. If the timeout is
+        exceeded, the (daemon) thread is left to finish or be killed
+        with the process; no data corruption results either way since
+        prune commits happen in bounded batches, not one giant
+        transaction.
+        """
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    # ─────────────────────────────────────────────
+    # Reads (used by BackfillManager to know where to resume a catch-up fetch)
+    # ─────────────────────────────────────────────
+
+    def open_read_connection(self):
+        """Open a connection suitable for passing as conn= to max_ts()/
+        read_ticks() across repeated calls (e.g. a per-symbol loop).
+        Caller owns it and must close it when done. Mirrors
+        PostgresTickWriter.open_read_connection() so backend-agnostic
+        callers like BackfillManager don't need to know which backend
+        is active."""
+        return sqlite3.connect(self._db_path(), timeout=5)
+
+    def max_ts(self, symbol: str, kind: str = "quote", conn=None):
+        """Most recent ts_ms already cached for symbol in quote_<symbol>
+        (or depth_<symbol> if kind='depth'), or None. Opens its own
+        short-lived read connection by default — infrequent, off the
+        hot path, so no need to share the writer thread's connection.
+        A local sqlite3.connect() is cheap (no network round-trip), so
+        this doesn't need the same per-call-cost fix as
+        PostgresTickWriter.max_ts() — the conn= param exists purely so
+        callers that don't know which backend they're talking to (e.g.
+        BackfillManager's Phase 1 loop) can pass one uniformly; a
+        caller-supplied conn is reused and left open, otherwise a
+        fresh one is opened and closed here as before."""
+        path = self._db_path()
+        if not os.path.exists(path):
+            return None
+        table = self.table_name(symbol, kind)
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = sqlite3.connect(path, timeout=5)
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if not exists:
+                    return None
+                row = conn.execute(f"SELECT MAX(ts_ms) FROM {table}").fetchone()
+            finally:
+                if own_conn:
+                    conn.close()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+            return None
+
+    def max_ts_batch(self, symbols: list, kind: str = "quote", conn=None) -> dict:
+        """Batched version of max_ts() for interface parity with
+        PostgresTickWriter.max_ts_batch(). SQLite has no per-call
+        network round-trip to save, so this is just a loop over
+        max_ts() reusing conn if given — the batching win is entirely
+        on the Postgres side; this exists so BackfillManager's Phase 1
+        loop can call the same method name regardless of backend."""
+        own_conn = conn is None
+        if own_conn:
+            conn = self.open_read_connection()
+        try:
+            return {s: self.max_ts(s, kind=kind, conn=conn) for s in symbols}
+        finally:
+            if own_conn:
+                conn.close()
+
+    def read_ticks_batch(self, symbol_ranges: dict, kind: str = "quote", conn=None) -> dict:
+        """Batched version of read_ticks() for interface parity with
+        PostgresTickWriter.read_ticks_batch(). symbol_ranges:
+        {symbol: (start_ms, end_ms)}. SQLite has no network round-trip
+        to save, so this is just a loop reusing conn — exists purely so
+        BackfillManager's Phase 1 loop can call one method name
+        regardless of backend."""
+        own_conn = conn is None
+        if own_conn:
+            conn = self.open_read_connection()
+        try:
+            return {
+                s: self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, conn=conn)
+                for s, (start_ms, end_ms) in symbol_ranges.items()
+            }
+        finally:
+            if own_conn:
+                conn.close()
+
+    def read_ticks(self, symbol: str, start_ms: int = None, end_ms: int = None, kind: str = "quote", conn=None):
+        """
+        Read back cached rows for symbol from quote_<symbol> (or
+        depth_<symbol> if kind='depth'), optionally bounded by
+        start_ms/end_ms (either or both may be omitted), ascending by
+        ts_ms. Used by BackfillManager to reuse ticks already cached
+        locally instead of re-fetching them from the main db — see
+        backfill_manager.py's Phase 1.
+
+        Returns a list of dicts: {"timestamp", "ltp", "qty", "volume", "ltt"}
+        for kind='quote' ("volume" is the feed's cumulative
+        volume-traded-today counter, "ltt" is the last-trade-time —
+        see aggregate_ticks_to_candles()'s docstring for why
+        candle-building needs both alongside "qty"), or
+        {"timestamp", "ltp", <DEPTH_LEVEL_COLUMNS...>} (flat buy0_price/
+        buy0_qty/.../sell4_orders, same names as the PG source table)
+        for kind='depth'. Empty list if the table doesn't exist or
+        nothing matches. Opens its own short-lived read connection by
+        default — not on the hot write path, and a local sqlite3.connect()
+        has no network cost, so this doesn't need PostgresTickWriter's
+        per-call fix. conn= exists purely for interface parity with
+        PostgresTickWriter.read_ticks() so backend-agnostic callers can
+        pass one uniformly; if given, it's reused and left open instead
+        of opened/closed here.
+        """
+        path = self._db_path()
+        if not os.path.exists(path):
+            return []
+        table = self.table_name(symbol, kind)
+        if kind == "depth":
+            select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+        else:
+            select_cols = ["ts_ms", "ltp", "qty", "volume", "ltt"]
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("ts_ms >= ?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("ts_ms <= ?")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = sqlite3.connect(path, timeout=5)
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if not exists:
+                    return []
+                rows = conn.execute(
+                    f"SELECT {', '.join(select_cols)} FROM {table}{where} ORDER BY ts_ms",
+                    params,
+                ).fetchall()
+            finally:
+                if own_conn:
+                    conn.close()
+            out_cols = ["timestamp", "ltp"] + (list(DEPTH_LEVEL_COLUMNS) if kind == "depth" else ["qty", "volume", "ltt"])
+            return [dict(zip(out_cols, r)) for r in rows]
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] read_ticks({symbol}) failed: {exc}", flush=True)
+            return []
+
+    def delete_range(self, symbol: str, start_ms: int, end_ms: int = None, kind: str = "quote", timeout: float = 30):
+        """
+        Delete cached rows for symbol from quote_<symbol> (or
+        depth_<symbol>) where ts_ms >= start_ms (and <= end_ms if
+        given). Used by BackfillManager to purge a range of cached
+        ticks it no longer trusts (e.g. a detected silent gap) before
+        re-fetching that range from the main db — without this, the
+        re-fetch would leave duplicate rows sitting next to the
+        untrusted ones instead of replacing them.
+
+        Routed through the writer thread's own connection (same
+        pattern as prune_older_than_days) so it never fights the
+        writer thread for SQLite's single-writer lock.
+        """
+        if not self._thread.is_alive():
+            conn = sqlite3.connect(self._db_path(), timeout=timeout) if os.path.exists(self._db_path()) else None
+            if conn is None:
+                return
+            try:
+                self._delete_range(conn, symbol, start_ms, end_ms, kind)
+            finally:
+                conn.close()
+            return
+
+        done = threading.Event()
+        self._queue.put(("delete_range", symbol, start_ms, end_ms, kind, done))
+        if not done.wait(timeout=timeout):
+            print(
+                f"[TICK_WRITER][WARN] delete_range({symbol}) timed out after "
+                f"{timeout}s waiting for writer thread",
+                flush=True,
+            )
+
+    def delete_before_bulk(self, symbols: list, boundary_ms: int, kind: str = "quote", timeout: float = 120) -> int:
+        """
+        Prune every given symbol's rows older than boundary_ms in ONE
+        queued job — not one delete_range() call (and one queue round
+        trip) per symbol. Interface parity with
+        PostgresTickWriter.delete_before_bulk() (see that method's
+        docstring for the full Tier-1/Tier-2 rollover context this
+        serves) so BackfillManager can call the same method name on
+        either backend. SQLite has no live/backfill table split (one
+        unified quote_<symbol> table), so this is simpler than the
+        Postgres version — one DELETE per symbol, but all run inside a
+        single connection/transaction on the writer thread instead of
+        each being its own queued op with its own done.wait().
+
+        Returns the total row count deleted across every symbol (0 on
+        any failure or if the writer thread times out).
+        """
+        if not symbols:
+            return 0
+
+        if not self._thread.is_alive():
+            conn = sqlite3.connect(self._db_path(), timeout=timeout) if os.path.exists(self._db_path()) else None
+            if conn is None:
+                return 0
+            try:
+                return self._delete_before_bulk(conn, symbols, boundary_ms, kind)
+            finally:
+                conn.close()
+
+        result = {}
+        done = threading.Event()
+        self._queue.put(("delete_before_bulk", symbols, boundary_ms, kind, done, result))
+        if not done.wait(timeout=timeout):
+            print(
+                f"[TICK_WRITER][WARN] delete_before_bulk timed out after {timeout}s "
+                f"waiting for writer thread",
+                flush=True,
+            )
+            return 0
+        return result.get("total", 0)
+
+    def _delete_before_bulk(self, conn, symbols: list, boundary_ms: int, kind: str) -> int:
+        total = 0
+        for symbol in symbols:
+            table = self.table_name(symbol, kind)
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone()
+                if not exists:
+                    continue
+                cur = conn.execute(f"DELETE FROM {table} WHERE ts_ms < ?", (int(boundary_ms),))
+                total += cur.rowcount
+            except Exception as exc:
+                print(f"[TICK_WRITER][WARN] delete_before_bulk({table}) failed: {exc}", flush=True)
+        conn.commit()
+        if total:
+            print(
+                f"[TICK_WRITER] delete_before_bulk: {total} row(s) across "
+                f"{len(symbols)} symbol(s), {kind}.ts_ms < {boundary_ms}",
+                flush=True,
+            )
+        return total
+
+    def delete_timestamps(self, symbol: str, timestamps, kind: str = "quote", wait: bool = True, timeout: float = 30):
+        """
+        Delete specific (possibly non-contiguous) ts_ms values from
+        quote_<symbol> (or depth_<symbol>) — used by the phantom-row
+        check to remove rows that are cached locally but weren't
+        confirmed present in the main db for the range just re-checked.
+        Unlike delete_range(), these timestamps aren't necessarily a
+        contiguous block, so they're matched individually rather than
+        with a >=/<= range.
+
+        wait=False: fire-and-forget, matching the other tick_writer
+        calls in BackfillManager's phantom-row loops — the delete is
+        still ordered correctly relative to other queued writes (same
+        queue, same single writer thread), it just doesn't block the
+        caller waiting for confirmation.
+        """
+        timestamps = [int(t) for t in timestamps]
+        if not timestamps:
+            return
+
+        if not self._thread.is_alive():
+            conn = sqlite3.connect(self._db_path(), timeout=timeout) if os.path.exists(self._db_path()) else None
+            if conn is None:
+                return
+            try:
+                self._delete_timestamps(conn, symbol, timestamps, kind)
+            finally:
+                conn.close()
+            return
+
+        done = threading.Event()
+        self._queue.put(("delete_timestamps", symbol, timestamps, kind, done))
+        if wait:
+            if not done.wait(timeout=timeout):
+                print(
+                    f"[TICK_WRITER][WARN] delete_timestamps({symbol}) timed out after "
+                    f"{timeout}s waiting for writer thread",
+                    flush=True,
+                )
+
+    def _delete_timestamps(self, conn, symbol: str, timestamps, kind: str):
+        table = self.table_name(symbol, kind)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                return
+            total_deleted = 0
+            # SQLite has a default limit (~999) on bound parameters per
+            # statement, so page the IN(...) clause instead of binding
+            # every phantom timestamp in one call.
+            page_size = 500
+            for start in range(0, len(timestamps), page_size):
+                page = timestamps[start:start + page_size]
+                placeholders = ", ".join("?" * len(page))
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE ts_ms IN ({placeholders})", page
+                )
+                total_deleted += cur.rowcount
+            conn.commit()
+            if total_deleted:
+                print(
+                    f"[TICK_WRITER] Deleted {total_deleted} phantom row(s) from {table}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] delete_timestamps({table}) failed: {exc}", flush=True)
+
+    def _delete_range(self, conn, symbol: str, start_ms: int, end_ms, kind: str):
+        table = self.table_name(symbol, kind)
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not exists:
+                return
+            clauses = ["ts_ms >= ?"]
+            params = [int(start_ms)]
+            if end_ms is not None:
+                clauses.append("ts_ms <= ?")
+                params.append(int(end_ms))
+            cur = conn.execute(f"DELETE FROM {table} WHERE {' AND '.join(clauses)}", params)
+            conn.commit()
+            if cur.rowcount:
+                print(
+                    f"[TICK_WRITER] Deleted {cur.rowcount} untrusted row(s) from "
+                    f"{table} (ts_ms >= {start_ms})",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] delete_range({table}) failed: {exc}", flush=True)
+
+    # ─────────────────────────────────────────────
+    # Retention — keep only the last N trading days
+    # ─────────────────────────────────────────────
+
+    # Prune can genuinely take a while with ~200 symbols × 2 tables each
+    # if ticks.db has accumulated multiple trading days of raw tick data
+    # — one DELETE per table, inside a single background-thread
+    # connection. Default timeout is generous and overridable via env
+    # var for slower disks / larger symbol universes.
+    DEFAULT_PRUNE_TIMEOUT_SECS = float(os.getenv("TICK_WRITER_PRUNE_TIMEOUT_SECS", "180"))
+    # How many per-symbol tables to DELETE from before committing —
+    # keeps any single transaction bounded instead of one giant
+    # transaction across all ~400 tables, and gives visible progress.
+    PRUNE_COMMIT_EVERY = 25
+
+    def prune_older_than_days(self, n_trading_days: int = 3, timeout: float = None):
+        """
+        Delete every row whose ts_ms falls before the start (00:00 IST)
+        of the n_trading_days-th most recent trading day — i.e. keep
+        exactly the last n_trading_days trading days' worth of ticks.
+        Applies to every quote_<symbol> and depth_<symbol> table.
+        Meant to be called at market close / on shutdown, not on the
+        hot write path.
+
+        Runs INSIDE the writer thread's own connection (via the queue)
+        rather than opening a second connection, so it never fights the
+        writer thread for SQLite's single-writer lock.
+
+        `timeout` bounds how long THIS CALL waits for the writer thread
+        to finish — it does not cancel the prune itself. If it times
+        out, the writer thread keeps pruning in the background and
+        logs its own completion line when done; only the caller stops
+        waiting. Defaults to DEFAULT_PRUNE_TIMEOUT_SECS (env-tunable)
+        since with ~400 per-symbol tables this can take a while.
+        """
+        if timeout is None:
+            timeout = self.DEFAULT_PRUNE_TIMEOUT_SECS
+
+        if not self._thread.is_alive():
+            # Writer thread already stopped (e.g. called after shutdown()) —
+            # safe to use our own connection since nothing else is writing.
+            conn = sqlite3.connect(self._db_path(), timeout=timeout) if os.path.exists(self._db_path()) else None
+            if conn is None:
+                return
+            try:
+                self._prune_tables(conn, n_trading_days)
+            finally:
+                conn.close()
+            return
+
+        done = threading.Event()
+        self._queue.put(("prune", n_trading_days, done))
+        if not done.wait(timeout=timeout):
+            print(
+                f"[TICK_WRITER][WARN] prune still running after {timeout}s — "
+                f"giving up waiting, but it continues in the background and "
+                f"will log its own completion line when done",
+                flush=True,
+            )
+
+    def _prune_tables(self, conn, n_trading_days: int):
+        """Shared prune logic — always called with a connection that is
+        the ONLY writer touching the DB at that moment (either the
+        writer thread's own connection, or a fresh one after the
+        thread has stopped)."""
+        cutoff_date = trading_day_n_back(n_trading_days - 1)
+        cutoff_dt   = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=tz_kolkata)
+        cutoff_ms   = int(cutoff_dt.timestamp() * 1000)
+
+        start = time.time()
+        try:
+            tables = [
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND (name LIKE 'quote_%' OR name LIKE 'depth_%')"
+                ).fetchall()
+            ]
+            total_pruned = 0
+            for i, table in enumerate(tables, start=1):
+                cur = conn.execute(f"DELETE FROM {table} WHERE ts_ms < ?", (cutoff_ms,))
+                total_pruned += cur.rowcount
+
+                if i % self.PRUNE_COMMIT_EVERY == 0:
+                    conn.commit()
+                    print(
+                        f"[TICK_WRITER] Pruning… {i}/{len(tables)} table(s) done "
+                        f"({total_pruned} row(s) so far, "
+                        f"{time.time() - start:.1f}s elapsed)",
+                        flush=True,
+                    )
+            conn.commit()
+            print(
+                f"[TICK_WRITER] Pruned {total_pruned} row(s) across {len(tables)} table(s) "
+                f"older than {cutoff_date.isoformat()} "
+                f"(keeping last {n_trading_days} trading days, "
+                f"{time.time() - start:.1f}s total)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] prune failed: {exc}", flush=True)
+
+    # ─────────────────────────────────────────────
+    # Internals
+    # ─────────────────────────────────────────────
+
+    def _db_path(self):
+        return os.path.join(self.base_dir, self.DB_FILENAME)
+
+    def _connect(self):
+        path = self._db_path()
+        os.makedirs(self.base_dir, exist_ok=True)
+        conn = sqlite3.connect(path, timeout=15)
+        # Configured once per writer-thread lifetime, on the single
+        # writer connection — see plan item 2. synchronous=FULL is kept
+        # (not relaxed to NORMAL) so durability guarantees don't
+        # change; the throughput win instead comes from committing far
+        # less often (see COMMIT_MAX_ROWS/COMMIT_MAX_SECS), which
+        # amortizes each fsync over many more rows without weakening
+        # what a completed commit means.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.commit()
+        return conn
+
+    def _ensure_table(self, conn, table: str, kind: str):
+        if table in self._known_tables:
+            return
+        is_new_table = not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if kind == "depth":
+            level_cols_sql = ",\n                    ".join(f"{c} REAL" for c in DEPTH_LEVEL_COLUMNS)
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms    INTEGER NOT NULL,
+                    ltp      REAL,
+                    {level_cols_sql}
+                )
+            """)
+        else:
+            extra_cols_sql = ",\n                    ".join(
+                f"{c} {'INTEGER' if c in _QUOTE_EXTRA_INT_COLUMNS else 'REAL'}"
+                for c in QUOTE_EXTRA_COLUMNS
+            )
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table} (
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_ms    INTEGER NOT NULL,
+                    ltp      REAL,
+                    qty      REAL,
+                    {extra_cols_sql}
+                )
+            """)
+        # On a brand-new/empty ticks.db, defer this table's index until
+        # build_pending_indexes() is called after the initial import
+        # finishes (plan item 6) — building it row-by-row during a huge
+        # first bulk import is wasted, repeated rebalancing work with
+        # nothing querying the table yet. On an existing/incremental
+        # db, keep creating the index immediately as before, since
+        # ongoing lookups (gap detection, RAM seeding, etc.) need to
+        # stay fast throughout.
+        if self._is_fresh_db and is_new_table:
+            self._pending_index_tables.add(table)
+        else:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}(ts_ms)")
+        conn.commit()
+        self._known_tables.add(table)
+
+    def _commit_if_due(self, conn, force: bool = False):
+        """
+        Commits the currently-open transaction if `force`, or if either
+        commit-window threshold (COMMIT_MAX_ROWS / COMMIT_MAX_SECS) has
+        been hit. No-ops if nothing is pending. This is the actual
+        throughput lever — previously every _insert() committed
+        immediately (one fsync-wait per flush); now many flushes worth
+        of rows share one commit.
+        """
+        if self._pending_commit_rows == 0:
+            return
+        due = (
+            force
+            or self._pending_commit_rows >= self.COMMIT_MAX_ROWS
+            or (self._txn_started_at is not None
+                and time.time() - self._txn_started_at >= self.COMMIT_MAX_SECS)
+        )
+        if not due:
+            return
+        t0 = time.time()
+        conn.commit()
+        dt = time.time() - t0
+        self._commits_total += 1
+        self._commit_time_total += dt
+        self._last_commit_duration = dt
+        self._last_commit_rows = self._pending_commit_rows
+        self._last_txn_duration = time.time() - (self._txn_started_at or t0)
+        self._pending_commit_rows = 0
+        self._txn_started_at = None
+
+    def _note_inserted(self, n: int):
+        if n <= 0:
+            return
+        if self._txn_started_at is None:
+            self._txn_started_at = time.time()
+        self._pending_commit_rows += n
+        self._rows_written_total += n
+
+    def _build_pending_indexes(self, conn):
+        if not self._pending_index_tables:
+            return
+        for table in self._pending_index_tables:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}(ts_ms)")
+        conn.commit()
+        self._pending_index_tables.clear()
+
+    def _run(self):
+        # Detected once, before _connect() creates the file if it
+        # doesn't already exist — governs whether _ensure_table() defers
+        # index creation (plan item 6). An existing ticks.db (this
+        # process restarting against an already-populated cache) always
+        # gets indexes immediately, same as before.
+        self._is_fresh_db = not os.path.exists(self._db_path())
+
+        conn = self._connect()
+        batch = []  # list of ("live", symbol, kind, snapshot) items pending one executemany()
+        last_batch_flush = time.time()   # groups live snapshots into one insert call
+        self._pending_commit_rows = 0    # rows inserted but not yet committed
+        self._txn_started_at = None      # when the currently-open txn's first insert landed
+        try:
+            while True:
+                stopping = self._stop.is_set() and self._queue.empty()
+
+                if not batch and stopping:
+                    self._commit_if_due(conn, force=True)
+                    break
+
+                try:
+                    item = self._queue.get(timeout=0.25)
+                except queue.Empty:
+                    item = None
+
+                if item is not None and item[0] == "bulk":
+                    # Flush whatever live rows are pending first, so the
+                    # bulk block lands in the right relative position —
+                    # then insert the bulk rows as one contiguous,
+                    # already-ordered block. Neither call commits by
+                    # itself; both just add to the open transaction.
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    _, symbol, rows, kind = item
+                    self._note_inserted(self._flush_bulk(conn, symbol, rows, kind))
+                elif item is not None and item[0] == "prune":
+                    # These are rare, explicit operations — commit
+                    # whatever's pending first (flush live rows into the
+                    # same txn, then commit) so they run against fully
+                    # durable state, then commit their own work
+                    # immediately too rather than leaving it open.
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    _, n_trading_days, done_event = item
+                    self._prune_tables(conn, n_trading_days)
+                    done_event.set()
+                elif item is not None and item[0] == "delete_range":
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    _, symbol, start_ms, end_ms, kind, done_event = item
+                    self._delete_range(conn, symbol, start_ms, end_ms, kind)
+                    done_event.set()
+                elif item is not None and item[0] == "delete_before_bulk":
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    _, symbols, boundary_ms, kind, done_event, result = item
+                    result["total"] = self._delete_before_bulk(conn, symbols, boundary_ms, kind)
+                    done_event.set()
+                elif item is not None and item[0] == "delete_timestamps":
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    _, symbol, timestamps, kind, done_event = item
+                    self._delete_timestamps(conn, symbol, timestamps, kind)
+                    done_event.set()
+                elif item is not None and item[0] == "barrier":
+                    # Flush pending live rows first, then force a commit
+                    # — the barrier's whole guarantee (see
+                    # flush_and_wait()'s docstring) is that everything
+                    # queued before it is DURABLE by the time it fires,
+                    # not just inserted into an open transaction.
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    _, done_event = item
+                    done_event.set()
+                elif item is not None and item[0] == "build_indexes":
+                    if batch:
+                        self._note_inserted(self._flush_live(conn, batch))
+                        batch = []
+                        last_batch_flush = time.time()
+                    self._commit_if_due(conn, force=True)
+                    self._build_pending_indexes(conn)
+                    _, done_event = item
+                    done_event.set()
+                elif item is not None:
+                    batch.append(item)
+
+                should_flush_batch = batch and (
+                    len(batch) >= self.BATCH_SIZE
+                    or time.time() - last_batch_flush >= self.BATCH_MAX_SECS
+                    or stopping
+                )
+                if should_flush_batch:
+                    self._note_inserted(self._flush_live(conn, batch))
+                    batch = []
+                    last_batch_flush = time.time()
+
+                # Commit-window check runs every loop iteration (cheap
+                # no-op when nothing's pending) so a burst of small
+                # queue items still gets committed within COMMIT_MAX_SECS
+                # even if no single flush call crosses COMMIT_MAX_ROWS.
+                self._commit_if_due(conn, force=stopping)
+        finally:
+            conn.close()
+
+    def _flush_live(self, conn, batch) -> int:
+        # group rows by destination table, since a single batch can mix
+        # quote and depth ticks for many different symbols
+        rows_by_table = {}   # table_name -> (kind, [row_tuple, ...])
+
+        for _, symbol, kind, snapshot in batch:
+            ts_ms = snapshot.get("timestamp")
+            if ts_ms is None:
+                continue
+            table = self.table_name(symbol, kind)
+            bucket = rows_by_table.setdefault(table, (kind, []))
+            if kind == "depth":
+                flat = {}
+                flat.update(_flatten_depth_levels(snapshot.get("bids", []), "buy"))
+                flat.update(_flatten_depth_levels(snapshot.get("asks", []), "sell"))
+                bucket[1].append(
+                    (int(ts_ms), snapshot.get("ltp"))
+                    + tuple(flat[c] for c in DEPTH_LEVEL_COLUMNS)
+                )
+            else:
+                bucket[1].append(
+                    (int(ts_ms), snapshot.get("ltp"), snapshot.get("qty"))
+                    + tuple(
+                        _safe_bigint(snapshot.get(c), table=table, col=c) if c in _QUOTE_EXTRA_INT_COLUMNS
+                        else snapshot.get(c)
+                        for c in QUOTE_EXTRA_COLUMNS
+                    )
+                )
+
+        n = 0
+        for table, (kind, rows) in rows_by_table.items():
+            self._ensure_table(conn, table, kind)
+            n += self._insert(conn, table, kind, rows)
+        return n
+
+    def _flush_bulk(self, conn, symbol, rows_in, kind="quote") -> int:
+        # BackfillManager's quote path can now hand this a DataFrame
+        # instead of a list of dicts (see enqueue_backfill_rows'
+        # docstring) — this class still processes rows as dicts, so
+        # adapt here rather than rewriting the loops below. Only
+        # exercised if the SQLite backend is the one actually in use.
+        if isinstance(rows_in, pd.DataFrame):
+            rows_in = rows_in.to_dict("records")
+        table = self.table_name(symbol, kind)
+        rows = []
+        if kind == "depth":
+            # rows_in items are already flat (same DEPTH_LEVEL_COLUMNS
+            # keys straight from PG, or already-flattened live rows) —
+            # no bids/asks reconstruction, no json.dumps, just pass the
+            # matching columns through.
+            for r in rows_in:
+                ts_ms = r.get("timestamp")
+                if ts_ms is None:
+                    continue
+                rows.append(
+                    (int(ts_ms), r.get("ltp"))
+                    + tuple(r.get(c) for c in DEPTH_LEVEL_COLUMNS)
+                )
+        else:
+            for r in rows_in:
+                ts_ms = r.get("timestamp")
+                if ts_ms is None:
+                    continue
+                rows.append(
+                    (int(ts_ms), r.get("ltp"), r.get("qty"))
+                    + tuple(
+                        _safe_bigint(r.get(c), table=table, col=c) if c in _QUOTE_EXTRA_INT_COLUMNS
+                        else r.get(c)
+                        for c in QUOTE_EXTRA_COLUMNS
+                    )
+                )
+        self._ensure_table(conn, table, kind)
+        return self._insert(conn, table, kind, rows)
+
+    def _insert(self, conn, table, kind, rows) -> int:
+        """
+        Executes the insert(s) for `rows` but deliberately does NOT
+        commit — see _run()'s commit-window logic (plan item 1). Pages
+        very large row lists into INSERT_PAGE_SIZE-row executemany()
+        calls (plan item 3) so one huge bulk chunk can't stall the
+        writer thread for an unresponsive stretch; all pages still land
+        in the same open transaction as everything else, so this
+        doesn't add extra commits.
+
+        Returns the number of rows actually executed (0 if `rows` is
+        empty or the insert failed).
+        """
+        if not rows:
+            return 0
+        if kind == "depth":
+            cols = "ts_ms, ltp, " + ", ".join(DEPTH_LEVEL_COLUMNS)
+            placeholders = ", ".join("?" * (2 + len(DEPTH_LEVEL_COLUMNS)))
+        else:
+            cols = "ts_ms, ltp, qty, " + ", ".join(QUOTE_EXTRA_COLUMNS)
+            placeholders = ", ".join("?" * (3 + len(QUOTE_EXTRA_COLUMNS)))
+        sql = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+        try:
+            for start in range(0, len(rows), self.INSERT_PAGE_SIZE):
+                conn.executemany(sql, rows[start:start + self.INSERT_PAGE_SIZE])
+            return len(rows)
+        except Exception as exc:
+            print(f"[TICK_WRITER][WARN] batch insert into {table} failed: {exc}", flush=True)
+            return 0
+
+
+
+import re
+import shutil
+import subprocess
+import sys
+
+import psycopg2
+import psycopg2.extras
+
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Auto-setup — installs/configures/starts a LOCAL PostgreSQL, only when
+# PG_LOCAL_HOST is localhost. Adapted from the pattern already proven
+# out for the live-mirror PgWriter; trimmed to just what this module
+# needs (one db, no history db, no multi-db loop).
+# ═════════════════════════════════════════════════════════════════════
+
+def _conn_params(dbname=None, statement_timeout_sec=10) -> dict:
+    return {
+        "host":     os.getenv("PG_LOCAL_HOST", "localhost"),
+        "port":     int(os.getenv("PG_LOCAL_PORT", "5432")),
+        "dbname":   dbname or os.getenv("PG_LOCAL_DBNAME", "tickcache"),
+        "user":     os.getenv("PG_LOCAL_USER", "tickcache"),
+        "password": os.getenv("PG_LOCAL_PASSWORD", ""),
+        "connect_timeout": 10,
+        "options": f"-c statement_timeout={statement_timeout_sec * 1000}",
+    }
+
+
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=check)
+
+
+def _sudo_read(path) -> str:
+    result = subprocess.run(["sudo", "cat", str(path)], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to read {path}: {result.stderr}")
+    return result.stdout
+
+
+def _sudo_write(path, content: str) -> None:
+    result = subprocess.run(["sudo", "tee", str(path)], input=content, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to write {path}: {result.stderr}")
+
+
+def _is_pg_installed() -> bool:
+    return shutil.which("pg_lsclusters") is not None
+
+
+def _install_pg() -> None:
+    print("[PG_LOCAL_SETUP] PostgreSQL not found — installing...", flush=True)
+    _run("sudo apt-get update -qq")
+    _run("sudo apt-get install -y postgresql postgresql-contrib")
+    print("[PG_LOCAL_SETUP] PostgreSQL installed", flush=True)
+
+
+def _detect_pg_version():
+    result = _run("pg_lsclusters", check=False)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].isdigit():
+            return parts[0]
+    return None
+
+
+def _ensure_service_running(version: str) -> None:
+    result = _run(f"sudo systemctl is-active postgresql@{version}-main", check=False)
+    if result.stdout.strip() != "active":
+        print(f"[PG_LOCAL_SETUP] Starting PostgreSQL {version}...", flush=True)
+        _run(f"sudo systemctl start postgresql@{version}-main")
+        time.sleep(2)
+
+
+def _configure_pg(version: str) -> None:
+    """Local-only db, so listen_addresses can stay at its default
+    (localhost) — unlike the live-mirror PgWriter, this deliberately
+    does NOT open listen_addresses='*' or add a 0.0.0.0/0 pg_hba.conf
+    rule, since nothing outside this machine should ever need to reach
+    it. Only pg_hba.conf gets a scoped local-only entry."""
+    from pathlib import Path
+    hba_path = Path(f"/etc/postgresql/{version}/main/pg_hba.conf")
+    user = os.getenv("PG_LOCAL_USER", "tickcache")
+    dbname = os.getenv("PG_LOCAL_DBNAME", "tickcache")
+    hba_text = _sudo_read(hba_path)
+    needed = f"host    {dbname}    {user}    127.0.0.1/32    scram-sha-256\n"
+    if needed.strip() not in hba_text:
+        _sudo_write(hba_path, hba_text + "\n" + needed)
+        print("[PG_LOCAL_SETUP] pg_hba.conf updated (localhost-only)", flush=True)
+
+
+def _create_user_and_db() -> None:
+    user = os.getenv("PG_LOCAL_USER", "tickcache")
+    password = os.getenv("PG_LOCAL_PASSWORD", "")
+    dbname = os.getenv("PG_LOCAL_DBNAME", "tickcache")
+    safe_pw = password.replace("'", "''")
+    safe_user = _quote_ident(user)
+
+    def _psql(sql: str):
+        return subprocess.run(["sudo", "-u", "postgres", "psql", "-c", sql], capture_output=True, text=True)
+
+    result = _psql(f"CREATE USER {safe_user} WITH PASSWORD '{safe_pw}'")
+    if "already exists" in result.stderr:
+        _psql(f"ALTER USER {safe_user} WITH PASSWORD '{safe_pw}'")
+    else:
+        print(f"[PG_LOCAL_SETUP] user '{user}' created", flush=True)
+
+    safe_dbname = _quote_ident(dbname)
+    result = _psql(f"CREATE DATABASE {safe_dbname} OWNER {safe_user}")
+    if "already exists" not in result.stderr:
+        print(f"[PG_LOCAL_SETUP] database '{dbname}' created", flush=True)
+    _psql(f"GRANT ALL PRIVILEGES ON DATABASE {safe_dbname} TO {safe_user}")
+
+
+def _restart_pg(version: str) -> None:
+    result = subprocess.run(
+        f"sudo systemctl restart postgresql@{version}-main", shell=True, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"PostgreSQL restart failed: {result.stderr.strip()}")
+    time.sleep(2)
+
+
+def auto_setup() -> dict:
+    """
+    Returns conn_params dict for psycopg2.connect(**params). Only runs
+    install/configure steps when PG_LOCAL_HOST is localhost/127.0.0.1 —
+    a genuinely remote PG_LOCAL_HOST (someone repurposing this module
+    against a real server) is left completely alone.
+
+    Fast path: if a connection already succeeds, every install/configure
+    step below is skipped — this is why setup is instant on every run
+    after the very first one.
+
+    First-run prerequisite: the install/configure steps below shell out
+    to `sudo`. If your user needs an interactive password for sudo, run
+    this the FIRST time directly in a terminal (not backgrounded/under a
+    process manager) — sudo will prompt on your actual terminal (via
+    /dev/tty) the first time it's needed, then cache that credential for
+    ~15 minutes, so every later sudo call in this same setup run reuses
+    it silently. For unattended restarts before Postgres exists yet,
+    passwordless sudo (scoped to just these commands, not blanket
+    NOPASSWD:ALL) is the robust long-term answer instead.
+    """
+    host = os.getenv("PG_LOCAL_HOST", "localhost")
+    params = _conn_params()
+
+    if host not in ("localhost", "127.0.0.1"):
+        print("[PG_LOCAL_SETUP] Remote PG_LOCAL_HOST — skipping auto-setup", flush=True)
+        return params
+
+    try:
+        conn = psycopg2.connect(**params)
+        conn.close()
+        print("[PG_LOCAL_SETUP] Local PostgreSQL already running and connectable", flush=True)
+        return params
+    except Exception:
+        pass
+
+    print("[PG_LOCAL_SETUP] Starting local PostgreSQL auto-setup...", flush=True)
+    if not _is_pg_installed():
+        _install_pg()
+
+    version = _detect_pg_version()
+    if not version:
+        raise RuntimeError("[PG_LOCAL_SETUP] Could not detect PostgreSQL version")
+    print(f"[PG_LOCAL_SETUP] Detected PostgreSQL version: {version}", flush=True)
+
+    _ensure_service_running(version)
+    _configure_pg(version)
+    _create_user_and_db()
+    _restart_pg(version)
+
+    for attempt in range(1, 6):
+        try:
+            conn = psycopg2.connect(**params)
+            conn.close()
+            print("[PG_LOCAL_SETUP] Setup complete — connection verified", flush=True)
+            return params
+        except Exception as exc:
+            print(f"[PG_LOCAL_SETUP] Connection attempt {attempt}/5: {exc}", flush=True)
+            time.sleep(3)
+
+    raise RuntimeError("[PG_LOCAL_SETUP] Setup completed but connection still failing")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# PostgresTickWriter — same public interface as SQLiteTickWriter above,
+# selected via the TickWriter() factory function below based on
+# TICK_WRITER_BACKEND.
+# ═════════════════════════════════════════════════════════════════════
+
+class PostgresTickWriter:
+    """
+    Drop-in replacement for SQLiteTickWriter above — never instantiate
+    this directly, use the TickWriter() factory function so the same
+    `from tick_writer import TickWriter` callers everywhere else in the
+    codebase don't need to know or care which backend is active. Same
+    method names, same argument shapes, same return shapes (read_ticks()
+    returns the identical flat-dict format).
+
+    ── Live writer: a single dedicated thread, not sharded ──────────────
+    Live tick volume is naturally rate-limited by the market feed itself
+    (unlike backfill's "dump months of history at once" pattern), so it
+    doesn't need Postgres's MVCC-driven cross-table concurrency the way
+    bulk backfill throughput does — one thread comfortably keeps up.
+    Live ticks for EVERY symbol flow through one queue (self._live_queue),
+    one dedicated thread (_run_live()), one connection. Ordering per
+    symbol is trivially guaranteed (single thread, natural queue order) —
+    simpler than the shard-hash scheme below, which now exists purely
+    for bulk/backfill throughput.
+
+    Bulk shard threads ALSO help drain this same queue the moment their
+    own bulk queue is empty — see _help_drain_live_queue(), called from
+    _run_bulk()'s idle branch. This is what makes "every worker writes
+    live ticks only once backfill is done" happen with zero explicit
+    mode switch: the instant a shard's bulk queue runs dry (permanently,
+    for every shard, the moment the day's backfill finishes), it starts
+    helping the dedicated live thread on every subsequent idle
+    iteration for the rest of the session. Safe because Postgres's MVCC
+    tolerates concurrent writers to one table fine, and nothing
+    downstream depends on cross-thread write order (every read path
+    already does ORDER BY timestamp off each row's own column).
+
+    ── Bulk writer pool: still sharded ──────────────────────────────────
+    Every symbol is routed to exactly ONE bulk shard for its entire
+    lifetime (via a deterministic hash — see _shard_for()), so all of
+    one symbol's BACKFILL rows always pass through the SAME queue,
+    processed by the SAME single thread, in arrival order. Postgres's
+    MVCC lets genuinely concurrent writes to DIFFERENT tables proceed
+    without blocking each other, unlike SQLite's single file-level write
+    lock, so a pool is a real throughput lever here — this is where it
+    actually matters, unlike the live path above.
+
+    ── Live vs. backfill tables ─────────────────────────────────────────
+    Unlike SQLiteTickWriter, live and backfilled ticks are written into
+    physically SEPARATE tables — quote_<symbol>_live / quote_<symbol>_backfill
+    (and depth_<symbol>_live / depth_<symbol>_backfill) — see table_name().
+    _flush_live() always targets the "_live" table, _flush_bulk() (fed by
+    enqueue_backfill_rows(), always called via BackfillManager) always
+    targets the "_backfill" table.
+
+    This removes the ordering race hold()/release() used to guard
+    against: that gate existed only because live and backfilled rows
+    used to share ONE table's timeline, so a live tick landing before an
+    earlier-timestamped historical row (still in flight from Postgres)
+    would have corrupted max_ts()'s "what's already cached" resume-point
+    logic. With separate tables there's no shared timeline to corrupt —
+    live ticks can be written the instant they arrive, with zero wait on
+    backfill. hold()/release() are kept as no-ops purely so this class
+    stays a drop-in replacement for SQLiteTickWriter (which still needs
+    them) — callers (engine_runtime.py) don't need to know or care which
+    backend is active.
+
+    Read methods (max_ts(), read_ticks(), delete_range(),
+    delete_timestamps()) default to source="backfill", matching what
+    BackfillManager's own cache-check / gap-detection / resume-point
+    logic actually needs — it must only ever see its own backfilled
+    history, never live ticks, or it could wrongly conclude a date range
+    is already covered and silently skip re-fetching a real gap. Pass
+    source="live" explicitly for anything that needs the live table
+    instead, or read both tables and UNION them for a combined
+    live+backfill view (e.g. building candles from full tick history).
+
+    ── RAM ceiling kept from multiplying by pool size ──────────────────
+    BULK_QUEUE_MAXSIZE and COMMIT_MAX_ROWS (bulk side) are divided by
+    the bulk pool size (see __init__) so the AGGREGATE worst-case bulk
+    backlog across every shard stays roughly where a single writer's
+    ceiling was, instead of silently multiplying by 9x just because
+    there are 9 bulk queues/9 open transactions now. LIVE_QUEUE_MAXSIZE
+    is NOT divided — there's only one live queue now, so it gets the
+    full ceiling.
+
+    ── Cross-pool maintenance ops ────────────────────────────────────────
+    flush_and_wait() fans a barrier out to every bulk shard AND the
+    live queue, waiting for all of them. build_pending_indexes()/
+    prune_older_than_days() are DB-wide operations (not per-symbol), so
+    they call flush_and_wait() first (ensuring every shard's AND the
+    live thread's pending work is durable), then run once against bulk
+    shard 0's connection only — no need to run them once per
+    shard/thread, any single connection can CREATE INDEX / DELETE across
+    every table in the database.
+    """
+
+    BATCH_SIZE       = 100
+    BATCH_MAX_SECS   = 1.0
+    COMMIT_MAX_ROWS  = 50_000   # aggregate target across the whole pool — see __init__
+    COMMIT_MAX_SECS  = 1.0
+    INSERT_PAGE_SIZE = 10_000
+    BULK_QUEUE_MAXSIZE = 40     # aggregate target across the whole pool — see __init__
+    LIVE_QUEUE_MAXSIZE = 4_500  # aggregate target — separate pool from bulk, see class docstring.
+    # Raised from 200 -> 4,500 (was ~22/shard, now ~500/shard): a live
+    # tick item is a small dict, cheap to hold, and this is real
+    # headroom against genuine burstiness (quote+depth ticks for busy
+    # symbols landing close together) — the earlier size was tuned
+    # assuming steady arrival, which real market data isn't. Combined
+    # with the GIL-priority backpressure below (the actual root cause —
+    # see _yield_to_live_if_pressured()'s docstring), this is
+    # defense-in-depth, not the primary fix.
+    WRITER_POOL_SIZE = 9        # overridable via PG_LOCAL_WRITER_THREADS
+
+    # ── Live-writer GIL priority ──────────────────────────────────────
+    # CPython's GIL round-robins every RUNNABLE thread roughly equally
+    # by default — it has no concept of "this thread matters more".
+    # With WRITER_POOL_SIZE (9) bulk shard threads plus 1 live thread
+    # all runnable at once during a big concurrent backfill, the live
+    # thread only ever gets ~1/10th of available CPU turns purely by
+    # chance, even though it does far less total work per tick. That
+    # GIL/CPU starvation — not a queue-capacity problem, and not a DB
+    # lock (live and bulk write to entirely separate tables via
+    # entirely separate connections, see class docstring) — is what
+    # let the live queue's drain rate fall behind live tick arrival
+    # rate during a large backfill, producing "LIVE queue full" drops.
+    #
+    # Two levers, both applied, neither needing elevated OS privileges
+    # (real per-thread OS priority/SCHED_FIFO would need CAP_SYS_NICE
+    # and risks destabilizing the whole box if misused — not worth it
+    # for what's fundamentally a Python-level scheduling problem):
+    #
+    #   1. sys.setswitchinterval() lowered in __init__ — a process-wide
+    #      knob controlling how long any one thread can hold the GIL
+    #      before CPython checks whether another thread wants a turn.
+    #      Lower means the live thread waits less, worst-case, for its
+    #      next turn during any single bulk thread's CPU-bound stretch
+    #      (row/dict prep, JSON encoding) — a small, safe global tweak
+    #      that helps ALL threads' fairness, live included.
+    #   2. _yield_to_live_if_pressured() below — the real fix. Every
+    #      bulk shard thread checks the live queue's fill level between
+    #      items and voluntarily sleeps (proportional to how pressured
+    #      it is) before grabbing its next one, explicitly handing GIL
+    #      turns to the live thread exactly when it needs them. Costs
+    #      bulk throughput NOTHING when the live queue isn't under
+    #      pressure — it returns immediately below the threshold.
+    #
+    # This is NOT a mathematical guarantee of literally zero drops
+    # under any circumstance (e.g. Postgres itself being unreachable
+    # would stall the live thread regardless of how much GIL time it
+    # gets) — but it directly targets the actual mechanism that caused
+    # the drops seen in practice, and should eliminate them for the
+    # "big backfill running concurrently with live feed" scenario this
+    # was built for.
+    _LIVE_PRESSURE_THRESHOLD      = 0.5    # start backing bulk off once live queue is >50% full
+    _LIVE_PRESSURE_MAX_SLEEP_SECS = 0.02   # full-pressure pause per bulk item, per shard (20ms)
+    _GIL_SWITCH_INTERVAL_SECS     = 0.001  # default is 0.005s
+
+    # Below this, a lone dribbling live tick isn't worth 9 threads
+    # constantly interrupting real bulk work to go check on it — see
+    # _run_bulk()'s "live priority" check at the top of its loop. Above
+    # it, a genuine backlog exists and every bulk shard proactively
+    # peels off a chunk before touching its own next bulk item, rather
+    # than waiting until it happens to be fully idle.
+    _LIVE_PROACTIVE_DRAIN_MIN_QSIZE = 5
+
+    # Statement timeout (ms) for CREATE INDEX calls in _ensure_table()'s
+    # existing-table branch and _build_pending_indexes() — both build an
+    # index on a table that can already hold a large, unindexed backlog
+    # (most commonly one deferred here on a past run — see
+    # _ensure_table()'s comment — that never got picked up by
+    # build_pending_indexes() until now). That's a real full-table scan
+    # + sort, which can easily exceed the connection's normal write-path
+    # statement_timeout (10s default, sized for fast inserts) and throw
+    # QueryCanceled — which, uncaught, used to be able to kill an entire
+    # bulk-writer thread (see _run_bulk()'s catch-all comments).
+    _DDL_STATEMENT_TIMEOUT_MS = 120_000
+
+    # Statement timeout (ms) applied to open_read_connection()'s
+    # connection — see that method's docstring. This connection is only
+    # used for background cache-check queries (max_ts_batch/
+    # read_ticks_batch), never anything latency-sensitive, so it's set
+    # generously rather than inheriting a tight server-side default
+    # meant for normal query traffic.
+    _BACKGROUND_STATEMENT_TIMEOUT_MS = 120_000
+
+    def __init__(self):
+        self._params = auto_setup()
+
+        # See "Live-writer GIL priority" above — process-wide, safe,
+        # done once here since PostgresTickWriter is effectively a
+        # singleton per process.
+        sys.setswitchinterval(self._GIL_SWITCH_INTERVAL_SECS)
+
+        self.pool_size = max(1, int(os.getenv("PG_LOCAL_WRITER_THREADS", str(self.WRITER_POOL_SIZE))))
+
+        # Divided by BULK pool size only — see class docstring's "RAM
+        # ceiling" section. Floored so a large pool_size can't shrink
+        # this to something degenerate (e.g. a queue that can't even
+        # hold one bulk chunk).
+        self._bulk_queue_maxsize_per_shard = max(4, self.BULK_QUEUE_MAXSIZE // self.pool_size)
+        self._commit_max_rows_per_shard    = max(1_000, self.COMMIT_MAX_ROWS // self.pool_size)
+
+        self._bulk_queues = [queue.Queue(maxsize=self._bulk_queue_maxsize_per_shard) for _ in range(self.pool_size)]
+        # Single dedicated live queue/thread — not sharded, not divided
+        # across pool_size. See class docstring's "Live writer" section.
+        self._live_queue = queue.Queue(maxsize=self.LIVE_QUEUE_MAXSIZE)
+        self._stop   = threading.Event()
+
+        # No hold/release buffering state — see class docstring's "Live
+        # vs. backfill tables" section. hold()/release() below are kept
+        # as no-ops purely for drop-in compatibility with
+        # SQLiteTickWriter, which still needs the gate.
+
+        # Per-BULK-shard state — each dict is only ever mutated by its
+        # OWN shard thread (inside _run_bulk(shard_idx)), so no locking
+        # is needed for any of these; get_metrics() only READS them.
+        self._shard_state = [
+            {
+                "known_tables":         set(),
+                "pending_commit_rows":  0,
+                "txn_started_at":       None,
+                "rows_written_total":   0,
+                "commits_total":        0,
+                "commit_time_total":    0.0,
+                "last_commit_duration": 0.0,
+                "last_commit_rows":     0,
+                "last_txn_duration":    0.0,
+            }
+            for _ in range(self.pool_size)
+        ]
+
+        # Live thread's own state — same shape as one bulk shard's, but
+        # a single dict since there's only one live thread. Only ever
+        # mutated by _run_live(); get_metrics() only reads it.
+        self._live_state = {
+            "known_tables":         set(),
+            "pending_commit_rows":  0,
+            "txn_started_at":       None,
+            "rows_written_total":   0,
+            "commits_total":        0,
+            "commit_time_total":    0.0,
+            "last_commit_duration": 0.0,
+            "last_commit_rows":     0,
+            "last_txn_duration":    0.0,
+        }
+
+        # SHARED across bulk shards (a table can only ever be created by
+        # the one shard that owns its symbol, but build_pending_indexes()
+        # needs to see every shard's pending tables, not just shard 0's)
+        # — writes are rare (once per symbol, at first table creation),
+        # so a simple lock is more than sufficient, no contention risk.
+        self._pending_index_tables = set()
+        self._pending_index_lock   = threading.Lock()
+
+        # Serializes table/index CREATION specifically (a much narrower
+        # scope than _pending_index_lock above, which only guards the
+        # pending-tables SET). Postgres's "CREATE TABLE IF NOT EXISTS"
+        # is NOT actually atomic across concurrent sessions — two
+        # bulk-writer threads can both pass the "doesn't exist yet"
+        # check and then both attempt the real DDL at the same instant,
+        # which Postgres's catalog can't reconcile (surfaces as
+        # UniqueViolation on pg_type's own unique index, since every
+        # table implicitly creates a matching row there) — or, even
+        # when creating two DIFFERENT tables, two threads' CREATE
+        # TABLE/CREATE INDEX can deadlock against each other over
+        # shared catalog locks. Both only ever showed up when many
+        # symbols' tables are being created for the first time
+        # near-simultaneously (startup on a fresh/partially-fresh db);
+        # once a table exists, _ensure_table's own known_tables/
+        # pg_tables checks make every later call on it a fast no-op
+        # that never reaches this lock's body at all. All bulk-writer
+        # shards are threads in this one process (see the traceback
+        # this was added for — "Thread pg-bulk-writer-N" frames), so a
+        # plain Lock genuinely serializes every shard's DDL against
+        # every other's, not just its own.
+        self._ddl_lock = threading.Lock()
+
+        # Detected ONCE, up front, via a single throwaway connection —
+        # not per-shard — so every shard/thread agrees on whether this
+        # is a fresh db, and so nothing independently races to query
+        # pg_tables at startup.
+        self._is_fresh_db = self._detect_fresh_db()
+
+        self._metrics_started_at = time.time()
+        self._dropped_live_ticks = 0  # only ever touched from the event-loop thread — see enqueue_live()/release()
+
+        self._threads = []
+        for i in range(self.pool_size):
+            # Shard index passed as an explicit thread argument, NOT
+            # captured via a closure over the loop variable — the
+            # classic "every thread sees the same final value of a
+            # loop variable" bug. threading.Thread(args=(i,)) binds the
+            # value of i at Thread-creation time, so each thread gets
+            # its own correct, fixed shard index.
+            t = threading.Thread(target=self._run_bulk, name=f"pg-bulk-writer-{i}", args=(i,), daemon=True)
+            t.start()
+            self._threads.append(t)
+
+        self._live_thread = threading.Thread(target=self._run_live, name="pg-live-writer", daemon=True)
+        self._live_thread.start()
+        self._threads.append(self._live_thread)
+
+    def _detect_fresh_db(self) -> bool:
+        conn = None
+        try:
+            conn = psycopg2.connect(**self._params)
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'quote_%%' LIMIT 1")
+            return cur.fetchone() is None
+        except Exception:
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _shard_for(self, symbol: str) -> int:
+        """
+        Deterministic (NOT Python's randomized built-in hash()) so a
+        given symbol always maps to the same shard for the lifetime of
+        this process — required for the ordering guarantee. Doesn't
+        need to be stable ACROSS restarts (a symbol landing on a
+        different shard after a restart doesn't corrupt anything —
+        shards don't own data, tables do, and every shard writes to the
+        same shared set of tables), only within one running process.
+        """
+        return zlib.crc32(symbol.encode()) % self.pool_size
+
+    # ─────────────────────────────────────────────
+    # Live tick ingestion — mirrors TickWriter.enqueue_live() exactly,
+    # including the non-blocking put_nowait(): this runs synchronously
+    # on the asyncio event loop (OhlcEngine.run()/DepthStore.run()),
+    # so it must never block on a full queue. Routed to the symbol's
+    # shard queue only — other shards are entirely unaffected if this
+    # one particular symbol's shard is momentarily full.
+    # ─────────────────────────────────────────────
+
+    def enqueue_live(self, symbol: str, kind: str, snapshot: dict):
+        try:
+            self._live_queue.put_nowait(("live", symbol, kind, dict(snapshot)))
+        except queue.Full:
+            self._dropped_live_ticks += 1
+            if self._dropped_live_ticks == 1 or self._dropped_live_ticks % 500 == 0:
+                print(
+                    f"[PG_LOCAL_WRITER][WARN] LIVE queue full — dropped live tick "
+                    f"for {symbol} ({self._dropped_live_ticks} dropped total)",
+                    flush=True,
+                )
+
+    def hold(self):
+        """No-op — live and backfill write to separate tables now, so
+        there's no ordering race left to guard against. Kept only so
+        this class stays a drop-in replacement for SQLiteTickWriter
+        (which still needs a real gate) — see class docstring."""
+        pass
+
+    # Back-compat alias, matching TickWriter's — nothing in this repo
+    # currently calls it, kept only so PostgresTickWriter is a true
+    # drop-in.
+    def enqueue(self, symbol: str, snapshot: dict):
+        self.enqueue_live(symbol, "depth", snapshot)
+
+    def release(self):
+        """No-op — see hold()."""
+        pass
+
+    # ─────────────────────────────────────────────
+    # Bulk catch-up ingestion — same signature as
+    # TickWriter.enqueue_backfill_rows(), including the blocking put():
+    # safe here because BackfillManager always calls this via
+    # asyncio.to_thread(), never directly on the event loop. Routed to
+    # its own dedicated BULK queue, entirely separate from the LIVE
+    # queue above — a busy catch-up job filling this queue can never
+    # crowd out live ticks, since they're not competing for the same
+    # slots anymore (see class docstring + __init__ for why this split
+    # exists: it's what a shared queue got wrong during mid-session
+    # auto-heal after a websocket reconnect).
+    # ─────────────────────────────────────────────
+
+    def enqueue_backfill_rows(self, symbol: str, rows: list, kind: str = "quote"):
+        """`rows` is either a list of dicts or a pandas DataFrame — see
+        _backfill_rows_empty/_backfill_rows_for_queue's docstrings for
+        why each needs different handling. _flush_bulk() (this class's
+        version) expects and works directly on a DataFrame; if a list
+        of dicts arrives instead, it gets turned into one there via
+        pd.DataFrame(rows_in), same as before."""
+        if _backfill_rows_empty(rows):
+            return
+        self._bulk_queues[self._shard_for(symbol)].put(("bulk", symbol, _backfill_rows_for_queue(rows), kind))
+
+    def flush_and_wait(self, timeout: float = 120):
+        """
+        Fans a barrier out to every BULK shard's queue AND the single
+        live queue, and waits for all of them — guarantees everything
+        queued before this call, on any of them, is committed by the
+        time it returns. They run concurrently, so the real wall-clock
+        cost is bounded by the slowest one, not the sum of all of them.
+        """
+        events = []
+        for q in list(self._bulk_queues) + [self._live_queue]:
+            done = threading.Event()
+            q.put(("barrier", done))
+            events.append(done)
+        all_ok = True
+        for done in events:
+            if not done.wait(timeout=timeout):
+                print(f"[PG_LOCAL_WRITER][WARN] flush_and_wait timed out after {timeout}s on one queue", flush=True)
+                all_ok = False
+        return all_ok
+
+    def build_pending_indexes(self, timeout: float = 300):
+        """DB-wide op — flush every shard first so nothing's still
+        in-flight, then build every pending index (across ALL shards'
+        contributions to the shared _pending_index_tables set) using
+        just shard 0's connection."""
+        self.flush_and_wait(timeout=timeout)
+        done = threading.Event()
+        self._bulk_queues[0].put(("build_indexes", done))
+        if not done.wait(timeout=timeout):
+            print(f"[PG_LOCAL_WRITER][WARN] build_pending_indexes timed out after {timeout}s", flush=True)
+        return done.is_set()
+
+    def delete_range(self, symbol: str, start_ms: int, end_ms=None, kind: str = "quote", source: str = "backfill", timeout: float = 30):
+        done = threading.Event()
+        self._bulk_queues[self._shard_for(symbol)].put(("delete_range", symbol, start_ms, end_ms, kind, source, done))
+        if not done.wait(timeout=timeout):
+            print(f"[PG_LOCAL_WRITER][WARN] delete_range({symbol}) timed out", flush=True)
+
+    # Chunk size for delete_before_bulk()'s per-batch DO blocks — see
+    # that method's docstring for why this exists.
+    _DELETE_BEFORE_BULK_BATCH_SIZE = 20
+
+    # statement_timeout (ms) for delete_before_bulk()'s dedicated
+    # connection — see that method's docstring.
+    _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS = 120_000
+
+    def _log_blocking_chain(self, batch_symbols: list):
+        """
+        Best-effort diagnostic for delete_before_bulk() timeouts/errors.
+
+        A lock wait and a genuinely slow scan raise the exact same
+        exception text from psycopg2, so the except block alone can't
+        tell you which one happened — and by the time someone opens a
+        SQL client to check pg_stat_activity/pg_locks by hand, the
+        blocking transaction has usually already committed or rolled
+        back and the window to see it is gone. This runs immediately,
+        on its own short-lived connection (the caller's connection may
+        itself be mid-rollback), so whatever chain existed at the
+        moment of failure gets into the logs rather than lost.
+
+        Deliberately swallows every exception here — a failed
+        diagnostic must never mask or replace the real error that
+        triggered it.
+        """
+        try:
+            diag_conn = psycopg2.connect(**self._params)
+        except Exception:
+            return
+        try:
+            diag_cur = diag_conn.cursor()
+            diag_cur.execute("SET statement_timeout = 5000")
+            diag_cur.execute("""
+                SELECT
+                    blocked.pid            AS blocked_pid,
+                    blocked_act.query      AS blocked_query,
+                    blocking.pid           AS blocking_pid,
+                    blocking_act.state     AS blocking_state,
+                    blocking_act.query     AS blocking_query,
+                    blocking_act.xact_start AS blocking_xact_start
+                FROM pg_locks blocked
+                JOIN pg_stat_activity blocked_act ON blocked_act.pid = blocked.pid
+                JOIN pg_locks blocking
+                    ON blocking.locktype = blocked.locktype
+                    AND blocking.database IS NOT DISTINCT FROM blocked.database
+                    AND blocking.relation IS NOT DISTINCT FROM blocked.relation
+                    AND blocking.pid != blocked.pid
+                    AND blocking.granted
+                JOIN pg_stat_activity blocking_act ON blocking_act.pid = blocking.pid
+                WHERE NOT blocked.granted
+            """)
+            rows = diag_cur.fetchall()
+            if rows:
+                print(
+                    f"[PG_LOCAL_WRITER][WARN] delete_before_bulk blocking chain "
+                    f"for batch {batch_symbols[:5]}{'...' if len(batch_symbols) > 5 else ''}:",
+                    flush=True,
+                )
+                for blocked_pid, blocked_q, blocking_pid, blocking_state, blocking_q, blocking_xact_start in rows:
+                    print(
+                        f"    blocked pid={blocked_pid} query={blocked_q!r} <- "
+                        f"blocked BY pid={blocking_pid} state={blocking_state} "
+                        f"xact_start={blocking_xact_start} query={blocking_q!r}",
+                        flush=True,
+                    )
+            else:
+                print(
+                    "[PG_LOCAL_WRITER][WARN] delete_before_bulk failed but no blocking "
+                    "chain found at diagnostic time (lock, if any, already cleared) — "
+                    "likely a genuinely slow statement rather than a lock wait",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] blocking-chain diagnostic itself failed: {exc}", flush=True)
+        finally:
+            try:
+                diag_conn.close()
+            except Exception:
+                pass
+
+    def delete_before_bulk(self, symbols: list, boundary_ms: int, kind: str = "quote") -> int:
+        """
+        Prune every symbol's raw ticks older than boundary_ms — not one
+        delete_range() call per symbol (which is 2 network round trips
+        per symbol, dispatched one at a time through each symbol's
+        shard queue). Used by BackfillManager.sync_1m_candle_cache()'s
+        Tier-1/Tier-2 daily rollover, once every rollover day for a
+        batch of symbols is confirmed already captured in
+        candle1m_<symbol> — see that method's docstring.
+
+        Runs one PL/pgSQL DO block per BATCH of symbols (see
+        _DELETE_BEFORE_BULK_BATCH_SIZE), each looping over BOTH the
+        _live and _backfill table for every symbol in that batch,
+        server-side, inside its own transaction — one round trip from
+        Python per batch rather than per symbol. to_regclass() skips
+        any table that doesn't exist instead of erroring the whole
+        batch (a symbol might only ever have had a live table, or only
+        a backfill table, or neither yet).
+
+        Batching (rather than one DO block for every symbol at once)
+        exists for two reasons: it keeps any one transaction's lock
+        footprint short instead of holding locks across every symbol's
+        tables at once, and it bounds the blast radius of a
+        timeout/error to the batch it happened in — earlier batches'
+        deletes are already committed rather than rolled back with
+        everything else.
+
+        This connection also gets its own generous statement_timeout
+        (see _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS), the same
+        pattern as open_read_connection() — self._params' default
+        statement_timeout (10s, see _conn_params()) is meant for normal
+        query traffic and was cancelling this batch's DELETE mid-run
+        even with batching, since some individual tables are large
+        enough that a plain index-range delete on them alone can run
+        past 10s.
+
+        Every interpolated piece here is already trusted before it
+        reaches this string — safe_syms is sanitized via
+        _safe_symbol() (alnum/underscore only), time_col only ever
+        comes from _time_col()'s fixed "timestamp"/"ts_ms" whitelist,
+        and boundary_ms is cast to int — so this builds the full query
+        directly rather than mixing psycopg2's own %-substitution with
+        PL/pgSQL's format()/%I inside the same string (those two
+        escaping schemes fighting each other in one query is exactly
+        how this kind of thing quietly breaks).
+
+        Opens its OWN dedicated connection rather than going through
+        any shard's queue — this spans every shard's symbols at once,
+        so it doesn't belong to one shard's serialized write stream;
+        it's a one-off maintenance operation, not a per-symbol write.
+
+        Returns the total row count deleted across every table and
+        every batch that succeeded (0 on total failure — logged, never
+        raised, matching every other delete_* method's
+        fire-and-log-on-failure contract here; a batch that fails still
+        lets later batches run).
+        """
+        if not symbols:
+            return 0
+
+        safe_syms = sorted({_safe_symbol(s) for s in symbols})
+        time_col  = self._time_col(kind)
+        prefix    = f"{kind}_"
+        boundary  = int(boundary_ms)
+        batch_size = self._DELETE_BEFORE_BULK_BATCH_SIZE
+
+        try:
+            conn = psycopg2.connect(**self._params)
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] delete_before_bulk connect failed: {exc}", flush=True)
+            return 0
+
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] could not raise statement_timeout on delete_before_bulk connection: {exc}", flush=True)
+
+        grand_total = 0
+        try:
+            for i in range(0, len(safe_syms), batch_size):
+                batch = safe_syms[i:i + batch_size]
+
+                # Postgres array literal — safe because every element
+                # already passed through _safe_symbol() (alnum +
+                # underscore only, see its own docstring), so none can
+                # contain a quote/backslash to break out of this literal.
+                syms_array_sql = "ARRAY[" + ",".join(f"'{s}'" for s in batch) + "]::text[]"
+
+                do_block = f"""
+                    DO $do$
+                    DECLARE
+                        sym   TEXT;
+                        tbl   TEXT;
+                        total BIGINT := 0;
+                        n     BIGINT;
+                    BEGIN
+                        FOREACH sym IN ARRAY {syms_array_sql}
+                        LOOP
+                            FOREACH tbl IN ARRAY ARRAY['{prefix}' || sym || '_live', '{prefix}' || sym || '_backfill']
+                            LOOP
+                                IF to_regclass(tbl) IS NOT NULL THEN
+                                    EXECUTE format('DELETE FROM %I WHERE {time_col} < {boundary}', tbl);
+                                    GET DIAGNOSTICS n = ROW_COUNT;
+                                    total := total + n;
+                                END IF;
+                            END LOOP;
+                        END LOOP;
+                        RAISE NOTICE 'DELETE_BEFORE_BULK_TOTAL:%', total;
+                    END
+                    $do$;
+                """
+
+                try:
+                    conn.notices.clear()
+                    cur.execute(do_block)
+                    # NOTICE messages land in conn.notices, most recent
+                    # last — parse the total this DO block just raised,
+                    # rather than re-querying every table's count
+                    # separately.
+                    batch_total = 0
+                    for notice in reversed(conn.notices):
+                        if "DELETE_BEFORE_BULK_TOTAL:" in notice:
+                            try:
+                                batch_total = int(notice.strip().split("DELETE_BEFORE_BULK_TOTAL:")[-1].strip())
+                            except ValueError:
+                                pass
+                            break
+                    conn.commit()
+                    grand_total += batch_total
+                except Exception as exc:
+                    print(
+                        f"[PG_LOCAL_WRITER][WARN] delete_before_bulk batch "
+                        f"{i // batch_size + 1} ({len(batch)} symbol(s)) failed: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    # Capture the blocking-lock chain right now, on its
+                    # own short-lived connection — a lock-wait timeout
+                    # looks identical to a slow-scan timeout from the
+                    # exception alone, and by the time a human opens
+                    # DBeaver to check pg_stat_activity by hand the
+                    # blocking transaction has usually already
+                    # committed/rolled back and the evidence is gone.
+                    # Logged best-effort; never raised, since a failed
+                    # diagnostic shouldn't mask the real failure above.
+                    self._log_blocking_chain(batch)
+
+            if grand_total:
+                print(
+                    f"[PG_LOCAL_WRITER] delete_before_bulk: {grand_total} row(s) across "
+                    f"{len(safe_syms)} symbol(s), {kind} < {boundary}",
+                    flush=True,
+                )
+            return grand_total
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def delete_timestamps(self, symbol: str, timestamps, kind: str = "quote", source: str = "backfill", wait: bool = True, timeout: float = 30):
+        timestamps = [int(t) for t in timestamps]
+        if not timestamps:
+            return
+        done = threading.Event()
+        self._bulk_queues[self._shard_for(symbol)].put(("delete_timestamps", symbol, timestamps, kind, source, done))
+        if wait:
+            if not done.wait(timeout=timeout):
+                print(f"[PG_LOCAL_WRITER][WARN] delete_timestamps({symbol}) timed out", flush=True)
+
+    def prune_older_than_days(self, n_trading_days: int = 3, timeout=None):
+        """DB-wide op — flush every shard first, then prune once using
+        just shard 0's connection (it queries pg_tables directly for
+        every quote_%/depth_% table, not any shard's local knowledge)."""
+        self.flush_and_wait(timeout=timeout if timeout is not None else 120)
+        done = threading.Event()
+        self._bulk_queues[0].put(("prune", n_trading_days, done))
+        if timeout is not None:
+            if not done.wait(timeout=timeout):
+                print(f"[PG_LOCAL_WRITER][WARN] prune_older_than_days timed out", flush=True)
+        else:
+            done.wait()
+
+    def get_metrics(self) -> dict:
+        elapsed = max(time.time() - self._metrics_started_at, 1e-9)
+        bulk_rows_written  = sum(s["rows_written_total"] for s in self._shard_state)
+        bulk_commits_total = sum(s["commits_total"] for s in self._shard_state)
+        bulk_commit_time   = sum(s["commit_time_total"] for s in self._shard_state)
+        rows_written_total = bulk_rows_written + self._live_state["rows_written_total"]
+        commits_total       = bulk_commits_total + self._live_state["commits_total"]
+        commit_time_total   = bulk_commit_time + self._live_state["commit_time_total"]
+        bulk_queue_depth = sum(q.qsize() for q in self._bulk_queues)
+        live_queue_depth = self._live_queue.qsize()
+        return {
+            "pool_size":            self.pool_size,
+            "queue_depth":          bulk_queue_depth + live_queue_depth,
+            "bulk_queue_depth":     bulk_queue_depth,
+            "live_queue_depth":     live_queue_depth,
+            "rows_written_total":   rows_written_total,
+            "rows_per_sec_avg":     rows_written_total / elapsed,
+            "commits_total":        commits_total,
+            "avg_commit_secs":      (commit_time_total / commits_total) if commits_total else 0.0,
+            "pending_index_tables": len(self._pending_index_tables),
+            "dropped_live_ticks":   self._dropped_live_ticks,
+            "live": {
+                "queue_depth":        live_queue_depth,
+                "rows_written_total": self._live_state["rows_written_total"],
+                "commits_total":      self._live_state["commits_total"],
+                "last_commit_secs":   self._live_state["last_commit_duration"],
+                "last_commit_rows":   self._live_state["last_commit_rows"],
+                "last_txn_secs":      self._live_state["last_txn_duration"],
+            },
+            "per_bulk_shard": [
+                {
+                    "bulk_queue_depth":   self._bulk_queues[i].qsize(),
+                    "rows_written_total": s["rows_written_total"],
+                    "commits_total":      s["commits_total"],
+                    "last_commit_secs":   s["last_commit_duration"],
+                    "last_commit_rows":   s["last_commit_rows"],
+                    "last_txn_secs":      s["last_txn_duration"],
+                }
+                for i, s in enumerate(self._shard_state)
+            ],
+        }
+
+    def shutdown(self, timeout=60):
+        self._stop.set()
+        # Each thread gets a fair share of the overall timeout budget —
+        # they're shutting down concurrently (all see _stop set at
+        # roughly the same time), so this isn't "9x timeout", it's
+        # "up to timeout seconds total, checked per-thread".
+        per_thread_timeout = max(1.0, timeout / max(1, len(self._threads)))
+        deadline = time.time() + timeout
+        for t in self._threads:
+            remaining = max(0.1, deadline - time.time())
+            t.join(timeout=min(per_thread_timeout, remaining))
+        still_alive = [t.name for t in self._threads if t.is_alive()]
+        if still_alive:
+            print(f"[PG_LOCAL_WRITER][ERROR] shutdown timed out for: {', '.join(still_alive)}", flush=True)
+
+    # ─────────────────────────────────────────────
+    # Reads — separate short-lived connection, not on any writer thread,
+    # unaffected by sharding
+    # ─────────────────────────────────────────────
+
+    def table_name(self, symbol: str, kind: str, source: str = "backfill") -> str:
+        """source: 'live' or 'backfill' — see class docstring's "Live vs.
+        backfill tables" section for why these are physically separate."""
+        return f"{kind}_{_safe_symbol(symbol)}_{source}"
+
+    def read_ticks(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote",
+                    source: str = "backfill", conn=None):
+        """Same return shape as TickWriter.read_ticks(): list of dicts,
+        {"timestamp","ltp","qty"} for quote, {"timestamp","ltp",
+        <DEPTH_LEVEL_COLUMNS...>} for depth. source defaults to
+        "backfill" — see class docstring.
+
+        conn: optional pre-opened psycopg2 connection to reuse instead
+        of opening a fresh one. Callers making many calls back-to-back
+        (e.g. a per-symbol cache-check loop) should open one connection
+        up front and pass it in here to avoid paying TCP/auth setup
+        cost per call — see max_ts() below, same pattern. When conn is
+        passed in, this method never closes it; that's the caller's
+        responsibility."""
+        table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
+        if kind == "depth":
+            select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+        else:
+            select_cols = list(PG_LOCAL_QUOTE_COLUMNS)
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append(f"{time_col} >= %s")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append(f"{time_col} <= %s")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,)
+                )
+                if not cur.fetchone():
+                    return []
+                cur.execute(f"SELECT {', '.join(select_cols)} FROM {table}{where} ORDER BY {time_col}", params)
+                rows = cur.fetchall()
+            finally:
+                if own_conn:
+                    conn.close()
+            if kind == "depth":
+                out_cols = ["timestamp", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+                return [dict(zip(out_cols, r)) for r in rows]
+            # Column names already match desired output keys 1:1 (see
+            # PG_LOCAL_QUOTE_COLUMNS) — just add a derived "qty" key
+            # (from last_quantity) for backward compatibility with
+            # every existing consumer that expects one, since "qty" is
+            # no longer a stored column in this backend's quote table.
+            out = []
+            for r in rows:
+                d = dict(zip(PG_LOCAL_QUOTE_COLUMNS, r))
+                d["qty"] = 0  # last_quantity dropped upstream, see QUOTE_EXTRA_COLUMNS
+                out.append(d)
+            return out
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] read_ticks({symbol}) failed: {exc}", flush=True)
+            if conn is not None and not own_conn:
+                # This is a shared connection the caller will keep using
+                # (e.g. read_ticks_batch's bisection base case) — this
+                # whole call is read-only, so a full rollback can't lose
+                # any committed work, and it's required here: without
+                # it, the failed statement leaves the connection's
+                # transaction "aborted", and EVERY later query on it —
+                # including just creating a SAVEPOINT for an unrelated
+                # sibling chunk — fails too, cascading a single genuine
+                # timeout into a total batch failure. Confirmed in
+                # testing: one slow/large table's query timing out here
+                # otherwise took down every other symbol's result in
+                # the same read_ticks_batch() call.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return []
+
+    def read_ticks_combined(self, symbol: str, start_ms=None, end_ms=None, kind: str = "quote"):
+        """Live + backfill tables UNIONed and re-sorted by timestamp —
+        for consumers that want the full tick history regardless of
+        which table a row happens to live in (e.g. building candles
+        from raw ticks). BackfillManager's own cache-check should NOT
+        use this — it needs read_ticks(source="backfill") specifically,
+        see class docstring."""
+        live     = self.read_ticks(symbol, start_ms, end_ms, kind, source="live")
+        backfill = self.read_ticks(symbol, start_ms, end_ms, kind, source="backfill")
+        return sorted(live + backfill, key=lambda r: r["timestamp"])
+
+    def open_read_connection(self):
+        """Open a connection suitable for passing as conn= to max_ts()/
+        read_ticks() across repeated calls (e.g. a per-symbol loop),
+        so the caller pays the TCP-handshake-plus-auth cost once
+        instead of once per call. Caller owns it and must close it
+        when done.
+
+        Sets a generous statement_timeout on this connection —
+        read_ticks_batch()'s UNION ALL queries can legitimately scan a
+        lot of data across many symbols/tables at once, and this
+        connection is only ever used for background cache-check work
+        (never anything user-facing), so there's no reason to inherit
+        whatever tight server-side default statement_timeout is
+        configured for normal query traffic. Without this, a batch
+        query that's merely SLOW (not actually stuck) gets cancelled by
+        Postgres, which used to trigger a fallback to per-symbol
+        queries for the whole chunk — recreating the exact per-symbol
+        slowdown this batching was meant to fix."""
+        conn = psycopg2.connect(**self._params)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._BACKGROUND_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] could not raise statement_timeout on read connection: {exc}", flush=True)
+        return conn
+
+    def max_ts(self, symbol: str, kind: str = "quote", source: str = "backfill", conn=None):
+        """conn: optional pre-opened psycopg2 connection to reuse. Without
+        it, every call pays a fresh TCP handshake + Postgres auth
+        negotiation — fine for one-off calls, but ruinous in a tight
+        per-symbol loop (e.g. BackfillManager's Phase 1 cache-check,
+        which calls this once per symbol for ~199 symbols). Callers
+        doing that should open one connection up front, pass it in
+        here on every iteration, and close it themselves once the loop
+        is done. When conn is passed in, this method never closes it."""
+        table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,)
+                )
+                if not cur.fetchone():
+                    return None
+                cur.execute(f"SELECT MAX({time_col}) FROM {table}")
+                row = cur.fetchone()
+                return row[0] if row else None
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+            if conn is not None and not own_conn:
+                # Same reasoning as read_ticks()'s except block — a
+                # shared connection must be rolled back on failure or
+                # every later query on it (even in unrelated chunks)
+                # fails too. Read-only call, so nothing is lost.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return None
+
+    def max_ts_batch(self, symbols: list, kind: str = "quote", source: str = "backfill", conn=None) -> dict:
+        """Batched version of max_ts() for a whole symbol list — returns
+        {symbol: last_ts_ms_or_None}.
+
+        max_ts() called once per symbol in a Python loop still costs one
+        network round-trip per call even with a shared connection (199
+        round-trips for 199 symbols, each a real TCP send/recv even on
+        localhost). This does it in ~2 round-trips total regardless of
+        symbol count:
+
+          1. One "which of these tables exist" query using
+             tablename = ANY(%s) instead of 199 single-table checks.
+          2. One UNION ALL query — one `SELECT %s AS symbol,
+             MAX(ts_ms) AS max_ts FROM {table}` branch per EXISTING
+             table — executed as a single statement, chunked at
+             _BATCH_CHUNK_SIZE branches per query to keep individual
+             statements from growing unreasonably large with very big
+             symbol lists.
+
+        Table names are still interpolated directly (table_name() /
+        _safe_symbol() restrict to alnum+underscore already, same as
+        every other method here); the symbol label in each branch is
+        passed as a %s parameter, not interpolated, so it can't affect
+        the query even if a symbol ever contained unexpected characters.
+
+        ── One bad table must not blank out everyone else ──────────────
+        If ANY branch in a UNION ALL chunk fails (e.g. one symbol's
+        table has a corrupt/mismatched column type), Postgres aborts
+        the WHOLE transaction on that connection — every later query on
+        that same connection then fails too with "current transaction
+        is aborted" until a rollback happens. Since this method is
+        called with one shared connection reused across the whole
+        cache-check loop, a single broken symbol could otherwise poison
+        every OTHER symbol's result for the rest of the run (verified:
+        one corrupt table among 20 healthy ones made all 20 come back
+        as "no cached data", not just the bad one) — BackfillManager
+        would then think it needs to re-fetch everything for symbols
+        that were actually fine, and depending on timing that can leave
+        a symbol's live feed running before its backfill has caught up.
+
+        Each chunk therefore runs inside its own SAVEPOINT: if the
+        chunk's UNION ALL fails, we roll back to the savepoint (which
+        un-poisons the connection without needing a new one) and retry
+        that chunk's symbols ONE AT A TIME via max_ts(), so only the
+        genuinely broken symbol(s) get logged as failed — every healthy
+        symbol in that chunk still gets its real answer.
+        """
+        if not symbols:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
+        result = {s: None for s in symbols}
+        time_col = self._time_col(kind)
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                # Step 1: which tables actually exist — one round-trip.
+                # Wrapped in its own savepoint too: it's low-risk (just
+                # reading pg_tables, not touching per-symbol table
+                # content) but costs nothing to protect the same way.
+                cur.execute("SAVEPOINT sp_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_exist_check")
+                except Exception as exc:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                # Step 2: one UNION ALL query per chunk for MAX(ts_ms)
+                # across every existing table, each chunk isolated by
+                # its own savepoint so a bad table in one chunk can't
+                # affect other chunks OR other symbols in the same chunk.
+                _BATCH_CHUNK_SIZE = 150
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches = []
+                    params = []
+                    for s in chunk:
+                        branches.append(f"SELECT %s AS symbol, MAX({time_col}) AS max_ts FROM {table_by_symbol[s]}")
+                        params.append(s)
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_batch_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, max_ts in cur.fetchall():
+                            result[sym] = max_ts
+                        cur.execute("RELEASE SAVEPOINT sp_batch_chunk")
+                    except Exception as exc:
+                        # Un-poison the connection first, THEN fall back
+                        # — falling back without this rollback is what
+                        # made every symbol in the chunk look empty.
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_batch_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] max_ts_batch chunk failed ({exc}); "
+                            f"falling back to per-symbol checks for this chunk ({len(chunk)} symbols) "
+                            f"so only the actually-broken symbol(s) are affected",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            result[s] = self.max_ts(s, kind=kind, source=source, conn=conn)
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] max_ts_batch failed: {exc}", flush=True)
+            # Last-resort fallback if something broke before/outside the
+            # per-chunk handling above (e.g. the connection itself is
+            # bad) — a fresh connection per symbol here since the shared
+            # one may be unusable.
+            for s in symbols:
+                if result[s] is None:
+                    result[s] = self.max_ts(s, kind=kind, source=source, conn=None)
+        return result
+
+    def _session_gap_query(self, table: str, time_col: str) -> str:
+        """One symbol's branch for session_gap_batch()/_session_gap_single()
+        below. Pure server-side twin of
+        TickGapDetector.first_suspicious_gap_ms(): LAG() gets each row's
+        previous timestamp, then a single FILTER'd MIN() picks out the
+        earliest pair that's on the same IST calendar day, both inside
+        market hours, and further apart than the threshold — exactly the
+        same three conditions first_suspicious_gap_ms() checks in pandas.
+        Because rows are scanned in ts order, the smallest qualifying
+        prev_ts IS the first (chronologically earliest) suspicious gap,
+        so a plain MIN() reproduces pandas' ".iloc[0]" without needing to
+        materialize or sort anything client-side.
+
+        Also returns gap_next_ms — the timestamp of the tick immediately
+        AFTER that same gap (t.{time_col} itself on the qualifying row,
+        alongside t.prev_ts). Together, (gap_prev_ms, gap_next_ms) is the
+        exact narrow window the gap spans — callers use this to check
+        upstream for JUST that window instead of re-verifying everything
+        from gap_prev_ms all the way through to the current high-water
+        mark (see scan_local_cache()'s docstring for why that used to
+        happen and why it doesn't need to anymore).
+
+        Param order per branch: (symbol_label, threshold_ms, MARKET_OPEN,
+        MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE, start_ms).
+        """
+        return f"""
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms, agg.gap_next_ms
+            FROM (
+                SELECT
+                    MIN(t.{time_col}) AS earliest_ms,
+                    MIN(t.prev_ts) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_prev_ms,
+                    MIN(t.{time_col}) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_next_ms
+                FROM (
+                    SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
+                    FROM {table}
+                    WHERE {time_col} >= %s
+                ) t
+            ) agg
+        """
+
+    def _session_gap_single(self, symbol: str, table: str, time_col: str,
+                             threshold_ms: int, start_ms: int, conn) -> dict:
+        """Per-symbol fallback used when a chunk branch in
+        session_gap_batch() fails — same query, one table at a time."""
+        try:
+            cur = conn.cursor()
+            query = self._session_gap_query(table, time_col)
+            params = [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [int(start_ms)]
+            cur.execute(query, params)
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2], "gap_next_ms": row[3]}
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap single-symbol query for {symbol} failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None}
+
+    def session_gap_batch(self, symbols: list, kind: str = "quote", start_ms: int = 0,
+                           threshold_secs: int = 300, source: str = "backfill",
+                           conn=None) -> dict:
+        """
+        Server-side twin of TickGapDetector.first_suspicious_gap_ms(), run
+        entirely inside Postgres via the LAG() window function, so
+        BackfillManager's cache-check no longer has to pull a symbol's
+        full day of ticks (or depth snapshots) across the network just to
+        look for one silent gap. The database still scans every row —
+        that work doesn't disappear — but only a couple of small numbers
+        per symbol cross the wire instead of the whole cached range.
+
+        Returns {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None, "gap_next_ms": int|None}}
+          - earliest_ms: MIN(time_col) among rows >= start_ms, or None if
+            the table has no rows in range (used by scan_local_cache() to
+            detect a widened lookback whose leading edge was never
+            fetched — see its comment on "earliest cached row").
+          - gap_prev_ms: ts of the tick immediately before the first
+            silent same-session gap (same IST day, both ticks inside
+            market hours, gap > threshold_secs), or None if there isn't
+            one. Same value first_suspicious_gap_ms() would have returned
+            from the equivalent DataFrame.
+          - gap_next_ms: ts of the tick immediately after that same gap.
+            Together with gap_prev_ms this is the gap's exact narrow span
+            — see _session_gap_query()'s docstring.
+
+        kind selects quote_<symbol>_<source> vs depth_<symbol>_<source>
+        via table_name()/_time_col() exactly like max_ts_batch() and
+        read_ticks_batch() — this is what makes the optimization apply to
+        depth for free: scan_local_cache() already calls this generically
+        with kind="quote" or kind="depth", so depth's silent-gap check
+        gets the same network savings with no depth-specific code here.
+
+        Same batching shape as max_ts_batch(): one "which tables exist"
+        check, then one UNION ALL per chunk of _BATCH_CHUNK_SIZE symbols,
+        each isolated by its own savepoint so one bad/corrupt table can't
+        blank out the rest of the chunk — a failed branch falls back to
+        _session_gap_single() for just that symbol.
+        """
+        if not symbols:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbols}
+        time_col = self._time_col(kind)
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None} for s in symbols}
+        threshold_ms = int(threshold_secs) * 1000
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_gap_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_gap_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_gap_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                _BATCH_CHUNK_SIZE = 100
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches, params = [], []
+                    for s in chunk:
+                        branches.append(self._session_gap_query(table_by_symbol[s], time_col))
+                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.append(int(start_ms))
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_gap_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, earliest_ms, gap_prev_ms, gap_next_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms, "gap_next_ms": gap_next_ms}
+                        cur.execute("RELEASE SAVEPOINT sp_gap_chunk")
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_gap_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] session_gap_batch chunk failed ({exc}); "
+                            f"falling back to per-symbol queries for this chunk ({len(chunk)} symbols)",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            result[s] = self._session_gap_single(
+                                s, table_by_symbol[s], time_col, threshold_ms, start_ms, conn
+                            )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_batch failed: {exc}", flush=True)
+            for s in symbols:
+                if result[s]["earliest_ms"] is None and result[s]["gap_prev_ms"] is None:
+                    fresh_conn = None
+                    try:
+                        fresh_conn = psycopg2.connect(**self._params)
+                        result[s] = self._session_gap_single(
+                            s, table_by_symbol[s], time_col, threshold_ms, start_ms, fresh_conn
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        if fresh_conn is not None:
+                            fresh_conn.close()
+        return result
+
+    def _session_gap_query_combined(self, table_backfill: Optional[str], table_live: Optional[str],
+                                     time_col: str) -> tuple:
+        """
+        Same LAG()-based "first suspicious gap" logic as
+        _session_gap_query(), but scanned across the UNION of BOTH a
+        symbol's backfill AND live tables — not just one. See
+        session_gap_batch_combined()'s docstring for why: checking
+        backfill alone after a restart makes every minute of ticks
+        already captured live look like a gap needing re-fetch from
+        main db all over again.
+
+        UNION (not UNION ALL) between the two source SELECTs so a
+        timestamp landing in both tables — right at the seam where live
+        picked up before this check next runs — is only counted once;
+        doesn't change LAG's gap-size math either way, just avoids
+        double-counting a moment we already have.
+
+        This still isn't "just check the two tables' min/max and call
+        it covered" — a genuine gap CAN exist within the live table
+        itself (a WS drop that predates the priority/backpressure fixes,
+        or one on a machine that doesn't have them yet), so the LAG scan
+        runs on the merged timeline itself, catching an internal live-
+        only gap exactly the same way it already catches an internal
+        backfill-only one.
+
+        Handles a symbol having only ONE of the two tables (e.g. live
+        hasn't started writing for it yet, or backfill has never run)
+        by just scanning that one table alone — same query shape as
+        the single-table _session_gap_query(), automatically.
+
+        Returns (query_string, n_start_params) — the caller needs
+        n_start_params to know whether to supply the start_ms parameter
+        once or twice when building this branch's param list, since
+        that depends on whether both tables are actually being unioned.
+        Also returns gap_next_ms (ts of the tick right after the gap)
+        alongside gap_prev_ms — see _session_gap_query()'s docstring on
+        why callers need the narrow (gap_prev_ms, gap_next_ms) span
+        rather than just the leading edge.
+        """
+        if table_backfill and table_live:
+            source_sql = (
+                f"SELECT {time_col} FROM {table_backfill} WHERE {time_col} >= %s "
+                f"UNION "
+                f"SELECT {time_col} FROM {table_live} WHERE {time_col} >= %s"
+            )
+            n_start_params = 2
+        elif table_backfill:
+            source_sql = f"SELECT {time_col} FROM {table_backfill} WHERE {time_col} >= %s"
+            n_start_params = 1
+        else:
+            source_sql = f"SELECT {time_col} FROM {table_live} WHERE {time_col} >= %s"
+            n_start_params = 1
+
+        query = f"""
+            SELECT %s AS symbol, agg.earliest_ms, agg.gap_prev_ms, agg.gap_next_ms
+            FROM (
+                SELECT
+                    MIN(t.{time_col}) AS earliest_ms,
+                    MIN(t.prev_ts) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_prev_ms,
+                    MIN(t.{time_col}) FILTER (
+                        WHERE t.prev_ts IS NOT NULL
+                          AND (t.{time_col} - t.prev_ts) > %s
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                            = (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::date
+                          AND (to_timestamp(t.prev_ts / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                          AND (to_timestamp(t.{time_col} / 1000.0) AT TIME ZONE 'Asia/Kolkata')::time BETWEEN %s AND %s
+                    ) AS gap_next_ms
+                FROM (
+                    SELECT {time_col}, LAG({time_col}) OVER (ORDER BY {time_col}) AS prev_ts
+                    FROM ({source_sql}) src
+                ) t
+            ) agg
+        """
+        return query, n_start_params
+
+    def _session_gap_single_combined(self, symbol: str, table_backfill: Optional[str],
+                                      table_live: Optional[str], time_col: str,
+                                      threshold_ms: int, start_ms: int, conn) -> dict:
+        """Per-symbol fallback used when a chunk branch in
+        session_gap_batch_combined() fails — same combined query, one
+        symbol at a time."""
+        try:
+            cur = conn.cursor()
+            query, n_start_params = self._session_gap_query_combined(table_backfill, table_live, time_col)
+            params = [symbol, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params += [threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE]
+            params.extend([int(start_ms)] * n_start_params)
+            cur.execute(query, params)
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                return {"earliest_ms": row[1], "gap_prev_ms": row[2], "gap_next_ms": row[3]}
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_combined single-symbol query for {symbol} failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None}
+
+    def session_gap_batch_combined(self, symbols: list, kind: str = "quote", start_ms: int = 0,
+                                    threshold_secs: int = 300, conn=None) -> dict:
+        """
+        session_gap_batch()'s combined-coverage twin: scans the UNION of
+        each symbol's backfill AND live tables for a silent gap, instead
+        of backfill alone.
+
+        Why this exists: session_gap_batch() (backfill-only, by design —
+        see class docstring's "Live vs. backfill tables" section) is
+        exactly right for one specific question — "does BACKFILL have
+        anything it doesn't already know it should trust" — but it's the
+        wrong question for "what does this system actually already
+        have, combining everything". After a restart mid-session,
+        backfill's own table stops at whenever it last ran; every tick
+        captured live since then sits in a completely separate table
+        that session_gap_batch() never looks at. Treating backfill's
+        table as "the whole picture" for THAT question makes real,
+        already-captured minutes look like gaps needing a redundant
+        re-fetch from main db. Not incorrect — nothing is lost, nothing
+        breaks — just wasted network/DB time for data already on hand.
+
+        Deliberately NOT just "check each table's min/max timestamp and
+        call the span between them covered" — a live table can have its
+        own internal gaps too (a WS drop, before or without the
+        priority/backpressure fixes elsewhere in this file), so min/max
+        alone could just as easily paper over a real hole as it could
+        correctly detect coverage. This runs the exact same LAG-based
+        first-suspicious-gap scan as session_gap_batch(), just against
+        the UNION of both tables' timestamps, so an internal gap in
+        EITHER table (or a genuine hole between where backfill's
+        coverage ends and live's coverage begins) is caught the same
+        way a within-backfill gap always was.
+
+        Returns the same shape as session_gap_batch():
+        {symbol: {"earliest_ms": int|None, "gap_prev_ms": int|None, "gap_next_ms": int|None}}
+
+        Which decision this feeds (fetch_start_ms, phantom_range, etc.)
+        is entirely tick_gap_detector.py's job, same as always — this
+        method's only responsibility is running the merged-table scan
+        and handing back what it found.
+
+        Batching shape mirrors session_gap_batch(): one "which tables
+        exist" check (now against BOTH backfill and live table name
+        sets), then one UNION ALL per chunk, savepoint-isolated per
+        chunk, with a per-symbol fallback (_session_gap_single_combined())
+        for anything that fails.
+        """
+        if not symbols:
+            return {}
+
+        table_backfill_by_symbol = {s: self.table_name(s, kind, "backfill") for s in symbols}
+        table_live_by_symbol     = {s: self.table_name(s, kind, "live") for s in symbols}
+        time_col = self._time_col(kind)
+        result = {s: {"earliest_ms": None, "gap_prev_ms": None, "gap_next_ms": None} for s in symbols}
+        threshold_ms = int(threshold_secs) * 1000
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_gap_combined_exist_check")
+                try:
+                    all_tables = list(table_backfill_by_symbol.values()) + list(table_live_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_gap_combined_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_gap_combined_exist_check")
+                    raise
+
+                # A symbol only drops out entirely if NEITHER table
+                # exists — one missing table just means that symbol's
+                # branch scans the other one alone (see
+                # _session_gap_query_combined()).
+                tables_by_symbol = {}
+                for s in symbols:
+                    tb = table_backfill_by_symbol[s] if table_backfill_by_symbol[s] in existing_tables else None
+                    tl = table_live_by_symbol[s] if table_live_by_symbol[s] in existing_tables else None
+                    if tb or tl:
+                        tables_by_symbol[s] = (tb, tl)
+
+                if not tables_by_symbol:
+                    return result
+
+                _BATCH_CHUNK_SIZE = 100
+                existing_symbols = list(tables_by_symbol.keys())
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    branches, params = [], []
+                    for s in chunk:
+                        tb, tl = tables_by_symbol[s]
+                        branch_query, n_start_params = self._session_gap_query_combined(tb, tl, time_col)
+                        branches.append(branch_query)
+                        params.extend([s, threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([threshold_ms, MARKET_OPEN, MARKET_CLOSE, MARKET_OPEN, MARKET_CLOSE])
+                        params.extend([int(start_ms)] * n_start_params)
+                    query = " UNION ALL ".join(branches)
+
+                    cur.execute("SAVEPOINT sp_gap_combined_chunk")
+                    try:
+                        cur.execute(query, params)
+                        for sym, earliest_ms, gap_prev_ms, gap_next_ms in cur.fetchall():
+                            result[sym] = {"earliest_ms": earliest_ms, "gap_prev_ms": gap_prev_ms, "gap_next_ms": gap_next_ms}
+                        cur.execute("RELEASE SAVEPOINT sp_gap_combined_chunk")
+                    except Exception as exc:
+                        cur.execute("ROLLBACK TO SAVEPOINT sp_gap_combined_chunk")
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] session_gap_batch_combined chunk failed ({exc}); "
+                            f"falling back to per-symbol queries for this chunk ({len(chunk)} symbols)",
+                            flush=True,
+                        )
+                        for s in chunk:
+                            tb, tl = tables_by_symbol[s]
+                            result[s] = self._session_gap_single_combined(
+                                s, tb, tl, time_col, threshold_ms, start_ms, conn
+                            )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] session_gap_batch_combined failed: {exc}", flush=True)
+            for s in symbols:
+                if result[s]["earliest_ms"] is None and result[s]["gap_prev_ms"] is None:
+                    tb = table_backfill_by_symbol.get(s)
+                    tl = table_live_by_symbol.get(s)
+                    fresh_conn = None
+                    try:
+                        fresh_conn = psycopg2.connect(**self._params)
+                        result[s] = self._session_gap_single_combined(
+                            s, tb, tl, time_col, threshold_ms, start_ms, fresh_conn
+                        )
+                    except Exception:
+                        pass
+                    finally:
+                        if fresh_conn is not None:
+                            fresh_conn.close()
+        return result
+
+    def _read_ticks_chunk_with_bisection(self, cur, chunk, table_by_symbol, symbol_ranges,
+                                          select_cols_sql, out_cols, result, conn, time_col="ts_ms",
+                                          kind="quote", source="backfill", depth=0):
+        """Try one UNION ALL chunk; on failure (including a statement
+        timeout — a chunk that's just SLOW, not necessarily broken),
+        split it in half and retry each half instead of immediately
+        collapsing to a full per-symbol loop for the WHOLE chunk.
+
+        Why this matters: falling all the way back to N individual
+        queries for a merely-slow-but-otherwise-fine chunk recreates
+        exactly the per-symbol round-trip cost this batching exists to
+        avoid — confirmed in production, where a 150-symbol chunk hit
+        statement_timeout and the resulting per-symbol fallback caused
+        the same live-queue-overflow this whole change was meant to
+        fix. Bisecting means only the genuinely problematic symbol(s)
+        (if any — timeouts are often just "this much data takes this
+        long", not a broken table) end up paying the per-symbol cost;
+        everything else in the chunk still benefits from batching at a
+        smaller size.
+
+        Bottoms out at per-symbol reads once a "chunk" is down to a
+        single symbol — that's the only case truly equivalent to the
+        old fully-unbatched behavior, and only for whichever symbol(s)
+        actually need it.
+        """
+        if len(chunk) == 1:
+            s = chunk[0]
+            start_ms, end_ms = symbol_ranges[s]
+            result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, source=source, conn=conn)
+            return
+
+        branches, params = [], []
+        for s in chunk:
+            start_ms, end_ms = symbol_ranges[s]
+            branches.append(
+                f"SELECT %s AS symbol, {select_cols_sql} FROM {table_by_symbol[s]} "
+                f"WHERE {time_col} >= %s AND {time_col} <= %s"
+            )
+            params.extend([s, int(start_ms), int(end_ms)])
+        query = " UNION ALL ".join(branches) + f" ORDER BY symbol, {time_col}"
+
+        savepoint = f"sp_rt_chunk_{depth}_{len(chunk)}"
+        cur.execute(f"SAVEPOINT {savepoint}")
+        try:
+            cur.execute(query, params)
+            for row in cur.fetchall():
+                sym = row[0]
+                result[sym].append(dict(zip(out_cols, row[1:])))
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception as exc:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            mid = len(chunk) // 2
+            print(
+                f"[PG_LOCAL_WRITER][WARN] read_ticks_batch chunk of {len(chunk)} symbol(s) "
+                f"failed ({exc}); bisecting into {mid} + {len(chunk) - mid} and retrying "
+                f"rather than falling back to {len(chunk)} individual queries",
+                flush=True,
+            )
+            self._read_ticks_chunk_with_bisection(
+                cur, chunk[:mid], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                time_col, kind, source, depth + 1
+            )
+            self._read_ticks_chunk_with_bisection(
+                cur, chunk[mid:], table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                time_col, kind, source, depth + 1
+            )
+
+    def read_ticks_batch(self, symbol_ranges: dict, kind: str = "quote", source: str = "backfill",
+                          conn=None) -> dict:
+        """Batched version of read_ticks() for multiple symbols at once —
+        symbol_ranges: {symbol: (start_ms, end_ms)}. Returns
+        {symbol: [row_dict, ...]} — same row shape read_ticks() returns.
+
+        This is the read_ticks() twin of max_ts_batch() above, and for
+        the same reason: a per-symbol loop calling read_ticks() for
+        ~199 symbols does ~199 real network round-trips even with a
+        shared connection — and unlike max_ts (a single MAX() scalar),
+        each read_ticks() call pulls back a symbol's FULL cached tick
+        range, so on a live system (most symbols already have cached
+        data) this is actually the heavier of the two per-symbol costs,
+        not max_ts. Collapses to ~2 round-trips total via the same
+        two-step pattern: one existence check with tablename = ANY(%s),
+        then one UNION ALL per chunk — each branch tagged with its own
+        symbol as a bound %s parameter so results can be split back out
+        per symbol after fetching.
+
+        Same savepoint-per-chunk isolation as max_ts_batch(): one bad
+        table can't blank out every other symbol's results — see that
+        method's docstring for the full explanation of why that
+        matters when reusing one shared connection.
+        """
+        if not symbol_ranges:
+            return {}
+
+        table_by_symbol = {s: self.table_name(s, kind, source) for s in symbol_ranges}
+        result = {s: [] for s in symbol_ranges}
+        time_col = self._time_col(kind)
+
+        if kind == "depth":
+            select_cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+            out_cols    = ["timestamp", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+        else:
+            select_cols = list(PG_LOCAL_QUOTE_COLUMNS)
+            out_cols    = list(PG_LOCAL_QUOTE_COLUMNS)
+        select_cols_sql = ", ".join(select_cols)
+
+        own_conn = conn is None
+        try:
+            if own_conn:
+                conn = psycopg2.connect(**self._params)
+            try:
+                cur = conn.cursor()
+
+                cur.execute("SAVEPOINT sp_rt_exist_check")
+                try:
+                    all_tables = list(table_by_symbol.values())
+                    cur.execute(
+                        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(%s)",
+                        (all_tables,),
+                    )
+                    existing_tables = {row[0] for row in cur.fetchall()}
+                    cur.execute("RELEASE SAVEPOINT sp_rt_exist_check")
+                except Exception:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_rt_exist_check")
+                    raise
+
+                existing_symbols = [s for s, t in table_by_symbol.items() if t in existing_tables]
+                if not existing_symbols:
+                    return result
+
+                # Chunk size kept smaller than max_ts_batch's — each
+                # branch here pulls back a symbol's FULL cached tick
+                # range (potentially thousands of rows), not a single
+                # scalar, so a 150-symbol chunk can be a genuinely large
+                # query. Confirmed in production: 150-symbol chunks were
+                # hitting Postgres's statement_timeout and cancelling
+                # the whole chunk.
+                _BATCH_CHUNK_SIZE = 40
+                for start in range(0, len(existing_symbols), _BATCH_CHUNK_SIZE):
+                    chunk = existing_symbols[start:start + _BATCH_CHUNK_SIZE]
+                    self._read_ticks_chunk_with_bisection(
+                        cur, chunk, table_by_symbol, symbol_ranges, select_cols_sql, out_cols, result, conn,
+                        time_col=time_col, kind=kind, source=source,
+                    )
+            finally:
+                if own_conn:
+                    conn.close()
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] read_ticks_batch failed: {exc}", flush=True)
+            for s, (start_ms, end_ms) in symbol_ranges.items():
+                if not result[s]:
+                    result[s] = self.read_ticks(s, start_ms=start_ms, end_ms=end_ms, kind=kind, source=source, conn=None)
+
+        # The UNION ALL fast path above returns raw stored columns
+        # (bypassing read_ticks()'s per-row dict building), so — same
+        # as read_ticks() — derive "qty" from last_quantity here too,
+        # for every quote row that came back that way. Rows that fell
+        # back to read_ticks() (bisection base case, or the top-level
+        # except above) already have "qty" set.
+        if kind != "depth":
+            for rows in result.values():
+                for d in rows:
+                    if "qty" not in d:
+                        d["qty"] = 0  # last_quantity dropped upstream, see QUOTE_EXTRA_COLUMNS
+        return result
+
+    # ─────────────────────────────────────────────
+    # Writer thread internals — every method below takes an explicit
+    # `state` dict (a bulk shard's own self._shard_state[shard_idx], or
+    # self._live_state for the single live thread) and/or a worker
+    # label for logging. No locking on state/connection/batch data —
+    # each worker's own state dict, connection, and batch are touched
+    # by exactly one thread for that worker's entire lifetime. The one
+    # exception is _ensure_table()'s DDL section (self._ddl_lock) —
+    # table/index CREATION genuinely is shared across every shard's
+    # thread (see that method's docstring for why it needs the lock).
+    # ─────────────────────────────────────────────
+
+    def _connect(self):
+        conn = psycopg2.connect(**self._params)
+        conn.autocommit = False
+        return conn
+
+    @staticmethod
+    def _time_col(kind: str) -> str:
+        """Column name holding the per-row timestamp: "timestamp" for
+        quote (exact match with the source Postgres schema — see
+        PG_LOCAL_QUOTE_COLUMNS), "ts_ms" for depth (unchanged local
+        naming, since depth wasn't part of the "match the source
+        exactly" request — its local schema already matches the source
+        depth_<symbol> table's flat level columns name-for-name)."""
+        return "ts_ms" if kind == "depth" else "timestamp"
+
+    def _ensure_table(self, conn, table: str, kind: str, state: dict):
+        if table in state["known_tables"]:
+            return
+
+        # Everything below is DDL (CREATE TABLE and/or CREATE INDEX),
+        # even on the "table already exists" branch — and even
+        # CREATE INDEX IF NOT EXISTS against an ALREADY-EXISTING
+        # table isn't safe to run concurrently: many threads doing it
+        # for many different tables at once still contend for shared
+        # catalog locks and can deadlock against each other (this is
+        # exactly the failure this was re-hit by — a previous version
+        # of this fix only locked the "creating a brand-new table"
+        # branch and left this one unlocked). So the whole method
+        # — the existence check AND whichever DDL follows it — runs
+        # inside self._ddl_lock, with no unlocked DDL path left at
+        # all. All bulk-writer shards are threads in this one process
+        # (see the lock's docstring), so this genuinely serializes
+        # every shard's DDL against every other's, process-wide. Once
+        # every symbol's table/index exists, this method never
+        # reaches the lock again for that table (see the early return
+        # above) — the lock only ever matters during the first-time
+        # creation burst at startup.
+        with self._ddl_lock:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            is_new_table = not cur.fetchone()
+
+            if is_new_table:
+                # UNLOGGED: this cache is entirely disposable
+                # (re-fetchable from AWS Postgres via BackfillManager
+                # on any loss), so skipping WAL entirely here is a
+                # safe, deliberate durability trade for close-to-
+                # memory-speed writes — see module docstring.
+                if kind == "depth":
+                    level_cols_sql = ",\n                    ".join(
+                        f"{c} DOUBLE PRECISION" for c in DEPTH_LEVEL_COLUMNS
+                    )
+                    cur.execute(f"""
+                        CREATE UNLOGGED TABLE IF NOT EXISTS {table} (
+                            id     BIGSERIAL PRIMARY KEY,
+                            ts_ms  BIGINT NOT NULL,
+                            ltp    DOUBLE PRECISION,
+                            {level_cols_sql}
+                        )
+                    """)
+                else:
+                    # Exact column-for-column match with the source
+                    # AWS Postgres quote_<symbol> table (see
+                    # PG_LOCAL_QUOTE_COLUMNS) — no id, no ts_ms/qty
+                    # aliases, nothing extra.
+                    extra_col_defs_sql = ",\n                    ".join(
+                        f"{c} {'BIGINT' if c in _QUOTE_EXTRA_INT_COLUMNS else 'DOUBLE PRECISION'}"
+                        for c in PG_LOCAL_QUOTE_COLUMNS[1:]  # everything but "timestamp" itself
+                    )
+                    cur.execute(f"""
+                        CREATE UNLOGGED TABLE IF NOT EXISTS {table} (
+                            timestamp BIGINT NOT NULL,
+                            {extra_col_defs_sql}
+                        )
+                    """)
+
+            if self._is_fresh_db and is_new_table:
+                # Bulk initial-load scenario — defer to avoid the well-
+                # known cost of maintaining an index incrementally while
+                # a large historical backfill streams in; built once, in
+                # bulk, later — see build_pending_indexes()/
+                # _build_pending_indexes().
+                with self._pending_index_lock:
+                    self._pending_index_tables.add(table)
+            elif is_new_table:
+                # A table that's brand new AND we're not mid a fresh-DB
+                # bulk load: it's empty, so building its index right
+                # now is genuinely instant — safe to do inline, still
+                # under the lock, same as before.
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}({self._time_col(kind)})")
+            else:
+                # Existing table whose index is missing — almost always
+                # because it was deferred on some PAST fresh-DB run and
+                # build_pending_indexes() was never called back then
+                # (that omission is now fixed — see engine_runtime.py —
+                # but a table already in this state needs one more pass
+                # to heal). Building it HERE, inline, under this GLOBAL
+                # lock, is exactly what caused the outage this fix is
+                # for: a real index build on a table that's accumulated
+                # actual data is a genuine full-table scan + sort, and
+                # since _ddl_lock serializes every shard's DDL
+                # process-wide, ALL bulk-writer threads — including
+                # whichever ones just need to touch a completely
+                # different, already-fine table — stall in a queue
+                # behind however many OTHER tables are in the same
+                # boat, one at a time. With dozens of affected symbols
+                # that's tens of minutes of near-total live-write
+                # starvation, which is the escalating "LIVE queue full"
+                # tick-drop storm this was actually causing — a
+                # *slower, quieter* version of the original crash bug,
+                # not a fix for it. So: defer here too, exactly like
+                # the fresh-DB case above. The table keeps working
+                # (writes don't need an index; only read/query
+                # performance does) with no index until
+                # build_pending_indexes() gets to it later, one table
+                # at a time, entirely outside this lock and off the
+                # live-write hot path.
+                with self._pending_index_lock:
+                    self._pending_index_tables.add(table)
+            conn.commit()
+
+        state["known_tables"].add(table)
+
+    def _build_pending_indexes(self, conn):
+        """
+        Builds every index deferred by _ensure_table() while
+        self._is_fresh_db was True — see that method's comment for why
+        those get deferred in the first place, and build_pending_indexes()
+        (the public wrapper that enqueues the "build_indexes" message
+        this runs in response to) for the one place that's meant to
+        trigger this.
+
+        Each table's CREATE INDEX gets its own try/except AND its own
+        raised statement_timeout (see _DDL_STATEMENT_TIMEOUT_MS) —
+        neither existed here before. Without the per-table try/except,
+        _pending_index_tables was already cleared before this loop
+        started, so a single failing/slow table (one big enough to
+        exceed even a normal DDL timeout) would silently lose every
+        OTHER pending table queued behind it in this same call, with no
+        record left anywhere that they still needed an index — nothing
+        would ever retry them. A table that fails here gets re-added to
+        _pending_index_tables instead, so the next "build_indexes" call
+        (or the next process restart, since a fresh scan would find it
+        already exists and still-unindexed via _ensure_table()'s normal
+        else-branch) gets another chance at it.
+        """
+        with self._pending_index_lock:
+            tables = list(self._pending_index_tables)
+            self._pending_index_tables.clear()
+        if not tables:
+            return
+        cur = conn.cursor()
+        built, failed = 0, 0
+        for table in tables:
+            # kind isn't tracked alongside pending table names, so infer
+            # it from the table-name prefix (table_name() always builds
+            # names as "{kind}_{symbol}_{source}") to pick the right
+            # timestamp column — "ts_ms" for depth, "timestamp" for quote.
+            time_col = "ts_ms" if table.startswith("depth_") else "timestamp"
+            try:
+                cur.execute(f"SET statement_timeout = {self._DDL_STATEMENT_TIMEOUT_MS}")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_ts ON {table}({time_col})")
+                cur.execute("SET statement_timeout = DEFAULT")
+                conn.commit()
+                built += 1
+            except Exception as exc:
+                print(f"[PG_LOCAL_WRITER][WARN] build_pending_indexes: {table} failed, will retry later: {exc}", flush=True)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                with self._pending_index_lock:
+                    self._pending_index_tables.add(table)
+                failed += 1
+        if built or failed:
+            print(f"[PG_LOCAL_WRITER] build_pending_indexes: {built} built, {failed} failed/deferred for retry", flush=True)
+
+    def _insert(self, conn, table, kind, rows) -> int:
+        if not rows:
+            return 0
+        if kind == "depth":
+            cols = ["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)
+        else:
+            cols = list(PG_LOCAL_QUOTE_COLUMNS)
+        sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES %s"
+        try:
+            cur = conn.cursor()
+            for start in range(0, len(rows), self.INSERT_PAGE_SIZE):
+                psycopg2.extras.execute_values(cur, sql, rows[start:start + self.INSERT_PAGE_SIZE])
+            return len(rows)
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] batch insert into {table} failed: {exc}", flush=True)
+            print(f"[PG_LOCAL_WRITER][WARN] {table}: sample row from failed batch: "
+                  f"{dict(zip(cols, rows[0])) if rows else '(no rows)'}", flush=True)
+            conn.rollback()
+            return 0
+
+    # Above this row count, a single symbol's backfill chunk is big enough
+    # that dropping the table's timestamp index before the load and
+    # rebuilding it once afterward (see _copy_insert below) is a net win —
+    # below it, the index-drop/rebuild round trip itself isn't worth
+    # paying for. 80k-row single-symbol backfill chunks (the common case
+    # per BackfillManager's batch fetch) are comfortably above this.
+    _BULK_COPY_INDEX_REBUILD_MIN_ROWS = 5_000
+
+    def _copy_insert(self, conn, table, kind, df, time_col: str) -> int:
+        """
+        Backfill-only bulk loader — used by _flush_bulk() in place of
+        _insert()'s execute_values() path. Loads via Postgres's native
+        COPY protocol instead of parameterized INSERTs.
+
+        Takes a pandas DataFrame (already column-cleaned by
+        _flush_bulk — see that method's docstring) rather than a list
+        of row tuples: turning the whole DataFrame into COPY's
+        tab-separated text is one bulk pandas call (to_csv), not a
+        Python loop over rows — same reasoning as _flush_bulk's
+        vectorized cleanup, applied to the text-building step too.
+
+        Why COPY itself is faster than execute_values at backfill
+        volumes (routinely 80k+ rows for a single symbol in one
+        _flush_bulk call): execute_values still goes through the
+        normal query path — parse, plan, bind parameters — for every
+        page of rows. COPY skips all of that and streams rows straight
+        into the table, which is Postgres's actual bulk-load mechanism.
+
+        Also skips index-maintenance-per-row for large loads: above
+        _BULK_COPY_INDEX_REBUILD_MIN_ROWS, the table's existing timestamp
+        index (if any) is dropped before the COPY and rebuilt once after
+        — one bulk index build over rows already on disk, instead of the
+        index being updated incrementally as each of 80,000 rows lands.
+        Only ever touches THIS table's index; every symbol's backfill
+        table is owned by exactly one shard (see _shard_for()), so no
+        other thread can be reading/writing this same table concurrently.
+        Small (sub-threshold) loads and brand-new tables with no index
+        yet (see _ensure_table's is_fresh_db deferral) just COPY straight
+        in, unchanged.
+
+        NOT used for the live-tick path (_flush_live still uses _insert):
+        live batches are small (BATCH_SIZE=100) and arrive continuously,
+        so there's no backlog of rows to justify COPY's setup cost, an
+        index drop/rebuild cycle, or building a DataFrame — execute_values
+        is already fine there.
+        """
+        n = len(df)
+        if n == 0:
+            return 0
+        cols = list(df.columns)
+
+        index_name = f"idx_{table}_ts"
+        rebuild_index = n >= self._BULK_COPY_INDEX_REBUILD_MIN_ROWS
+        dropped_index = False
+        cur = conn.cursor()
+        try:
+            if rebuild_index:
+                cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index_name,))
+                dropped_index = cur.fetchone() is not None
+                if dropped_index:
+                    cur.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+            # Whole-DataFrame -> COPY text in one bulk call, instead of
+            # a Python loop joining one row at a time. "\N" is Postgres
+            # COPY text format's NULL marker; every column here is a
+            # plain number (BIGINT/DOUBLE PRECISION — see
+            # PG_LOCAL_QUOTE_COLUMNS/DEPTH_LEVEL_COLUMNS), so no
+            # quoting/escaping concerns the way there would be for text
+            # columns. lineterminator is forced to "\n" explicitly (not
+            # left to default) so this can't ever emit "\r\n", which
+            # COPY's text parser would otherwise fold into the last
+            # column's value. pandas renamed this kwarg at one point,
+            # so both spellings are tried for cross-version safety.
+            buf = io.StringIO()
+            try:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+            except TypeError:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", line_terminator="\n")
+            buf.seek(0)
+            cur.copy_expert(
+                f"COPY {table} ({', '.join(cols)}) FROM STDIN WITH (FORMAT text)",
+                buf,
+            )
+
+            if dropped_index:
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({time_col})")
+
+            return n
+        except Exception as exc:
+            print(f"[PG_LOCAL_WRITER][WARN] bulk COPY insert into {table} failed: {exc}", flush=True)
+            try:
+                sample = df.iloc[0].to_dict()
+            except Exception:
+                sample = "(no rows)"
+            print(f"[PG_LOCAL_WRITER][WARN] {table}: sample row from failed batch: {sample}", flush=True)
+            conn.rollback()
+            return 0
+
+    def _flush_live(self, conn, batch, state) -> int:
+        rows_by_table = {}
+        for _, symbol, kind, snapshot in batch:
+            ts_ms = snapshot.get("timestamp")
+            if ts_ms is None:
+                continue
+            table = self.table_name(symbol, kind, "live")
+            bucket = rows_by_table.setdefault(table, (kind, []))
+            if kind == "depth":
+                flat = {}
+                flat.update(_flatten_depth_levels(snapshot.get("bids", []), "buy"))
+                flat.update(_flatten_depth_levels(snapshot.get("asks", []), "sell"))
+                bucket[1].append((int(ts_ms), snapshot.get("ltp")) + tuple(flat[c] for c in DEPTH_LEVEL_COLUMNS))
+            else:
+                bucket[1].append(tuple(
+                    int(ts_ms) if col == "timestamp"
+                    else _safe_bigint(snapshot.get(col), table=table, col=col) if col in _QUOTE_EXTRA_INT_COLUMNS
+                    else snapshot.get(col)
+                    for col in PG_LOCAL_QUOTE_COLUMNS
+                ))
+
+        n = 0
+        for table, (kind, rows) in rows_by_table.items():
+            self._ensure_table(conn, table, kind, state)
+            n += self._insert(conn, table, kind, rows)
+        return n
+
+    def _flush_bulk(self, conn, symbol, rows_in, kind, state) -> int:
+        """
+        Backfill path. Used to loop over rows_in in plain Python,
+        calling _safe_bigint() per bigint-typed field per row — at
+        80k-rows-per-symbol backfill volumes (the common case per
+        BackfillManager's batch fetch) that's roughly a million
+        individual Python-level touches before a single byte reached
+        Postgres, all of it serialized by the GIL regardless of how
+        many shard threads exist. Replaced with a handful of
+        whole-column pandas operations instead: build one DataFrame
+        from rows_in, clean each bigint column in one vectorized pass,
+        and hand the whole thing to _copy_insert() to stream out via
+        COPY — same result, same NaN/inf/out-of-range NULL-safety
+        _safe_bigint used to give, just done column-at-a-time instead
+        of value-at-a-time.
+
+        (The reason that safety check exists at all — a single NaN
+        anywhere in a bigint-bound column silently upcasting the WHOLE
+        column to float64, see _safe_bigint's original docstring — is
+        itself a pandas quirk, so redoing it as a pandas-native
+        whole-column fix is the natural place for it to live now.)
+        """
+        table = self.table_name(symbol, kind, "backfill")
+        if _backfill_rows_empty(rows_in):
+            return 0
+
+        # rows_in is normally already a DataFrame now (see
+        # enqueue_backfill_rows) — avoid pd.DataFrame(rows_in)'s extra
+        # copy in that case; still accept a list of dicts for anything
+        # that hasn't been switched over (e.g. depth backfill still
+        # calls this with to_dict("records") lists as of this writing).
+        df = rows_in if isinstance(rows_in, pd.DataFrame) else pd.DataFrame(rows_in)
+        if "timestamp" not in df.columns:
+            return 0
+        df = df[df["timestamp"].notna()]
+        if df.empty:
+            return 0
+
+        if kind == "depth":
+            df["ts_ms"] = df["timestamp"].astype("int64")
+            for c in DEPTH_LEVEL_COLUMNS:
+                if c not in df.columns:
+                    df[c] = None
+            out_df = df[["ts_ms", "ltp"] + list(DEPTH_LEVEL_COLUMNS)]
+        else:
+            for c in QUOTE_EXTRA_COLUMNS:
+                if c not in df.columns:
+                    df[c] = None
+            df["timestamp"] = df["timestamp"].astype("int64")
+            for col in _QUOTE_EXTRA_INT_COLUMNS:
+                # Same protection _safe_bigint() gave per-value, applied
+                # to the whole column at once: non-numeric -> NaN,
+                # +/-inf -> NaN, out-of-Postgres-bigint-range -> NaN,
+                # then round to the nearest whole number. Int64 (capital
+                # I — pandas' NULLABLE integer dtype, not plain int64)
+                # keeps NaN as a real missing value instead of forcing
+                # the column back to float, so to_csv below still
+                # writes clean integers (no trailing ".0") with "\N"
+                # for the missing ones.
+                s = pd.to_numeric(df[col], errors="coerce")
+                s = s.replace([np.inf, -np.inf], np.nan)
+                out_of_range = (s < _PG_BIGINT_MIN) | (s > _PG_BIGINT_MAX)
+                newly_invalid = out_of_range & s.notna()
+                if newly_invalid.any():
+                    key = (table, col)
+                    if key not in _bigint_warned_cols:
+                        _bigint_warned_cols.add(key)
+                        print(
+                            f"[PG_LOCAL_WRITER][WARN] {table}.{col}: "
+                            f"{int(newly_invalid.sum())} out-of-range/invalid "
+                            f"bigint value(s) in this batch — storing NULL "
+                            f"instead (further occurrences for this column "
+                            f"suppressed)",
+                            flush=True,
+                        )
+                s = s.mask(out_of_range)
+                df[col] = s.round().astype("Int64")
+            out_df = df[list(PG_LOCAL_QUOTE_COLUMNS)]
+
+        self._ensure_table(conn, table, kind, state)
+        # Backfill path uses the COPY-based bulk loader (see
+        # _copy_insert's docstring) instead of _insert()'s
+        # execute_values — the live path (_flush_live) still uses
+        # _insert() unchanged, since it never sees this row volume.
+        return self._copy_insert(conn, table, kind, out_df, self._time_col(kind))
+
+    def _delete_range(self, conn, symbol, start_ms, end_ms, kind, source):
+        table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+        if not cur.fetchone():
+            return
+        if end_ms is not None:
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} >= %s AND {time_col} <= %s", (start_ms, end_ms))
+        else:
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} >= %s", (start_ms,))
+        n = cur.rowcount
+        conn.commit()
+        if n:
+            print(f"[PG_LOCAL_WRITER] Deleted {n} row(s) from {table}", flush=True)
+
+    def _delete_timestamps(self, conn, symbol, timestamps, kind, source):
+        table = self.table_name(symbol, kind, source)
+        time_col = self._time_col(kind)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+        if not cur.fetchone():
+            return
+        total = 0
+        page_size = 1000
+        for start in range(0, len(timestamps), page_size):
+            page = timestamps[start:start + page_size]
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} = ANY(%s)", (page,))
+            total += cur.rowcount
+        conn.commit()
+        if total:
+            print(f"[PG_LOCAL_WRITER] Deleted {total} phantom row(s) from {table}", flush=True)
+
+    def _prune_tables(self, conn, n_trading_days: int):
+        cutoff_date = trading_day_n_back(n_trading_days - 1)
+        cutoff_dt   = datetime.combine(cutoff_date, datetime.min.time(), tzinfo=tz_kolkata)
+        cutoff_ms   = int(cutoff_dt.timestamp() * 1000)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname='public' "
+            "AND (tablename LIKE 'quote_%%' OR tablename LIKE 'depth_%%')"
+        )
+        tables = [r[0] for r in cur.fetchall()]
+        total_deleted, affected = 0, 0
+        for table in tables:
+            # quote_<symbol> now uses "timestamp" as its time column
+            # (exact match with the source schema); depth_<symbol>
+            # still uses "ts_ms" — see _time_col()'s docstring.
+            time_col = "ts_ms" if table.startswith("depth_") else "timestamp"
+            cur.execute(f"DELETE FROM {table} WHERE {time_col} < %s", (cutoff_ms,))
+            if cur.rowcount:
+                total_deleted += cur.rowcount
+                affected += 1
+        conn.commit()
+        print(
+            f"[PG_LOCAL_WRITER] Pruned {total_deleted} row(s) across {affected} table(s) "
+            f"older than {cutoff_date} (keeping last {n_trading_days} trading days)",
+            flush=True,
+        )
+
+    def _commit_if_due(self, conn, state, worker_label, commit_max_rows: int, force: bool = False):
+        """
+        Returns the connection to use going forward — usually the same
+        `conn` passed in, but a FRESH one if the commit failed and had
+        to reconnect. Callers must always do `conn = self._commit_if_due(...)`
+        and keep using the returned value, never the original variable.
+
+        worker_label is just for log messages (a bulk shard index or
+        "live"). commit_max_rows is that worker's own threshold — bulk
+        shards use self._commit_max_rows_per_shard (aggregate budget
+        divided across the pool), the live thread uses the full
+        self.COMMIT_MAX_ROWS (it's the only live writer, no dividing).
+
+        Without a try/except here, ANY commit failure (a transient
+        network blip, a Postgres-side timeout, a dropped connection)
+        would propagate straight out of the run loop and kill this
+        worker's thread silently — a daemon thread with no supervisor
+        to notice or restart it. From that point on this worker's
+        queue never drains again: enqueue_backfill_rows()/enqueue_live()
+        for every symbol mapped to it blocks forever on a full queue,
+        and whatever's already queued sits in RAM permanently. That's a
+        real, previously-unhandled path to exactly the "fetched data
+        but RAM never comes back down" symptom.
+        """
+        if state["pending_commit_rows"] == 0:
+            return conn
+        due = (
+            force
+            or state["pending_commit_rows"] >= commit_max_rows
+            or (state["txn_started_at"] is not None and time.time() - state["txn_started_at"] >= self.COMMIT_MAX_SECS)
+        )
+        if not due:
+            return conn
+        t0 = time.time()
+        try:
+            conn.commit()
+        except Exception as exc:
+            lost_rows = state["pending_commit_rows"]
+            print(
+                f"[PG_LOCAL_WRITER][ERROR] {worker_label} commit failed "
+                f"({lost_rows} row(s) in this transaction lost): {exc} — reconnecting",
+                flush=True,
+            )
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # Reconnect so this worker keeps working instead of being
+            # permanently wedged — the rows in the failed transaction
+            # are gone (never buffered separately for retry, same
+            # trade-off SQLiteTickWriter makes on an insert failure),
+            # but every symbol mapped to it keeps flowing instead of
+            # hanging forever on a dead queue.
+            conn = self._connect()
+            state["pending_commit_rows"] = 0
+            state["txn_started_at"] = None
+            return conn
+        dt = time.time() - t0
+        state["commits_total"]        += 1
+        state["commit_time_total"]    += dt
+        state["last_commit_duration"]  = dt
+        state["last_commit_rows"]      = state["pending_commit_rows"]
+        state["last_txn_duration"]     = time.time() - (state["txn_started_at"] or t0)
+        state["pending_commit_rows"]   = 0
+        state["txn_started_at"]        = None
+        return conn
+
+    def _note_inserted(self, n: int, state: dict):
+        if n <= 0:
+            return
+        if state["txn_started_at"] is None:
+            state["txn_started_at"] = time.time()
+        state["pending_commit_rows"] += n
+        state["rows_written_total"]  += n
+
+    def _yield_to_live_if_pressured(self):
+        """
+        Called by every bulk shard thread between items — see class
+        docstring's "Live-writer GIL priority" section for the full
+        story. Checks how full the live queue currently is and
+        voluntarily sleeps a proportional amount before this shard
+        grabs its next item, explicitly handing the GIL to whichever
+        thread wants it next (in practice, usually the live thread,
+        since it's the one actually starved).
+
+        Linear ramp from _LIVE_PRESSURE_THRESHOLD (a token nudge) up to
+        full (LIVE_QUEUE_MAXSIZE, the full _LIVE_PRESSURE_MAX_SLEEP_SECS
+        pause). Every bulk shard runs this independently and reads the
+        same shared queue's .qsize(), so at genuine max pressure all
+        WRITER_POOL_SIZE shards back off together — collectively
+        handing the live thread nearly the whole GIL until it catches
+        up. Below the threshold this is a single cheap .qsize() call
+        and an immediate return — zero cost to bulk throughput during
+        normal operation, when there's no pressure to relieve.
+        """
+        qsize = self._live_queue.qsize()
+        fill_ratio = qsize / self.LIVE_QUEUE_MAXSIZE
+        if fill_ratio <= self._LIVE_PRESSURE_THRESHOLD:
+            return
+        excess = (fill_ratio - self._LIVE_PRESSURE_THRESHOLD) / (1.0 - self._LIVE_PRESSURE_THRESHOLD)
+        time.sleep(self._LIVE_PRESSURE_MAX_SLEEP_SECS * min(1.0, excess))
+
+    def _help_drain_live_queue(self, conn, state: dict, label: str) -> bool:
+        """
+        Called by a bulk shard thread the MOMENT its own bulk queue is
+        empty — i.e. genuinely idle capacity that would otherwise just
+        poll nothing every 250ms and do nothing at all. This is what
+        makes "all workers write live ticks only once backfill is
+        done" happen automatically: there's no explicit backfill-done
+        flag or mode switch anywhere — the instant a shard's bulk queue
+        runs dry (which happens permanently, for every shard, the
+        moment the day's backfill finishes), that shard starts helping
+        drain the live queue on every subsequent idle iteration, for
+        the rest of the session, with zero special-casing.
+
+        Safe to run concurrently from multiple threads (up to
+        pool_size of them, plus the dedicated live thread itself, all
+        competing consumers on the SAME queue.Queue — exactly the
+        pattern queue.Queue exists for):
+          - Postgres's MVCC handles concurrent INSERTs into the same
+            `_live` table across separate connections/transactions
+            without any special handling needed here.
+          - Nothing downstream depends on cross-thread arrival order —
+            every read path (candle building, indicators) already does
+            ORDER BY timestamp off each row's own column, so which
+            thread happened to write a given row first is irrelevant.
+          - The dedicated live thread (_run_live()) just sees fewer
+            items per iteration when helpers are also draining the
+            same queue — aggregate live-write throughput only ever
+            goes up with more helpers, never down or at risk of a race.
+
+        Grabs up to BATCH_SIZE items non-blockingly and flushes them
+        through the exact same _flush_live() the dedicated live thread
+        uses. Returns True if it actually did anything (so the caller
+        skips its own idle-timeout bookkeeping that iteration), False
+        if the live queue was ALSO empty — genuinely nothing to do
+        anywhere right now.
+
+        Note: reuses this shard's own bulk `state` dict for commit
+        bookkeeping (pending_commit_rows/rows_written_total/etc.), so
+        get_metrics() folds a shard's live-helper contribution into its
+        bulk-shard row counts rather than tracking it separately — an
+        acceptable, minor imprecision in exchange for not needing a
+        third parallel state-dict shape just for this.
+        """
+        batch = []
+        try:
+            while len(batch) < self.BATCH_SIZE:
+                batch.append(self._live_queue.get_nowait())
+        except queue.Empty:
+            pass
+
+        if not batch:
+            return False
+
+        # The live queue also carries ("barrier", done_event) sentinels
+        # from flush_and_wait() (see class docstring / _run_live()) —
+        # split those out and set their events instead of handing them
+        # to _flush_live(), which only knows how to unpack real ticks
+        # ("live", symbol, kind, snapshot). Without this split, a
+        # barrier grabbed here during shutdown blows up _flush_live()
+        # with "not enough values to unpack" and the barrier's event
+        # never gets set, so flush_and_wait() times out too.
+        ticks = []
+        for item in batch:
+            if item[0] == "barrier":
+                _, done_event = item
+                done_event.set()
+            else:
+                ticks.append(item)
+
+        if ticks:
+            self._note_inserted(self._flush_live(conn, ticks, state), state)
+        self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+        return True
+
+    def _run_bulk(self, shard_idx: int):
+        """
+        One of self.pool_size bulk shard threads. Handles backfill rows
+        (enqueue_backfill_rows()), the DB-wide admin ops (prune/delete/
+        barrier/build_indexes) that piggyback on shard 0's connection —
+        see class docstring — AND helps drain the LIVE queue in TWO
+        ways, so live ticks get real priority rather than just
+        avoiding overflow:
+          1. Proactively, at the TOP of every single loop pass,
+             whenever the live queue has a real backlog
+             (_LIVE_PROACTIVE_DRAIN_MIN_QSIZE) — BEFORE this shard even
+             looks at its own next bulk item. This is what stops live
+             ticks from sitting in queue while every shard happens to
+             be busy with real backfill work: without this, a shard
+             mid-way through a stack of bulk items would only ever
+             glance at live once it ran completely dry, which could be
+             a while during a heavy backfill burst.
+          2. Reactively, whenever this shard's own queue is empty (the
+             original idle-helper behavior — see _help_drain_live_queue()).
+        In practice this means every bulk shard automatically becomes a
+        live-writing helper for the rest of the session the moment the
+        day's backfill work runs out — no separate "backfill complete"
+        signal needed anywhere — AND live ticks get attention from all
+        pool_size+1 threads whenever there's a real backlog, not just
+        the one dedicated live thread.
+        """
+        bulk_q = self._bulk_queues[shard_idx]
+        state  = self._shard_state[shard_idx]
+        label  = f"bulk shard {shard_idx}"
+
+        conn = self._connect()
+        try:
+            while True:
+                stopping = self._stop.is_set() and bulk_q.empty() and self._live_queue.empty()
+                if stopping:
+                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                    break
+
+                # Live priority, checked FIRST, every pass — see
+                # docstring point 1 above. A single trickling tick
+                # below the threshold isn't worth interrupting real
+                # bulk work for, so this is a no-op far more often than
+                # not; it only actually does anything once a real
+                # backlog exists.
+                #
+                # Wrapped in the SAME catch-all/reconnect pattern as the
+                # "bulk"/"prune"/etc dispatch block below — this call
+                # (and the other _help_drain_live_queue() call inside
+                # the queue.Empty handler just below) used to sit
+                # completely unprotected, so any unexpected error
+                # inside it — e.g. _ensure_table()'s CREATE INDEX
+                # timing out on a large existing table, see that
+                # method's docstring — escaped straight out of this
+                # loop and killed the whole shard thread outright. A
+                # dead shard thread means its bulk queue AND its share
+                # of live-draining capacity are both gone for the rest
+                # of the session with nothing to replace them, which is
+                # exactly what produced the cascading "LIVE queue full"
+                # tick-drop storm this fix is closing off.
+                if self._live_queue.qsize() > self._LIVE_PROACTIVE_DRAIN_MIN_QSIZE:
+                    try:
+                        self._help_drain_live_queue(conn, state, label)
+                    except Exception as exc:
+                        print(
+                            f"[PG_LOCAL_WRITER][ERROR] {label} proactive live-drain hit an "
+                            f"unexpected error, reconnecting and continuing: {exc}",
+                            flush=True,
+                        )
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._connect()
+                        state["pending_commit_rows"] = 0
+                        state["txn_started_at"] = None
+
+                self._yield_to_live_if_pressured()
+
+                try:
+                    item = bulk_q.get_nowait()
+                except queue.Empty:
+                    # Genuinely nothing of our own pending — help the
+                    # live queue if it has anything waiting. Same
+                    # catch-all/reconnect protection as above — see
+                    # that comment for why this can't be allowed to
+                    # propagate and kill the thread.
+                    try:
+                        if self._help_drain_live_queue(conn, state, label):
+                            continue
+                    except Exception as exc:
+                        print(
+                            f"[PG_LOCAL_WRITER][ERROR] {label} reactive live-drain hit an "
+                            f"unexpected error, reconnecting and continuing: {exc}",
+                            flush=True,
+                        )
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._connect()
+                        state["pending_commit_rows"] = 0
+                        state["txn_started_at"] = None
+                        continue
+                    # Live queue was empty too — actually idle. Same
+                    # 0.25s blocking wait as before, so this thread
+                    # isn't spinning a hot loop when there's truly
+                    # nothing for anyone to do.
+                    try:
+                        item = bulk_q.get(timeout=0.25)
+                    except queue.Empty:
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+                        continue
+
+                try:
+                    kind0 = item[0]
+                    if kind0 == "bulk":
+                        _, symbol, rows, kind = item
+                        self._note_inserted(self._flush_bulk(conn, symbol, rows, kind, state), state)
+                    elif kind0 == "prune":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, n_trading_days, done_event = item
+                        self._prune_tables(conn, n_trading_days)
+                        done_event.set()
+                    elif kind0 == "delete_range":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, symbol, start_ms, end_ms, kind, source, done_event = item
+                        self._delete_range(conn, symbol, start_ms, end_ms, kind, source)
+                        done_event.set()
+                    elif kind0 == "delete_timestamps":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, symbol, timestamps, kind, source, done_event = item
+                        self._delete_timestamps(conn, symbol, timestamps, kind, source)
+                        done_event.set()
+                    elif kind0 == "barrier":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        _, done_event = item
+                        done_event.set()
+                    elif kind0 == "build_indexes":
+                        conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=True)
+                        self._build_pending_indexes(conn)
+                        _, done_event = item
+                        done_event.set()
+
+                    conn = self._commit_if_due(conn, state, label, self._commit_max_rows_per_shard, force=False)
+
+                except Exception as exc:
+                    # Catch-all safety net — see _run_live()'s matching
+                    # block for why this must never let the thread die.
+                    print(
+                        f"[PG_LOCAL_WRITER][ERROR] {label} hit an unexpected "
+                        f"error, reconnecting and continuing: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = self._connect()
+                    state["pending_commit_rows"] = 0
+                    state["txn_started_at"] = None
+        finally:
+            conn.close()
+
+    def _run_live(self):
+        """
+        Single dedicated live writer thread — see class docstring's
+        "Live writer" section for why one thread is enough here (unlike
+        bulk backfill, live volume is naturally rate-limited by the
+        market feed). Every symbol's live ticks flow through the one
+        queue this drains, batched the same way the old combined loop
+        batched them (BATCH_SIZE / BATCH_MAX_SECS), just without any
+        bulk-priority juggling since bulk never shows up here.
+        """
+        live_q = self._live_queue
+        state  = self._live_state
+        label  = "live writer"
+
+        conn = self._connect()
+        batch = []
+        last_batch_flush = time.time()
+        try:
+            while True:
+                stopping = self._stop.is_set() and live_q.empty()
+                if not batch and stopping:
+                    conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=True)
+                    break
+
+                try:
+                    item = live_q.get(timeout=0.25)
+                except queue.Empty:
+                    item = None
+
+                try:
+                    if item is not None and item[0] == "barrier":
+                        if batch:
+                            self._note_inserted(self._flush_live(conn, batch, state), state)
+                            batch = []
+                            last_batch_flush = time.time()
+                        conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=True)
+                        _, done_event = item
+                        done_event.set()
+                    elif item is not None:
+                        batch.append(item)
+
+                    should_flush_batch = batch and (
+                        len(batch) >= self.BATCH_SIZE
+                        or time.time() - last_batch_flush >= self.BATCH_MAX_SECS
+                        or stopping
+                    )
+                    if should_flush_batch:
+                        self._note_inserted(self._flush_live(conn, batch, state), state)
+                        batch = []
+                        last_batch_flush = time.time()
+
+                    conn = self._commit_if_due(conn, state, label, self.COMMIT_MAX_ROWS, force=stopping)
+
+                except Exception as exc:
+                    # Catch-all safety net: _insert()/_commit_if_due()
+                    # already handle the failures they can anticipate,
+                    # but this guarantees NOTHING unexpected can kill
+                    # this thread outright. A dead live thread means
+                    # enqueue_live() blocks/drops for EVERY symbol
+                    # (there's only one live thread now, not 9 shards
+                    # to fall back on) — reconnecting and dropping
+                    # whatever was in-flight is a far better outcome
+                    # than a permanently wedged live writer.
+                    print(
+                        f"[PG_LOCAL_WRITER][ERROR] {label} hit an unexpected "
+                        f"error, reconnecting and continuing: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = self._connect()
+                    batch = []
+                    state["pending_commit_rows"] = 0
+                    state["txn_started_at"] = None
+        finally:
+            conn.close()
+
+
+# ═════════════════════════════════════════════════════════════════════
+# TickWriter — the factory every other module imports and calls. Picks
+# SQLiteTickWriter (default) or PostgresTickWriter based on
+# TICK_WRITER_BACKEND, so `from tick_writer import TickWriter` plus
+# `TickWriter(base_dir="tickdata")` keeps working unchanged everywhere
+# in the codebase regardless of which backend is active — engine_runtime.py
+# doesn't need an if/else, and nothing needs to know PostgresTickWriter
+# exists at all unless it's explicitly selected.
+# ═════════════════════════════════════════════════════════════════════
+
+def TickWriter(base_dir: str = "tickdata", **kwargs):
+    """
+    TICK_WRITER_BACKEND=sqlite (default, or unset): SQLiteTickWriter,
+    writing to base_dir/ticks.db — base_dir is required and used as
+    before.
+
+    TICK_WRITER_BACKEND=postgres: PostgresTickWriter, writing to a
+    local PostgreSQL instance configured via PG_LOCAL_* env vars (see
+    auto_setup() above) — base_dir is accepted but ignored, kept only
+    so callers don't need a conditional just to construct this.
+    """
+    backend = os.getenv("TICK_WRITER_BACKEND", "sqlite").strip().lower()
+    if backend == "postgres":
+        return PostgresTickWriter(**kwargs)
+    return SQLiteTickWriter(base_dir=base_dir, **kwargs)
+
+
+
+# ═════════════════════════════════════════════════════════════════════
+# HistoryCandleStore
+#
+# Local Postgres cache for candles fetched from the history (fallback)
+# PostgreSQL DB — one table per symbol, `candles_1m_<symbol>`, in the
+# same local Postgres database every other local cache in this file
+# uses (PG_LOCAL_* env vars — see _conn_params()). Mirrors TickWriter's
+# per-symbol-table naming convention above, but for pre-built candles
+# instead of raw ticks, and with only ONE table per symbol since the
+# history db only ever holds one granularity (self.history_native_tf
+# in backfill_manager.py, default "1m" — see that file's docstring on
+# _fetch_history_candles_batch for how that's confirmed). "1m" is
+# baked into the table prefix rather than reusing history_native_tf so
+# the name stays stable even if that setting changes later.
+#
+# Deliberately a different table namespace than every other local
+# Postgres table already in use: quote_<symbol>_backfill/live and
+# depth_<symbol>_backfill/live (PostgresTickWriter above), and
+# daily_<symbol> (backfill_manager.py's fetch_daily_candles).
+#
+# Rows are upserted (ts_ms is the PRIMARY KEY) — candles are
+# idempotent (the same bucket always has the same OHLCV once closed),
+# so re-fetching an overlapping range just overwrites in place instead
+# of risking duplicate rows.
+#
+# Much lower write volume than raw ticks (~375 rows/symbol/day instead
+# of thousands), so this stays a simple synchronous psycopg2 wrapper —
+# no dedicated background writer thread the way TickWriter above has
+# one.
+# ═════════════════════════════════════════════════════════════════════
+
+class HistoryCandleStore:
+
+    # See module comment above for why this is its own namespace.
+    PG_TABLE_PREFIX = "candles_1m"
+
+    # See delete_before_bulk()'s docstring — same batching/timeout
+    # reasoning as Candle1mCache's own copy of these two constants.
+    _DELETE_BEFORE_BULK_BATCH_SIZE = 20
+    _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS = 120_000
+
+    def __init__(self, base_dir=None):
+        # base_dir is accepted (and ignored) only so existing callers
+        # that still pass it don't need a conditional at every call
+        # site — there's no local file for it to matter to anymore.
+        self._known_tables = set()
+
+        # Dedicated connection for save_candles() specifically — see
+        # that method's docstring. NOT shared with read_candles()/
+        # max_ts()/read_timestamps() (those still open/close per call,
+        # unchanged), so there's no risk of two different threads (a
+        # live engine doing reads, a backfill/heal thread doing writes)
+        # fighting over one shared connection. save_candles() itself
+        # is only ever called from backfill_manager.py's single
+        # serialized backfill/heal thread (engine_runtime.py's
+        # backfill_lock — see run_targeted_heal()'s docstring), so
+        # caching a connection here needs no locking of its own.
+        self._save_conn = None
+        # Staging table used by save_candles()'s COPY-then-merge upsert
+        # — see that method's docstring for why a temp table exists at
+        # all. One shared TEMP TABLE reused (truncated between calls)
+        # across every symbol on self._save_conn, rather than one
+        # per-symbol temp table, so a long backfill run touching ~200
+        # symbols doesn't leave ~200 temp-table catalog entries behind.
+        self._STAGING_TABLE = "history_store_candle_stage"
+
+    @classmethod
+    def table_name(cls, symbol: str) -> str:
+        return f"{cls.PG_TABLE_PREFIX}_{_safe_symbol(symbol)}"
+
+    def _connect(self):
+        # Same PG_LOCAL_* env vars / defaults as every other local-cache
+        # table in this codebase (see _conn_params() above).
+        return psycopg2.connect(**_conn_params())
+
+    def _get_save_conn(self):
+        """Lazily connects, then reuses the SAME connection across every
+        save_candles() call — see __init__'s comment on why this is
+        safe without locking. Previously this reconnected (full TCP +
+        auth handshake) on EVERY call, i.e. once per symbol per
+        backfill/heal run — the single biggest cost in this class,
+        bigger than the actual write itself for how little data one
+        symbol's candles are."""
+        if self._save_conn is not None and not self._save_conn.closed:
+            return self._save_conn
+        self._save_conn = self._connect()
+        return self._save_conn
+
+    def _ensure_staging_table(self, conn):
+        """CREATE TEMP TABLE IF NOT EXISTS — a cheap no-op after the
+        first call on a given connection. Also transparently recreates
+        it after a reconnect (a fresh connection has no memory of the
+        old session's temp tables), so save_candles() can call this
+        unconditionally every time rather than tracking "did I already
+        set this up on the CURRENT connection" separately."""
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TEMP TABLE IF NOT EXISTS {self._STAGING_TABLE} (
+                ts_ms  BIGINT,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
+            )
+        """)
+
+    def _ensure_table(self, conn, table: str):
+        if table in self._known_tables:
+            return
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_quote_ident(table)} (
+                ts_ms  BIGINT PRIMARY KEY,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
+            )
+        """)
+        conn.commit()
+        cur.close()
+        self._known_tables.add(table)
+
+    # ─────────────────────────────────────────────
+    # Writes
+    # ─────────────────────────────────────────────
+
+    def save_candles(self, symbol: str, rows):
+        """
+        rows: either a list of {"timestamp": ms_int, "open", "high",
+        "low", "close", "volume"} dicts, or a pandas DataFrame with
+        those same columns (BackfillManager's history-candle fetch
+        hands this a DataFrame directly now — see
+        _fetch_history_candles_batch). Upserts on ts_ms — safe to call
+        repeatedly with overlapping ranges.
+
+        Previously: opened a brand-new connection every single call
+        (one full TCP+auth handshake per symbol per backfill/heal run
+        — see _get_save_conn()) and upserted via execute_values with
+        an ON CONFLICT clause, i.e. Postgres checking/updating the
+        real table row by row as each one streamed in.
+
+        Now: reuses one connection across every symbol (_get_save_conn),
+        and writes via a two-step COPY-then-merge instead of a
+        row-by-row upsert:
+          1. COPY straight into a small reusable TEMP TABLE (see
+             _ensure_staging_table) — Postgres's actual bulk-load path,
+             same reasoning as PostgresTickWriter._copy_insert(), with
+             no ON CONFLICT to slow it down since the staging table has
+             no constraints at all.
+          2. ONE "INSERT ... SELECT ... ON CONFLICT DO UPDATE" merging
+             the staging table into the real candles_1m_<symbol> table
+             — the upsert logic still happens, just as a single bulk
+             operation over data already sitting in Postgres, instead
+             of psycopg2 sending and checking one row-batch at a time.
+        This is the standard way to get COPY's speed while keeping
+        upsert (ON CONFLICT) semantics, which plain COPY can't express
+        on its own.
+
+        If given a DataFrame, makes its own copy before touching it —
+        BackfillManager's fetch loop mutates and keeps using the same
+        DataFrame object after calling this (see that call site's
+        comment), so this must never modify the caller's copy.
+        """
+        if isinstance(rows, pd.DataFrame):
+            if rows.empty:
+                return
+            df = rows.copy()
+        else:
+            if not rows:
+                return
+            df = pd.DataFrame(rows)
+
+        for c in ("timestamp", "open", "high", "low", "close", "volume"):
+            if c not in df.columns:
+                df[c] = None
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df[df["timestamp"].notna()]
+        if df.empty:
+            return
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df = df.rename(columns={"timestamp": "ts_ms"})
+
+        try:
+            conn = self._get_save_conn()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] save_candles({symbol}) connect failed: {exc}", flush=True)
+            return
+        try:
+            table = self.table_name(symbol)
+            self._ensure_table(conn, table)
+            self._ensure_staging_table(conn)
+            cur = conn.cursor()
+
+            # Staging table is reused across every symbol on this
+            # connection — clear out whatever the previous symbol left
+            # behind before loading this one's rows. Cheap: it's a temp
+            # table holding at most one symbol's worth of candles at a
+            # time (~375 rows/day), never accumulates.
+            cur.execute(f"TRUNCATE {self._STAGING_TABLE}")
+
+            buf = io.StringIO()
+            try:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+            except TypeError:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", line_terminator="\n")
+            buf.seek(0)
+            cur.copy_expert(
+                f"COPY {self._STAGING_TABLE} (ts_ms, open, high, low, close, volume) FROM STDIN WITH (FORMAT text)",
+                buf,
+            )
+
+            cur.execute(f"""
+                INSERT INTO {_quote_ident(table)} (ts_ms, open, high, low, close, volume)
+                SELECT ts_ms, open, high, low, close, volume FROM {self._STAGING_TABLE}
+                ON CONFLICT (ts_ms) DO UPDATE SET
+                    open=EXCLUDED.open, high=EXCLUDED.high,
+                    low=EXCLUDED.low, close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
+            """)
+            conn.commit()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] save_candles({symbol}) failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                # Rollback itself failed — the connection is almost
+                # certainly dead. Close it and drop the cache so the
+                # NEXT call reconnects fresh instead of repeatedly
+                # trying to reuse a broken connection forever.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._save_conn = None
+
+    # ─────────────────────────────────────────────
+    # Reads
+    # ─────────────────────────────────────────────
+
+    def max_ts(self, symbol: str):
+        """Most recent ts_ms already cached for symbol, or None."""
+        table = self.table_name(symbol)
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] max_ts({symbol}) connect failed: {exc}", flush=True)
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return None
+            cur.execute(f"SELECT MAX(ts_ms) FROM {_quote_ident(table)}")
+            row = cur.fetchone()
+            cur.close()
+            return int(row[0]) if row and row[0] is not None else None
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] max_ts({symbol}) failed: {exc}", flush=True)
+            return None
+        finally:
+            conn.close()
+
+    def read_timestamps(self, symbol: str, start_ms: int = None, end_ms: int = None) -> set:
+        """
+        Just the ts_ms values already cached for symbol in [start_ms,
+        end_ms] (either bound optional), as a set — for diffing
+        against upstream's available timestamps to find genuinely
+        missing candles. Cheap on purpose: candles_1m_<symbol> is
+        populated occasionally, not one row per market minute, so
+        callers can't assume a full schedule and diff against that —
+        they diff this set directly against upstream's own timestamp
+        set instead (see BackfillManager.sync_history_cache_with_main_db).
+        Empty set if the table doesn't exist or nothing matches.
+        """
+        table = self.table_name(symbol)
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("ts_ms >= %s")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("ts_ms <= %s")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_timestamps({symbol}) connect failed: {exc}", flush=True)
+            return set()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return set()
+            cur.execute(f"SELECT ts_ms FROM {_quote_ident(table)}{where}", params)
+            rows = cur.fetchall()
+            cur.close()
+            return {int(r[0]) for r in rows}
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_timestamps({symbol}) failed: {exc}", flush=True)
+            return set()
+        finally:
+            conn.close()
+
+    def read_candles(self, symbol: str, start_ms: int = None, end_ms: int = None):
+        """
+        Rows for symbol within [start_ms, end_ms] (either bound
+        optional), ascending by ts_ms. Empty list if the table doesn't
+        exist or nothing matches.
+        """
+        table = self.table_name(symbol)
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("ts_ms >= %s")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("ts_ms <= %s")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_candles({symbol}) connect failed: {exc}", flush=True)
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return []
+            cur.execute(
+                f"SELECT ts_ms, open, high, low, close, volume FROM {_quote_ident(table)}{where} ORDER BY ts_ms",
+                params,
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [
+                {
+                    "timestamp": r[0], "open": r[1], "high": r[2],
+                    "low": r[3], "close": r[4], "volume": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] read_candles({symbol}) failed: {exc}", flush=True)
+            return []
+        finally:
+            conn.close()
+
+    def delete_before_bulk(self, symbols: list, cutoff_ms: int) -> int:
+        """
+        Prune every symbol's candles_1m_<symbol> rows older than
+        cutoff_ms. Nothing pruned this table before this method
+        existed: sync_history_cache_with_main_db() keeps adding newly
+        confirmed candles to this table every run and nothing was ever
+        removing old ones, so — unlike candle1m_<symbol>
+        (Candle1mCache.delete_before_bulk, which DOES get pruned) —
+        it grew without bound.
+
+        Same pattern as Candle1mCache.delete_before_bulk() (see that
+        method's docstring for the full reasoning): one PL/pgSQL DO
+        block per BATCH of symbols, server-side, its own transaction,
+        to_regclass() skipping any symbol with no candles_1m_<symbol>
+        table yet (read_timestamps()'s docstring notes this table is
+        populated only occasionally, so plenty of symbols won't have
+        one every run) rather than erroring the whole batch, and its
+        own generous statement_timeout for the same reason as the
+        other two delete_before_bulk() implementations in this file.
+
+        safe_syms is sanitized via _safe_symbol() (alnum/underscore
+        only) before being embedded in the array literal — see that
+        function's own docstring.
+
+        Returns the total row count deleted across every symbol and
+        every batch that succeeded (0 on total failure — logged, never
+        raised; a batch that fails still lets later batches run).
+        """
+        if not symbols:
+            return 0
+
+        safe_syms  = sorted({_safe_symbol(s) for s in symbols})
+        cutoff     = int(cutoff_ms)
+        batch_size = self._DELETE_BEFORE_BULK_BATCH_SIZE
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] delete_before_bulk connect failed: {exc}", flush=True)
+            return 0
+
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[HISTORY_STORE][WARN] could not raise statement_timeout on delete_before_bulk connection: {exc}", flush=True)
+
+        grand_total = 0
+        try:
+            for i in range(0, len(safe_syms), batch_size):
+                batch = safe_syms[i:i + batch_size]
+                syms_array_sql = "ARRAY[" + ",".join(f"'{s}'" for s in batch) + "]::text[]"
+
+                do_block = f"""
+                    DO $do$
+                    DECLARE
+                        sym   TEXT;
+                        tbl   TEXT;
+                        total BIGINT := 0;
+                        n     BIGINT;
+                    BEGIN
+                        FOREACH sym IN ARRAY {syms_array_sql}
+                        LOOP
+                            tbl := '{self.PG_TABLE_PREFIX}_' || sym;
+                            IF to_regclass(tbl) IS NOT NULL THEN
+                                EXECUTE format('DELETE FROM %I WHERE ts_ms < {cutoff}', tbl);
+                                GET DIAGNOSTICS n = ROW_COUNT;
+                                total := total + n;
+                            END IF;
+                        END LOOP;
+                        RAISE NOTICE 'DELETE_BEFORE_BULK_TOTAL:%', total;
+                    END
+                    $do$;
+                """
+
+                try:
+                    conn.notices.clear()
+                    cur.execute(do_block)
+                    batch_total = 0
+                    for notice in reversed(conn.notices):
+                        if "DELETE_BEFORE_BULK_TOTAL:" in notice:
+                            try:
+                                batch_total = int(notice.strip().split("DELETE_BEFORE_BULK_TOTAL:")[-1].strip())
+                            except ValueError:
+                                pass
+                            break
+                    conn.commit()
+                    grand_total += batch_total
+                except Exception as exc:
+                    print(
+                        f"[HISTORY_STORE][WARN] delete_before_bulk batch "
+                        f"{i // batch_size + 1} ({len(batch)} symbol(s)) failed: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            if grand_total:
+                print(
+                    f"[HISTORY_STORE] delete_before_bulk: {grand_total} row(s) across "
+                    f"{len(safe_syms)} symbol(s), ts_ms < {cutoff}",
+                    flush=True,
+                )
+            return grand_total
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+class Candle1mCache:
+    """
+    Tier-2 candle cache — per-symbol table of pre-aggregated 1-minute
+    candles for trading days OLDER than the raw-tick "Tier-1" window
+    (see BackfillManager.sync_1m_candle_cache()'s docstring for the
+    full two-tier design). Each row here is a genuine OHLC candle —
+    NOT a mirror of market_history's own quote_<symbol> candles (that
+    remains HistoryCandleStore's job, a different data source
+    entirely). These rows are produced EITHER by aggregating our own
+    already-cached raw ticks locally (once they're confirmed gap-free
+    for that day), OR — if the local raw ticks for that day are
+    missing/untrusted — by asking the main db to aggregate its own
+    quote_<symbol> ticks server-side and just hand back the finished
+    candles (see BackfillManager._fetch_1m_candles_from_main_db()).
+
+    Table: candle1m_<symbol> — same shape/upsert pattern as
+    HistoryCandleStore's candles_1m_<symbol> (ts_ms PK; COPY into a
+    reusable TEMP TABLE, then one bulk INSERT...ON CONFLICT merge —
+    see that class's save_candles() docstring for why), just a
+    separate namespace/prefix so the two data sources never collide
+    or get confused with each other.
+    """
+
+    PG_TABLE_PREFIX = "candle1m"
+
+    def __init__(self, base_dir=None):
+        # base_dir accepted-and-ignored for call-site symmetry with
+        # HistoryCandleStore/TickWriter — no local file backs this.
+        self._known_tables = set()
+        self._save_conn = None
+        self._STAGING_TABLE = "candle1m_cache_stage"
+
+    @classmethod
+    def table_name(cls, symbol: str) -> str:
+        return f"{cls.PG_TABLE_PREFIX}_{_safe_symbol(symbol)}"
+
+    def _connect(self):
+        return psycopg2.connect(**_conn_params())
+
+    def _get_save_conn(self):
+        if self._save_conn is not None and not self._save_conn.closed:
+            return self._save_conn
+        self._save_conn = self._connect()
+        return self._save_conn
+
+    def _ensure_staging_table(self, conn):
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TEMP TABLE IF NOT EXISTS {self._STAGING_TABLE} (
+                ts_ms  BIGINT,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
+            )
+        """)
+
+    def _ensure_table(self, conn, table: str):
+        if table in self._known_tables:
+            return
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {_quote_ident(table)} (
+                ts_ms  BIGINT PRIMARY KEY,
+                open   DOUBLE PRECISION,
+                high   DOUBLE PRECISION,
+                low    DOUBLE PRECISION,
+                close  DOUBLE PRECISION,
+                volume DOUBLE PRECISION
+            )
+        """)
+        conn.commit()
+        cur.close()
+        self._known_tables.add(table)
+
+    # ─────────────────────────────────────────────
+    # Writes
+    # ─────────────────────────────────────────────
+
+    def save_candles(self, symbol: str, rows):
+        """
+        rows: list of {"timestamp": ms_int, "open", "high", "low",
+        "close", "volume"} dicts, or a DataFrame with those columns.
+        Upserts on ts_ms — safe to call repeatedly / with overlapping
+        ranges. Same COPY-into-staging-then-merge pattern as
+        HistoryCandleStore.save_candles() — see that method's
+        docstring for why.
+        """
+        if isinstance(rows, pd.DataFrame):
+            if rows.empty:
+                return
+            df = rows.copy()
+        else:
+            if not rows:
+                return
+            df = pd.DataFrame(rows)
+
+        for c in ("timestamp", "open", "high", "low", "close", "volume"):
+            if c not in df.columns:
+                df[c] = None
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df[df["timestamp"].notna()]
+        if df.empty:
+            return
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df = df.rename(columns={"timestamp": "ts_ms"})
+
+        try:
+            conn = self._get_save_conn()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] save_candles({symbol}) connect failed: {exc}", flush=True)
+            return
+        try:
+            table = self.table_name(symbol)
+            self._ensure_table(conn, table)
+            self._ensure_staging_table(conn)
+            cur = conn.cursor()
+            cur.execute(f"TRUNCATE {self._STAGING_TABLE}")
+
+            buf = io.StringIO()
+            try:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", lineterminator="\n")
+            except TypeError:
+                df.to_csv(buf, sep="\t", header=False, index=False, na_rep="\\N", line_terminator="\n")
+            buf.seek(0)
+            cur.copy_expert(
+                f"COPY {self._STAGING_TABLE} (ts_ms, open, high, low, close, volume) FROM STDIN WITH (FORMAT text)",
+                buf,
+            )
+
+            cur.execute(f"""
+                INSERT INTO {_quote_ident(table)} (ts_ms, open, high, low, close, volume)
+                SELECT ts_ms, open, high, low, close, volume FROM {self._STAGING_TABLE}
+                ON CONFLICT (ts_ms) DO UPDATE SET
+                    open=EXCLUDED.open, high=EXCLUDED.high,
+                    low=EXCLUDED.low, close=EXCLUDED.close,
+                    volume=EXCLUDED.volume
+            """)
+            conn.commit()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] save_candles({symbol}) failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._save_conn = None
+
+    # ─────────────────────────────────────────────
+    # Reads
+    # ─────────────────────────────────────────────
+
+    def has_range(self, symbol: str, start_ms: int, end_ms: int) -> bool:
+        """
+        Cheap existence check — True if AT LEAST ONE candle is already
+        cached for symbol in [start_ms, end_ms]. Used by the daily
+        rollover to decide "is this day already done" without pulling
+        the actual rows back (see save_candles()'s docstring — a day
+        is ~375 rows, but this only needs a boolean). False if the
+        table doesn't exist yet or nothing matches.
+        """
+        table = self.table_name(symbol)
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] has_range({symbol}) connect failed: {exc}", flush=True)
+            return False
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return False
+            cur.execute(
+                f"SELECT 1 FROM {_quote_ident(table)} WHERE ts_ms >= %s AND ts_ms <= %s LIMIT 1",
+                (int(start_ms), int(end_ms)),
+            )
+            return cur.fetchone() is not None
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] has_range({symbol}) failed: {exc}", flush=True)
+            return False
+        finally:
+            conn.close()
+
+    def read_candles(self, symbol: str, start_ms: int = None, end_ms: int = None):
+        """
+        Rows for symbol within [start_ms, end_ms] (either bound
+        optional), ascending by ts_ms. Empty list if the table doesn't
+        exist or nothing matches.
+        """
+        table = self.table_name(symbol)
+
+        clauses, params = [], []
+        if start_ms is not None:
+            clauses.append("ts_ms >= %s")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("ts_ms <= %s")
+            params.append(int(end_ms))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] read_candles({symbol}) connect failed: {exc}", flush=True)
+            return []
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=%s", (table,))
+            if not cur.fetchone():
+                return []
+            cur.execute(
+                f"SELECT ts_ms, open, high, low, close, volume FROM {_quote_ident(table)}{where} ORDER BY ts_ms",
+                params,
+            )
+            rows = cur.fetchall()
+            cur.close()
+            return [
+                {
+                    "timestamp": r[0], "open": r[1], "high": r[2],
+                    "low": r[3], "close": r[4], "volume": r[5],
+                }
+                for r in rows
+            ]
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] read_candles({symbol}) failed: {exc}", flush=True)
+            return []
+        finally:
+            conn.close()
+
+
+    # Chunk size for delete_before_bulk()'s per-batch DO blocks — same
+    # reasoning as PostgresTickWriter._DELETE_BEFORE_BULK_BATCH_SIZE.
+    _DELETE_BEFORE_BULK_BATCH_SIZE = 20
+
+    # statement_timeout (ms) for delete_before_bulk()'s dedicated
+    # connection — same reasoning as PostgresTickWriter's.
+    _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS = 120_000
+
+    def delete_before_bulk(self, symbols: list, cutoff_ms: int) -> int:
+        """
+        Prune every symbol's candle1m_<symbol> rows older than
+        cutoff_ms — the Tier-2 retention counterpart to
+        PostgresTickWriter.delete_before_bulk() (which prunes Tier-1
+        raw ticks). Nothing pruned this table before this method
+        existed — see BackfillManager's own retention comment for why
+        that's a real gap: sync_1m_candle_cache() keeps adding a new
+        rollover day to this table every trading day and nothing was
+        ever removing old ones, so it grew without bound.
+
+        Runs one PL/pgSQL DO block per BATCH of symbols (see
+        _DELETE_BEFORE_BULK_BATCH_SIZE), each looping over every
+        symbol's candle1m_<symbol> table in that batch, server-side,
+        inside its own transaction — same batching/lock-footprint/
+        blast-radius reasoning as PostgresTickWriter.delete_before_bulk()
+        (see that method's docstring); a single all-symbols-at-once DO
+        block is exactly what caused the original timeout bug this
+        codebase already hit once on the raw-tick version of this
+        operation. to_regclass() skips any table that doesn't exist
+        instead of erroring the whole batch (a symbol might not have
+        any Tier-2 rollover days yet).
+
+        This connection gets its own generous statement_timeout (see
+        _DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS) rather than relying
+        on _conn_params()'s normal-query-traffic default, for the same
+        reason as PostgresTickWriter.delete_before_bulk().
+
+        safe_syms is sanitized via _safe_symbol() (alnum/underscore
+        only) before being embedded in the array literal — see that
+        function's own docstring — so this builds the full query
+        directly rather than mixing psycopg2's %-substitution with
+        PL/pgSQL's format()/%I inside the same string.
+
+        Returns the total row count deleted across every symbol and
+        every batch that succeeded (0 on total failure — logged, never
+        raised; a batch that fails still lets later batches run).
+        """
+        if not symbols:
+            return 0
+
+        safe_syms  = sorted({_safe_symbol(s) for s in symbols})
+        cutoff     = int(cutoff_ms)
+        batch_size = self._DELETE_BEFORE_BULK_BATCH_SIZE
+
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] delete_before_bulk connect failed: {exc}", flush=True)
+            return 0
+
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SET statement_timeout = {self._DELETE_BEFORE_BULK_STATEMENT_TIMEOUT_MS}")
+            conn.commit()
+        except Exception as exc:
+            print(f"[CANDLE1M_STORE][WARN] could not raise statement_timeout on delete_before_bulk connection: {exc}", flush=True)
+
+        grand_total = 0
+        try:
+            for i in range(0, len(safe_syms), batch_size):
+                batch = safe_syms[i:i + batch_size]
+                syms_array_sql = "ARRAY[" + ",".join(f"'{s}'" for s in batch) + "]::text[]"
+
+                do_block = f"""
+                    DO $do$
+                    DECLARE
+                        sym   TEXT;
+                        tbl   TEXT;
+                        total BIGINT := 0;
+                        n     BIGINT;
+                    BEGIN
+                        FOREACH sym IN ARRAY {syms_array_sql}
+                        LOOP
+                            tbl := '{self.PG_TABLE_PREFIX}_' || sym;
+                            IF to_regclass(tbl) IS NOT NULL THEN
+                                EXECUTE format('DELETE FROM %I WHERE ts_ms < {cutoff}', tbl);
+                                GET DIAGNOSTICS n = ROW_COUNT;
+                                total := total + n;
+                            END IF;
+                        END LOOP;
+                        RAISE NOTICE 'DELETE_BEFORE_BULK_TOTAL:%', total;
+                    END
+                    $do$;
+                """
+
+                try:
+                    conn.notices.clear()
+                    cur.execute(do_block)
+                    batch_total = 0
+                    for notice in reversed(conn.notices):
+                        if "DELETE_BEFORE_BULK_TOTAL:" in notice:
+                            try:
+                                batch_total = int(notice.strip().split("DELETE_BEFORE_BULK_TOTAL:")[-1].strip())
+                            except ValueError:
+                                pass
+                            break
+                    conn.commit()
+                    grand_total += batch_total
+                except Exception as exc:
+                    print(
+                        f"[CANDLE1M_STORE][WARN] delete_before_bulk batch "
+                        f"{i // batch_size + 1} ({len(batch)} symbol(s)) failed: {exc}",
+                        flush=True,
+                    )
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            if grand_total:
+                print(
+                    f"[CANDLE1M_STORE] delete_before_bulk: {grand_total} row(s) across "
+                    f"{len(safe_syms)} symbol(s), ts_ms < {cutoff}",
+                    flush=True,
+                )
+            return grand_total
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# Back-compat alias — old code importing DepthWriter from depth_writer.py
+# should now import TickWriter from tick_writer.py instead.
+DepthWriter = TickWriter

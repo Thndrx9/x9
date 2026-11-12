@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+archive_cache/
+ohlcdata/
+connection_logs/
+*.db
+fo_symbols_cache.json

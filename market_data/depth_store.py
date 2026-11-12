@@ -2,7 +2,7 @@
 
 import os
 from collections import deque
-from event_bus import depth_data_queue
+from engine.event_bus import depth_data_queue
 
 
 class DepthStore:
@@ -15,11 +15,17 @@ class DepthStore:
 
     • Consumes depth_data_queue directly (websocket_connect.py routes
       Depth-mode ticks here, never through OHLCCollector/market_data_queue)
-    • Keeps a rolling RAM_WINDOW_MINUTES (default 30) window of history
-      per symbol — not just the single latest snapshot — pruned on
-      every update. Disk (via DepthWriter) always keeps the full history;
-      this only bounds what stays resident in memory.
-    • Forwards every update to DepthWriter (SQLite-backed) for persistence
+    • Keeps a rolling DEPTH_RAM_WINDOW_MINUTES (default 30) window of
+      history per symbol — not just the single latest snapshot —
+      pruned on every update. Disk (via TickWriter, kind='depth')
+      always keeps the full history; this only bounds what stays
+      resident in memory. Deliberately its OWN env var, separate from
+      ohlc.py's RAM_WINDOW_MINUTES (candle retention) — they used to
+      share one setting, which meant tuning candle RAM retention would
+      silently also change how much depth history stays in memory,
+      and vice versa. Independent knobs now.
+    • Forwards every update to TickWriter (SQLite-backed, shared with
+      quote ticks) for persistence
 
     NOTE: the exact field names OpenAlgo uses for bid/ask levels in a
     Depth packet weren't available when this was written, so
@@ -29,12 +35,12 @@ class DepthStore:
     keys back and the field mapping can be corrected exactly.
     """
 
-    def __init__(self, depth_writer=None):
+    def __init__(self, tick_writer=None):
         # symbol -> deque of snapshot dicts, oldest first
         self.depth_history  = {}
-        self.depth_writer    = depth_writer
+        self.tick_writer     = tick_writer
         self._warned_shape   = False
-        self.ram_window_secs = int(os.getenv("RAM_WINDOW_MINUTES", "30")) * 60
+        self.ram_window_secs = int(os.getenv("DEPTH_RAM_WINDOW_MINUTES", "30")) * 60
 
     async def run(self):
         print("[DEPTH] Collector running", flush=True)
@@ -90,8 +96,8 @@ class DepthStore:
             history.popleft()
 
         # ── Disk: full history, no windowing ────────────────────────────
-        if self.depth_writer is not None:
-            self.depth_writer.enqueue(symbol, snapshot)
+        if self.tick_writer is not None:
+            self.tick_writer.enqueue_live(symbol, "depth", snapshot)
 
     # ─────────────────────────────────────────────
     # Read access for live consumers (e.g. slippage-aware execution)

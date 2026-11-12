@@ -1,0 +1,656 @@
+# ohlc.py
+
+import os
+import re
+import time
+import pandas as pd
+from datetime import datetime, timedelta
+from engine.market_time import tz_kolkata, MARKET_OPEN
+from engine.event_bus import market_data_queue
+import asyncio
+import threading
+from collections import deque
+from candles.parquet_writer import ParquetWriter
+from verification.gap_detector import (
+    compute_bucket,
+    compute_bucket_vectorized,
+    compute_tick_volume_vectorized,
+    is_at_or_after_market_open_vectorized,
+    is_before_continuous_close_vectorized,
+    MARKET_CLOSE_SECS,
+    CAS_CONTINUOUS_CLOSE_SECS,
+)
+
+# 9:15:00 in seconds from midnight
+MARKET_OPEN_SECS = MARKET_OPEN.hour * 3600 + MARKET_OPEN.minute * 60  # 33300
+
+
+# ─────────────────────────────────────────────
+# TF utilities  (also mirrored in gap_detector.py's compute_bucket)
+# ─────────────────────────────────────────────
+
+def _tf_to_seconds(tf_str: str) -> int:
+    """
+    Parse a timeframe string into total seconds.
+    '5s' → 5   '30s' → 30   '1m' → 60
+    '5m' → 300  '1m30s' → 90  '15m' → 900
+    """
+    total = 0
+    for value, unit in re.findall(r'(\d+)([ms])', tf_str.lower()):
+        total += int(value) * (60 if unit == 'm' else 1)
+    if total == 0:
+        raise ValueError(f"[OHLC] Invalid timeframe string: '{tf_str}'")
+    return total
+
+
+def _compute_bucket(ts: datetime, tf_seconds: int) -> datetime:
+    """
+    Return the candle-open timestamp aligned to market open (9:15:00 IST).
+    Works for every TF — seconds, mixed, minutes.
+
+    9:15:03 @ 5s  → 9:15:00
+    9:17:42 @ 5m  → 9:15:00
+    9:16:10 @ 90s → 9:15:00   (1m30s bucket)
+    9:16:31 @ 90s → 9:16:30
+    """
+    secs = ts.hour * 3600 + ts.minute * 60 + ts.second
+    secs_since_open = max(secs - MARKET_OPEN_SECS, 0)
+    bucket_secs = MARKET_OPEN_SECS + (secs_since_open // tf_seconds) * tf_seconds
+    return ts.replace(
+        hour        = bucket_secs // 3600,
+        minute      = (bucket_secs % 3600) // 60,
+        second      = bucket_secs % 60,
+        microsecond = 0,
+    )
+
+
+class PreviousCandleGuard:
+    """
+    Ensures the immediately previous closed candle exists continuously.
+    Repairs 1m gaps via backfill and re-derives 5m.
+    """
+
+    def __init__(self, ohlc, poll_seconds=2.0):
+        self.ohlc = ohlc
+        self.poll_seconds = poll_seconds
+        self._attempted = set()
+
+    def _has_minute(self, symbol, minute_ts):
+        candles = self.ohlc.ohlc_1m.get(symbol, [])
+        if not candles:
+            return False
+
+        target = pd.Timestamp(minute_ts)
+        for c in candles:
+            ts = pd.Timestamp(c["timestamp"])
+            if ts == target:
+                return True
+        return False
+
+
+class OHLCCollector:
+    """
+    OHLCCollector
+    ─────────────
+    • Builds candles for ALL configured TFs directly from ticks
+    • No derivation chain — every TF is updated on every tick
+    • TFs set via TIMEFRAMES env var  e.g. "5s,30s,1m,1m30s,5m,15m"
+    • Candle buckets are aligned to market open (9:15:00 IST)
+    • SINGLE instance enforced via _WRITER_LOCK
+    """
+
+    _WRITER_LOCK = False
+
+    def __init__(self, base_dir="ohlcdata", tick_writer=None, history_store=None, conn_log_dir=None):
+        if OHLCCollector._WRITER_LOCK:
+            raise RuntimeError("[OHLC][FATAL] Multiple OHLCCollector instances detected")
+        OHLCCollector._WRITER_LOCK = True
+
+        self.base_dir = base_dir
+        # Passed through to BackfillManager so it can cross-check
+        # detected gaps against confirmed disconnect windows in
+        # connection_log.db (see gap_detector.connection_outage_windows).
+        self.conn_log_dir = conn_log_dir
+
+        # ── Load configured timeframes from env ───────────────────────
+        tf_env = os.getenv("TIMEFRAMES", "1m,5m")
+        self._configured_tfs = [tf.strip() for tf in tf_env.split(",") if tf.strip()]
+        self._tf_list = [(tf, _tf_to_seconds(tf)) for tf in self._configured_tfs]
+
+        # ── RAM stores — keyed by timeframe string ────────────────────
+        # ohlc_data[tf][symbol] = [ {timestamp, open, high, low, close, volume}, ... ]
+        self.ohlc_data = {tf: {} for tf in self._configured_tfs}
+
+        # ── Forming (not-yet-closed) candles per TF ───────────────────
+        # current_candles[tf][symbol] = { timestamp, open, high, low, close, volume }
+        self.current_candles = {tf: {} for tf in self._configured_tfs}
+
+        # ── RAM retention (rolling window) ─────────────────────────────
+        # Raw ticks + closed candles are pruned from RAM (NOT from disk —
+        # Parquet keeps full history) once they age out of this window.
+        # Per-TF window = max(RAM_WINDOW_MINUTES, MIN_CANDLES * tf_seconds)
+        # so higher TFs always retain at least MIN_CANDLES candles, which
+        # indicators.py / ADX depend on — a flat 30-min cap alone would
+        # starve 5m/15m of enough history.
+        self.ram_window_secs = int(os.getenv("RAM_WINDOW_MINUTES", "30")) * 60
+        self.min_candles     = int(os.getenv("MIN_CANDLES", "15"))
+        self._tf_seconds_map = dict(self._tf_list)
+
+        # Raw Quote ticks, kept only for a dedicated flat window — separate
+        # from RAM_WINDOW_MINUTES (candle retention) so tuning one never
+        # accidentally shifts the other. No MIN_CANDLES-style floor applies
+        # to raw ticks since they're not candles.
+        self.tick_ram_window_secs = int(os.getenv("TICK_RAM_WINDOW_MINUTES", "9")) * 60
+        # raw_ticks[symbol] = deque of {timestamp, ltp, qty}
+        self.raw_ticks = {}
+
+        # Per-symbol (date, last cumulative "volume" seen) — used by
+        # _process_tick() to diff the broker feed's cumulative volume
+        # into each tick's own incremental contribution. See that
+        # method's comment for why this beats summing last_trade_quantity.
+        self._last_cum_volume = {}
+
+        # ── Backward-compat references ────────────────────────────────
+        # executor.py / indicators.py / PreviousCandleGuard use these names directly.
+        # They point to the SAME dict objects inside ohlc_data / current_candles
+        # so mutations through either name are always in sync.
+        self.ohlc_1m    = self.ohlc_data.get("1m", {})
+        self.ohlc_5m    = self.ohlc_data.get("5m", {})
+        self.current_1m = self.current_candles.get("1m", {})
+
+        self.latest_ltp = {}
+        self._ram_lock  = threading.RLock()
+        self._ensured_parquet = set()
+
+        self._backfilled     = False
+        self.backfill_complete = False
+        self.parquet_writer  = ParquetWriter(base_dir=base_dir, tz=tz_kolkata)
+
+        # Local SQLite tick cache (shared with DepthStore, kind='quote'
+        # here) — optional; BackfillManager also writes PG catch-up
+        # rows through this same writer, so it's read here as
+        # `self.tick_writer` (see backfill_manager.py).
+        self.tick_writer = tick_writer
+
+        # Local SQLite cache for candles fetched from the history
+        # (fallback) DB — optional; BackfillManager reads/writes this
+        # as `self.history_store` (see tick_writer.py's HistoryCandleStore).
+        self.history_store = history_store
+
+        print(
+            f"[OHLC] Initialized | TFs: {self._configured_tfs} | base_dir: {base_dir}",
+            flush=True,
+        )
+
+    # =====================================================
+    # PUBLIC SAVE API  (used by live tick processing + backfill)
+    # =====================================================
+
+    def save_candle(self, symbol, timeframe, candle):
+        key = (symbol, timeframe)
+        with self._ram_lock:
+            if key not in self._ensured_parquet:
+                self.parquet_writer.ensure_file(symbol, timeframe)
+                self._ensured_parquet.add(key)
+        self._append_ram(symbol, timeframe, candle)
+        self.parquet_writer.enqueue(symbol, timeframe, candle)
+
+    def save_candles_bulk(self, symbol, timeframe, candles_df):
+        """
+        Same effect as calling save_candle() once per row of
+        candles_df, but O(N) instead of O(N^2) on BOTH the RAM side and
+        the disk side — this is what BackfillManager._finalize_symbol()
+        uses instead of looping save_candle() per historical candle.
+
+        RAM side: builds the merged/deduped series in one pass (a dict
+        keyed by timestamp) instead of _append_ram()'s per-call linear
+        scan for an existing same-timestamp row — that scan is fine for
+        one live tick at a time, but re-scanning the whole growing
+        series for every one of a few hundred historical candles adds
+        up.
+
+        Disk side: delegates to parquet_writer.enqueue_bulk(), which
+        does one read-merge-write for the whole batch instead of one
+        per candle — see that method's docstring for why the per-candle
+        version was the dominant cost of slow candle building.
+        """
+        if candles_df is None or candles_df.empty:
+            return
+
+        key = (symbol, timeframe)
+        with self._ram_lock:
+            if key not in self._ensured_parquet:
+                self.parquet_writer.ensure_file(symbol, timeframe)
+                self._ensured_parquet.add(key)
+
+            store = self.ohlc_data.get(timeframe)
+            if store is not None:
+                series = store.setdefault(symbol, [])
+                by_ts = {pd.Timestamp(r["timestamp"]): r for r in series}
+                for row in candles_df.itertuples(index=False):
+                    ts = pd.Timestamp(row.timestamp)
+                    by_ts[ts] = {
+                        "timestamp": ts,
+                        "open":      float(row.open),
+                        "high":      float(row.high),
+                        "low":       float(row.low),
+                        "close":     float(row.close),
+                        "volume":    float(row.volume),
+                    }
+                merged = sorted(by_ts.values(), key=lambda r: r["timestamp"])
+
+                tf_seconds = self._tf_seconds_map.get(timeframe)
+                if tf_seconds and merged:
+                    cutoff = merged[-1]["timestamp"] - timedelta(seconds=self._retention_secs(tf_seconds))
+                    merged = [r for r in merged if r["timestamp"] >= cutoff]
+
+                store[symbol] = merged
+
+        self.parquet_writer.enqueue_bulk(symbol, timeframe, candles_df)
+
+    # ─────────────────────────────────────────────
+    # Batch candle building — for BackfillManager's historical passes.
+    # (Separate from _process_tick(), which handles ONE live tick at a
+    # time; these work over a whole fetched DataFrame at once and use
+    # gap_detector's vectorized bucket math instead of a per-row loop.)
+    # ─────────────────────────────────────────────
+
+    def aggregate_ticks_to_candles(
+        self,
+        df:         pd.DataFrame,
+        tf_seconds: int,
+        now:        datetime,
+        continuous_close_secs: int = MARKET_CLOSE_SECS,
+    ) -> pd.DataFrame:
+        """
+        Group ticks into OHLC candles using market-open-aligned buckets.
+        Excludes the currently-forming candle (bucket == current_bucket).
+
+        continuous_close_secs caps how late in the day (seconds since
+        IST midnight) a tick can still be bucketed into a candle —
+        pass CAS_CONTINUOUS_CLOSE_SECS (15:15) for F&O-eligible
+        symbols, the default MARKET_CLOSE_SECS (15:30) for everyone
+        else. See is_before_continuous_close_vectorized()'s docstring
+        in gap_detector.py and fo_symbols.py's module docstring for why.
+        """
+        df = df.copy()
+
+        if df.empty or "ist_ts" not in df.columns:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+
+        # The broker feed's "volume" is CUMULATIVE (volume traded so far
+        # today), not per-tick — see compute_tick_volume_vectorized()'s
+        # docstring in gap_detector.py for the full reasoning on why
+        # candle volume is diffed from this rather than summed from
+        # "qty" (last_trade_quantity).
+        # Sort by (ist_ts, timestamp) explicitly, not just ist_ts —
+        # ist_ts is now derived from "ltt" (last trade time), which is
+        # only second-precision, so multiple ticks can share an
+        # identical ist_ts. "timestamp" (millisecond packet time)
+        # breaks that tie in true arrival order, so open/close price
+        # attribution within a tied group stays deterministic rather
+        # than depending on whatever order the rows happened to arrive
+        # in from the DB/RAM buffer.
+        sort_cols = ["ist_ts", "timestamp"] if "timestamp" in df.columns else ["ist_ts"]
+        df = df.sort_values(sort_cols)
+        if "volume" in df.columns:
+            tiebreaker = df["timestamp"] if "timestamp" in df.columns else None
+            df["tick_volume"] = compute_tick_volume_vectorized(df["ist_ts"], df["volume"], tiebreaker=tiebreaker)
+        else:
+            # Fallback for any caller that hasn't been updated to pass
+            # a cumulative "volume" column through yet.
+            df["tick_volume"] = df.get("qty", 0)
+
+        # Vectorized — was previously a per-row .apply(compute_bucket), which
+        # is a pure-Python loop over every tick and dominated wall time
+        # (measured ~2.5s per 130k-tick symbol per timeframe; with 199
+        # symbols x 2 TFs that adds up to several minutes). This does the
+        # same bucket math as numpy array ops instead of a scalar function
+        # call per row. See compute_bucket_vectorized()'s docstring in
+        # gap_detector.py for the equivalence guarantee with compute_bucket().
+        df["bucket"] = compute_bucket_vectorized(df["ist_ts"], tf_seconds)
+
+        # Drop any tick that landed before market open (bucket would be 9:15:00
+        # even for pre-market ticks — filter them by comparing raw ist_ts).
+        # Vectorized (int64 seconds-of-day) instead of .dt.time — see
+        # is_at_or_after_market_open_vectorized()'s docstring in
+        # gap_detector.py; this was the dominant cost (~86%) of this method.
+        df = df[is_at_or_after_market_open_vectorized(df["ist_ts"])]
+
+        # Drop any tick at/after this symbol's continuous-trading close
+        # (15:15 for F&O/CAS symbols, 15:30 otherwise) — see this
+        # method's docstring. A no-op when continuous_close_secs is the
+        # default MARKET_CLOSE_SECS and the data doesn't extend past
+        # 15:30 anyway, so this is safe to always apply.
+        df = df[is_before_continuous_close_vectorized(df["ist_ts"], continuous_close_secs)]
+
+        # Exclude the currently-forming (incomplete) candle
+        current_bucket = compute_bucket(now, tf_seconds)
+        df = df[df["bucket"] < current_bucket]
+
+        if df.empty:
+            return pd.DataFrame(
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+
+        grouped = (
+            df.groupby("bucket", sort=True)
+            .agg(
+                open   = ("ltp", "first"),
+                high   = ("ltp", "max"),
+                low    = ("ltp", "min"),
+                close  = ("ltp", "last"),
+                volume = ("tick_volume", "sum"),
+            )
+            .reset_index()
+            .rename(columns={"bucket": "timestamp"})
+        )
+
+        return grouped.reset_index(drop=True)
+
+    def build_symbol_candles(self, ticks_df, history_df, start_ts, now, timeframes, history_native_tf, gaps, continuous_close_secs: int = MARKET_CLOSE_SECS):
+        """
+        For every configured TF: build candles giving priority to
+        history-db data (history_df — already this symbol's full
+        lookback-window's worth of history-db candles, local-cache rows
+        plus freshly fetched ones, stitched together by BackfillManager)
+        over tick-aggregated ones:
+
+          - history_native_tf itself (default "1m"): a history-db
+            candle wins on any bucket collision; tick-aggregated candles
+            at that TF only fill buckets history_df doesn't cover.
+          - every OTHER (higher) TF: ALWAYS derived first by rolling up
+            the merged 1m base above via gaps.derive_from_1m(), across
+            every expected bucket for that TF — not just ones missing —
+            so a history-backed 1m sequence produces the higher-TF
+            candle even where raw-tick aggregation at that TF would
+            also have produced one. Only a bucket whose full run of 1m
+            sub-candles isn't available in the merged base falls back
+            to tick-aggregated-at-that-TF instead.
+
+        No DB calls in here — history_df/ticks_df must already be
+        fetched by the caller. `gaps` is a GapDetector (gap_detector.py)
+        instance — this method builds candles, it delegates "what's
+        missing" to gaps rather than computing that itself.
+
+        continuous_close_secs is passed straight through to every
+        aggregate_ticks_to_candles() call below — see that method's
+        docstring. Callers should pass CAS_CONTINUOUS_CLOSE_SECS for
+        F&O-eligible symbols (see fo_symbols.py), the default
+        MARKET_CLOSE_SECS otherwise.
+
+        Returns per_tf: {tf_str: {"candles", "missing", "expected"}}
+        """
+        native_tf_seconds = dict(timeframes).get(history_native_tf)
+
+        # merged_1m: the history-priority 1m base every higher TF derives
+        # from. history_df wins on collision; tick-aggregated 1m fills in
+        # what history_df doesn't have. If history_native_tf isn't itself
+        # a configured display TF, history_df alone still serves as the
+        # roll-up base (nothing to merge it against).
+        merged_1m = None
+        if native_tf_seconds is not None:
+            tick_native = self.aggregate_ticks_to_candles(ticks_df, native_tf_seconds, now, continuous_close_secs)
+            merged_1m = (
+                gaps.merge_candles(history_df, tick_native)
+                if history_df is not None and not history_df.empty
+                else tick_native
+            )
+        elif history_df is not None and not history_df.empty:
+            merged_1m = history_df
+
+        per_tf = {}
+        for tf_str, tf_seconds in timeframes:
+            expected = gaps.expected_buckets(start_ts, now, tf_seconds)
+
+            if tf_str == history_native_tf:
+                candles = merged_1m if merged_1m is not None else self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
+            elif tf_seconds > 60 and merged_1m is not None and not merged_1m.empty:
+                derived     = gaps.derive_from_1m(merged_1m, expected, tf_seconds)
+                tick_direct = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
+                candles     = gaps.merge_candles(derived, tick_direct)
+            else:
+                candles = self.aggregate_ticks_to_candles(ticks_df, tf_seconds, now, continuous_close_secs)
+
+            missing = gaps.find_missing(candles, expected)
+            per_tf[tf_str] = {"candles": candles, "missing": missing, "expected": expected}
+
+        return per_tf
+
+    def _retention_secs(self, tf_seconds: int) -> int:
+        """max(flat RAM window, enough seconds for MIN_CANDLES) for this TF."""
+        return max(self.ram_window_secs, self.min_candles * tf_seconds)
+
+    def _append_ram(self, symbol, timeframe, candle):
+        with self._ram_lock:
+            store = self.ohlc_data.get(timeframe)
+            if store is None:
+                return                  # TF not configured — ignore
+
+            row = dict(candle)
+            row["timestamp"] = pd.Timestamp(row["timestamp"])
+            series = store.setdefault(symbol, [])
+
+            # Upsert: replace existing candle with same timestamp
+            replaced = False
+            for i, existing in enumerate(series):
+                if pd.Timestamp(existing["timestamp"]) == row["timestamp"]:
+                    series[i] = row
+                    replaced = True
+                    break
+
+            if not replaced:
+                series.append(row)
+                series.sort(key=lambda x: pd.Timestamp(x["timestamp"]))
+
+            # ── Prune RAM to this TF's retention window ─────────────────
+            # Disk (Parquet) always keeps full history — this only trims
+            # what stays resident in memory.
+            tf_seconds = self._tf_seconds_map.get(timeframe)
+            if tf_seconds and series:
+                cutoff = row["timestamp"] - timedelta(seconds=self._retention_secs(tf_seconds))
+                while series and pd.Timestamp(series[0]["timestamp"]) < cutoff:
+                    series.pop(0)
+
+    # =====================================================
+    # BACKFILL TRIGGER  (called once at startup)
+    # =====================================================
+
+    def ensure_backfill(self, symbols):
+        """
+        Loads historical candles from PostgreSQL before live trading starts.
+        Safe to call multiple times — runs only once.
+        """
+        if self._backfilled:
+            return
+
+        from backfill.backfill_manager import BackfillManager
+        backfill = BackfillManager(self)
+        backfill.run_backfill(symbols)
+
+        print(
+            f"[CANDLE] Candle building complete | {len(symbols)} symbol(s) | "
+            f"live updates running",
+            flush=True,
+        )
+
+        self._backfilled       = True
+        self.backfill_complete = True
+
+    async def ensure_backfill_async(self, symbols):
+        await asyncio.to_thread(self.ensure_backfill, symbols)
+
+    # =====================================================
+    # MAIN ASYNC LOOP
+    # =====================================================
+
+    async def run(self):
+        print("[OHLC] Collector running", flush=True)
+        while True:
+            tick = await market_data_queue.get()
+            self._process_tick(tick)
+
+    async def monitor_loop(self, symbols, indicators):
+        pass
+
+    # =====================================================
+    # TICK PROCESSING
+    # All configured TFs are updated on every single tick.
+    # No derivation chain — each TF is independent.
+    # =====================================================
+
+    @staticmethod
+    def _normalize_symbol(raw_symbol):
+        if raw_symbol is None:
+            return None
+        s = str(raw_symbol).strip().upper()
+        if ":" in s:
+            return s.split(":")[-1]
+        return s
+
+    def _process_tick(self, tick):
+        data       = tick.get("data", {})
+        raw_symbol = data.get("symbol", tick.get("symbol"))
+        symbol     = self._normalize_symbol(raw_symbol)
+        if not symbol:
+            return
+
+        if "ltp" not in data:
+            return
+        ltp = data["ltp"]
+        self.latest_ltp[symbol] = ltp
+
+        if "ltt" not in data:
+            return
+        ts = datetime.fromtimestamp(data["ltt"] / 1000, tz=tz_kolkata)
+
+        # ── Raw tick RAM store — flat rolling window, no MIN_CANDLES rule ──
+        # Reconstruct this tick's OWN incremental volume from the feed's
+        # cumulative "volume" (volume traded so far today), diffed
+        # against the last cumulative value seen for this symbol —
+        # NOT last_trade_quantity directly, since a depth-only/quote-
+        # refresh tick can re-broadcast the same last trade's size with
+        # no new trade having occurred, which would double-count if
+        # summed. Same reasoning as aggregate_ticks_to_candles() (the
+        # historical-rebuild path) — see that method's docstring.
+        raw_cum_volume = data.get("volume")
+        tick_day = ts.date()
+        if raw_cum_volume is not None:
+            prev_day, prev_cum_volume = self._last_cum_volume.get(symbol, (None, None))
+            if prev_day == tick_day and prev_cum_volume is not None:
+                tick_vol = max(raw_cum_volume - prev_cum_volume, 0)
+            else:
+                # First tick seen for this symbol today (or ever this
+                # run) — the exchange's cumulative counter starts at 0
+                # at day open, so this tick's own cumulative value
+                # already IS its full incremental contribution.
+                tick_vol = raw_cum_volume
+            self._last_cum_volume[symbol] = (tick_day, raw_cum_volume)
+        else:
+            # Feed didn't send a cumulative "volume" this tick —
+            # fall back to last_trade_quantity (imperfect: can
+            # double-count on a duplicate/depth-only re-broadcast, but
+            # better than silently dropping volume for this tick).
+            tick_vol = data.get("last_trade_quantity", 0) or 0
+
+        with self._ram_lock:
+            ticks = self.raw_ticks.setdefault(symbol, deque())
+            ticks.append({
+                "timestamp": ts,
+                "ltp":       ltp,
+                "qty":       tick_vol,
+            })
+            cutoff = ts - timedelta(seconds=self.tick_ram_window_secs)
+            while ticks and ticks[0]["timestamp"] < cutoff:
+                ticks.popleft()
+
+        # ── Local SQLite tick cache (kind='quote') ─────────────────────
+        # Captures every field PostgreSQL's quote_<symbol> table has
+        # (see tick_writer.QUOTE_EXTRA_COLUMNS), not just ltp/qty, so
+        # nothing the broker feed sends is thrown away before it ever
+        # reaches disk. ingest_ns is stamped here (arrival time at this
+        # process), same role as pg_writer's ingest_ns upstream. The
+        # broker payload's exact key names for volume/oi/circuit limits
+        # weren't confirmed against a live feed when this was written —
+        # each field below tries the most likely key name(s) and falls
+        # back to None rather than raising, so an unrecognized field
+        # just stores NULL instead of breaking ingestion. If a column
+        # comes back consistently NULL, check what key OpenAlgo is
+        # actually sending for it and adjust the .get() call below.
+        if self.tick_writer is not None:
+            self.tick_writer.enqueue_live(symbol, "quote", {
+                "timestamp":      data["ltt"],
+                "ltp":            ltp,
+                "qty":            data.get("last_trade_quantity", 0),
+                "ingest_ns":      time.time_ns(),
+                "ltt":            data.get("ltt"),
+                "volume":         data.get("volume"),
+                "open":           data.get("open"),
+                "high":           data.get("high"),
+                "low":            data.get("low"),
+                "close":          data.get("close"),
+                "last_quantity":  data.get("last_trade_quantity", data.get("last_quantity")),
+                "oi":             data.get("oi"),
+                "upper_circuit":  data.get("upper_circuit", data.get("upper_circuit_limit")),
+                "lower_circuit":  data.get("lower_circuit", data.get("lower_circuit_limit")),
+            })
+
+        # ── Update every configured TF directly from this tick ────────
+        for tf_str, tf_seconds in self._tf_list:
+            bucket   = _compute_bucket(ts, tf_seconds)
+            tf_store = self.current_candles[tf_str]
+            current  = tf_store.get(symbol)
+
+            if current is not None and current["timestamp"] != bucket:
+                # Current candle just closed — save it and reset
+                self.save_candle(symbol, tf_str, current)
+                tf_store[symbol] = None
+                current = None
+
+            if current is None:
+                # Open a new forming candle
+                tf_store[symbol] = {
+                    "timestamp": bucket,
+                    "open":      ltp,
+                    "high":      ltp,
+                    "low":       ltp,
+                    "close":     ltp,
+                    "volume":    tick_vol,
+                }
+            else:
+                # Update the existing forming candle
+                current["high"]    = max(current["high"], ltp)
+                current["low"]     = min(current["low"],  ltp)
+                current["close"]   = ltp
+                current["volume"] += tick_vol
+
+    # =====================================================
+    # SHUTDOWN
+    # =====================================================
+
+    def shutdown(self):
+        self.parquet_writer.shutdown()
+
+    # =====================================================
+    # READ ACCESS  (for other in-process modules)
+    # =====================================================
+
+    def get_recent_ticks(self, symbol, seconds=None):
+        """
+        Return buffered ticks for `symbol` as a list of
+        {"timestamp", "ltp", "qty"} dicts, oldest first.
+
+        Defaults to the full retained window (TICK_RAM_WINDOW_MINUTES,
+        9 minutes by default). Pass `seconds` for a narrower slice of
+        that same buffer — it can't exceed what's actually retained.
+        """
+        with self._ram_lock:
+            ticks = self.raw_ticks.get(symbol)
+            if not ticks:
+                return []
+            if seconds is None:
+                return list(ticks)
+            cutoff = ticks[-1]["timestamp"] - timedelta(seconds=seconds)
+            return [t for t in ticks if t["timestamp"] >= cutoff]

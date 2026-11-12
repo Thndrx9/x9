@@ -107,10 +107,18 @@ def get_events_for_day(base_dir: str, day: date) -> List[ConnEvent]:
         return []
 
 
-def has_event_today(base_dir: str, event: str, when: datetime) -> bool:
-    """Check whether `event` has already been logged for when.date()."""
-    for logged_event, _ts_ms, _mode in get_events_for_day(base_dir, when.date()):
-        if logged_event == event:
+def has_event_today(base_dir: str, event: str, when: datetime, mode: Optional[str] = None) -> bool:
+    """
+    Check whether `event` has already been logged for when.date().
+
+    mode: if given, only counts events logged with that exact mode
+    (e.g. "Quote" vs "Depth") — needed because both feeds now share
+    this same log; without filtering, Quote connecting first would
+    make Depth's own first-connect-of-the-day wrongly log as
+    RECONNECTED instead of DAY_STARTED, and vice versa.
+    """
+    for logged_event, _ts_ms, logged_mode in get_events_for_day(base_dir, when.date()):
+        if logged_event == event and (mode is None or logged_mode == mode):
             return True
     return False
 

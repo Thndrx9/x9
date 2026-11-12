@@ -17,7 +17,7 @@ MARKET_CLOSE = dtime(15, 30)
 PRE_CONNECT = dtime(9, 14)  # 1 minute before market open
 
 # ── Trading calendar ────────────────────────────────────────────────────
-_CALENDAR_FILE = Path(__file__).resolve().parent / "trading_calendar.json"
+_CALENDAR_FILE = Path(__file__).resolve().parent.parent / "trading_calendar.json"   # project root
 
 _holidays: Set[date] = set()
 _special_open: Set[date] = set()
@@ -231,6 +231,36 @@ def seconds_until_pre_connect(dt: Optional[datetime] = None) -> float:
 
     # Fallback (shouldn't happen unless calendar blocks 15+ consecutive days)
     return max(0.0, (target - dt).total_seconds())
+
+
+def trading_day_n_back(n: int, from_date: Optional[date] = None) -> date:
+    """
+    The date that is the n-th most recent trading day at-or-before
+    from_date. n=0 -> from_date itself if it's a trading day, else the
+    closest trading day before it. n=1 -> one trading day before that.
+    Walks backward against the holiday/weekend calendar (bounded to a
+    generous 30-day lookback per step to avoid an unbounded loop if the
+    calendar is ever badly malformed).
+    """
+    if from_date is None:
+        from_date = now_kolkata().date()
+
+    d = from_date
+    for _ in range(30):
+        if is_trading_day(d):
+            break
+        d -= timedelta(days=1)
+
+    remaining = n
+    while remaining > 0:
+        d -= timedelta(days=1)
+        for _ in range(30):
+            if is_trading_day(d):
+                break
+            d -= timedelta(days=1)
+        remaining -= 1
+
+    return d
 
 
 def seconds_until_close(dt: Optional[datetime] = None) -> float:
