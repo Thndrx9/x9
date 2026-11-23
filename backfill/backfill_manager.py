@@ -62,6 +62,61 @@ def _tf_to_seconds(tf_str: str) -> int:
 BUILD_CANDLES_ENABLED = False
 
 
+class _PhaseTimer:
+    """Times each backfill phase. Use `with timer.phase("name"):`.
+
+    While a phase runs, prints a one-line elapsed update every
+    BACKFILL_TIMER_TICK_SECS (default 30; 0 = off) so a long phase shows it
+    is alive; prints the phase's duration when it ends; `summary()` prints
+    a table of all phases. Informational only — never raises."""
+
+    def __init__(self):
+        self.rows = []                      # [(name, seconds)]
+        self._t_all = time.time()
+        try:
+            self._tick = float(os.getenv("BACKFILL_TIMER_TICK_SECS", "30"))
+        except ValueError:
+            self._tick = 30.0
+
+    @staticmethod
+    def _fmt(sec: float) -> str:
+        sec = int(round(sec))
+        return f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s"
+
+    def phase(self, name: str):
+        timer = self
+
+        class _Ctx:
+            def __enter__(self_):
+                self_.t0 = time.time()
+                self_.stop = threading.Event()
+                if timer._tick > 0:
+                    def _ticker():
+                        while not self_.stop.wait(timer._tick):
+                            print(f"[BACKFILL][TIME] {name} ... {timer._fmt(time.time() - self_.t0)} elapsed", flush=True)
+                    threading.Thread(target=_ticker, name="phase-timer", daemon=True).start()
+                return self_
+
+            def __exit__(self_, exc_type, exc, tb):
+                self_.stop.set()
+                dt = time.time() - self_.t0
+                timer.rows.append((name, dt))
+                status = "" if exc_type is None else " (failed)"
+                print(f"[BACKFILL][TIME] {name}: {timer._fmt(dt)}{status}", flush=True)
+                return False
+        return _Ctx()
+
+    def summary(self):
+        if not self.rows:
+            return
+        total = time.time() - self._t_all
+        w = max(len(n) for n, _ in self.rows)
+        print("[BACKFILL][TIME] ── phase timings ──", flush=True)
+        for n, s in self.rows:
+            print(f"[BACKFILL][TIME]   {n:<{w}}  {self._fmt(s):>7}  {100 * s / total:4.0f}%", flush=True)
+        print(f"[BACKFILL][TIME]   {'TOTAL':<{w}}  {self._fmt(total):>7}", flush=True)
+
+
 class BackfillManager:
     """
     BackfillManager — ORCHESTRATION + DB I/O ONLY
@@ -628,14 +683,29 @@ class BackfillManager:
                     next_mark += 25
         return loaded, rows_total
 
-    def _archive_plan_kind(self, kind, window_start, symbols, now, chunk_size: int):
+    def _archive_today_eligible(self, now) -> bool:
+        """True once TODAY's session is over and upstream has published
+        today's Parquet files: a trading day, and now >= ARCHIVE_TODAY_AFTER
+        (default 16:00 IST). Set ARCHIVE_TODAY_AFTER=off to disable."""
+        raw = os.getenv("ARCHIVE_TODAY_AFTER", "16:00").strip().lower()
+        if raw in ("off", "0", "no", "false", ""):
+            return False
+        try:
+            hh, mm = raw.split(":")
+            cutoff = dtime(int(hh), int(mm))
+        except Exception:
+            cutoff = dtime(16, 0)
+        return bool(is_trading_day(now.date())) and now.time() >= cutoff
+
+    def _archive_plan_kind(self, kind, window_start, symbols, now, chunk_size: int, allow_today: bool = False):
         """What does the local cache still need from the archive for
         `kind`? Returns (day, need) or None when there is nothing to
         load (window is today, or nothing missing locally). Local-cache
-        read only — fast, no network."""
+        read only — fast, no network. allow_today=True is only passed
+        once today's file is published (see _archive_today_eligible)."""
         day = window_start.date()
-        if day >= now.date():
-            return None  # today is never served from the archive
+        if day >= now.date() and not allow_today:
+            return None  # today is never served from the archive mid-session
         need = self._archive_needs(kind, symbols, window_start, day, chunk_size)
         return (day, need) if need else None
 
@@ -662,6 +732,11 @@ class BackfillManager:
         only reports that (history 1m candles cover it; no Postgres
         previous-day pull). `done[kind]` is always set, success or not."""
         verify_jobs = []   # files that loaded OK — verified once ALL loads are done
+        # A kind can now have two jobs (previous day + today): only set its
+        # `done` event after the LAST one, or waiters would resume early.
+        remaining = {}
+        for j in jobs:
+            remaining[j["kind"]] = remaining.get(j["kind"], 0) + 1
         for job in jobs:
             kind, day = job["kind"], job["day"]
             try:
@@ -690,7 +765,9 @@ class BackfillManager:
                     flush=True,
                 )
             finally:
-                done[kind].set()
+                remaining[kind] -= 1
+                if remaining[kind] <= 0:
+                    done[kind].set()
 
         # Both daily files are now loaded (every `done` event is set, so the
         # main thread is not waiting on anything below): verify them.
@@ -738,8 +815,6 @@ class BackfillManager:
             cmd = nice + [sys.executable, script, str(path), "--max-ignored-gap", max_gap]
             if check_ltt:
                 cmd.append("--check-ltt")
-            print(f"[ARCHIVE][VERIFY] checking {kind} {day} — every second of market hours "
-                  f"(gaps up to {max_gap}s ignored) ...", flush=True)
             t0 = time.time()
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -759,22 +834,22 @@ class BackfillManager:
                 report = None
 
             if proc.returncode == 0:
-                verdict = "PASS — every second of market hours is covered"
+                verdict = "PASS"
             elif proc.returncode == 1:
-                verdict = "FAIL — gaps / errors found"
+                verdict = "FAIL"
             else:
-                verdict = f"could not be verified (exit {proc.returncode})"
-            print(f"[ARCHIVE][VERIFY] {kind} {day}: {verdict} ({time.time() - t0:.0f}s)", flush=True)
+                verdict = f"ERROR (exit {proc.returncode})"
+            suffix = f" | report: {report}" if (report and proc.returncode != 0) else ""
+            print(f"[ARCHIVE][VERIFY] {kind} {day}: {verdict} ({time.time() - t0:.0f}s){suffix}", flush=True)
 
-            lines = out.splitlines()
-            shown = lines[:40]
-            for ln in shown:
-                print(f"[ARCHIVE][VERIFY]   {ln}", flush=True)
-            if len(lines) > len(shown):
-                print(f"[ARCHIVE][VERIFY]   ... {len(lines) - len(shown)} more line(s)"
-                      + (f" — full report: {report}" if report else ""), flush=True)
-            elif report:
-                print(f"[ARCHIVE][VERIFY]   report saved: {report}", flush=True)
+            # Detail only when something is wrong; PASS stays a single line.
+            if proc.returncode != 0:
+                lines = out.splitlines()
+                shown = lines[:10]
+                for ln in shown:
+                    print(f"[ARCHIVE][VERIFY]   {ln}", flush=True)
+                if len(lines) > len(shown):
+                    print(f"[ARCHIVE][VERIFY]   ... {len(lines) - len(shown)} more line(s) in report", flush=True)
 
     def _preload_from_archive(self, symbols, now, chunk_size: int = 20):
         """
@@ -793,7 +868,7 @@ class BackfillManager:
         {"done": {kind: Event}, "loading": {kind...}, "incomplete": {kind: True}}.
         """
         done = {"quote": threading.Event(), "depth": threading.Event()}
-        self._archive_bg = {"done": done, "loading": set(), "incomplete": {}}
+        self._archive_bg = {"done": done, "loading": set(), "incomplete": {}, "today": set()}
         if self.tick_writer is None or not getattr(self._archive, "enabled", False):
             done["quote"].set(); done["depth"].set()
             return
@@ -801,47 +876,80 @@ class BackfillManager:
         jobs = []
         try:
             # What's missing locally — quick, sequential (shares one writer / gap scanner).
-            plans = {}
+            # Ordered list of (kind, day, need). Previous trading day first;
+            # then — once the session is over and today's files are
+            # published (>= 16:00 IST) — today as well, so Postgres has
+            # (almost) nothing left to supply.
+            plans = []
+            # Previous trading day's TICK (quote) / depth data comes from
+            # Parquet (candles come prebuilt from Postgres, but ticks and
+            # depth do not). ARCHIVE_PREV_DAY_KINDS picks which kinds:
+            # default "quote,depth"; "quote" for ticks only; "off" for none.
+            _pk = os.getenv("ARCHIVE_PREV_DAY_KINDS", "quote,depth").strip().lower()
+            prev_kinds = set() if _pk in ("off", "none", "0", "") else {k.strip() for k in _pk.split(",")}
             for kind, window_start in (
                 ("quote", self._tier1_boundary_start(now)),
                 ("depth", self._compute_depth_lookback_start(now)),
             ):
+                if kind not in prev_kinds:
+                    continue
                 plan = self._archive_plan_kind(kind, window_start, symbols, now, chunk_size)
                 if plan is not None:
-                    plans[kind] = plan
+                    plans.append((kind, plan[0], plan[1]))
+            self._archive_bg["today"] = set()
+            if self._archive_today_eligible(now):
+                today_open_dt = datetime.combine(now.date(), dtime(9, 15, 0)).replace(tzinfo=tz_kolkata)
+                for kind in ("quote", "depth"):
+                    plan = self._archive_plan_kind(kind, today_open_dt, symbols, now, chunk_size, allow_today=True)
+                    if plan is not None:
+                        plans.append((kind, plan[0], plan[1]))
+                        self._archive_bg["today"].add(kind)
+                if self._archive_bg["today"]:
+                    print(
+                        f"[BACKFILL][ARCHIVE] session over (>= {os.getenv('ARCHIVE_TODAY_AFTER', '16:00')} IST) "
+                        f"— also fetching TODAY's Parquet ({', '.join(sorted(self._archive_bg['today']))})",
+                        flush=True,
+                    )
 
             # Downloads run ONE AFTER ANOTHER (quote, then depth) — never at
             # the same time, so they don't split the bandwidth — and nothing
             # else runs between them: no loading, no Postgres. The plans
             # above were already computed, so depth's download starts the
             # moment quote's ends.
-            results = {}
-            for kind in ("quote", "depth"):
-                if kind not in plans:
-                    continue
-                day, need = plans[kind]
+            results = []
+            for kind, day, need in plans:
                 try:
-                    results[kind] = self._archive_download_kind(kind, day, need)
+                    results.append((kind, day, self._archive_download_kind(kind, day, need)))
                 except Exception as exc:
-                    print(f"[BACKFILL][ARCHIVE][WARN] {kind} archive download failed: {exc}", flush=True)
-                    results[kind] = None
+                    print(f"[BACKFILL][ARCHIVE][WARN] {kind} {day} archive download failed: {exc}", flush=True)
+                    results.append((kind, day, None))
+                    if day == now.date():
+                        self._archive_bg["today"].discard(kind)
 
-            for kind in ("quote", "depth"):          # load order
-                job = results.get(kind)
-                if job is None:
+            for kind in ("quote", "depth"):
+                kind_jobs = [j for k, d, j in results if k == kind and j is not None]
+                if not kind_jobs:
                     done[kind].set()                 # nothing to wait for on this kind
-                else:
-                    jobs.append(job)
-                    self._archive_bg["loading"].add(kind)
+                    if kind in self._archive_bg["today"]:
+                        self._archive_bg["today"].discard(kind)   # today's file unavailable → Postgres path
+                    continue
+                jobs.extend(kind_jobs)
+                self._archive_bg["loading"].add(kind)
+            # A today-job whose download failed must not hold back the Postgres fetch.
+            for k, d, j in results:
+                if j is None and d == now.date():
+                    self._archive_bg["today"].discard(k)
 
             if not jobs:
                 print("[BACKFILL][ARCHIVE] nothing to load from the Parquet archive", flush=True)
                 return
-            threading.Thread(
+            loader = threading.Thread(
                 target=self._archive_worker,
                 args=(jobs, chunk_size, done, self._archive_bg["incomplete"]),
                 name="archive-loader", daemon=True,
-            ).start()
+            )
+            self._archive_bg["thread"] = loader
+            loader.start()
             print(
                 "[BACKFILL][ARCHIVE] downloads complete — loading into the local db "
                 "in the background, continuing with today's main-db fetch",
@@ -852,6 +960,7 @@ class BackfillManager:
             # download bookkeeping) — fall back to the plain main-db path.
             print(f"[BACKFILL][ARCHIVE][WARN] archive preload skipped: {exc}", flush=True)
             self._archive_bg["loading"].clear()
+            self._archive_bg["today"].clear()
             for ev in done.values():
                 ev.set()
 
@@ -919,6 +1028,8 @@ class BackfillManager:
             flush=True,
         )
 
+        timer = _PhaseTimer()
+
         existing_tables = self._existing_tables_or_empty(
             self._load_existing_quote_tables(self.conn), "quote", "startup tick backfill (main db)"
         )
@@ -939,7 +1050,8 @@ class BackfillManager:
         # Only the Parquet DOWNLOADS (quote then depth, one after another) block here;
         # loading them into the local db continues on a background thread
         # (see _preload_from_archive).
-        self._preload_from_archive(symbols, now, chunk_size=chunk_size)
+        with timer.phase("0  parquet download"):
+            self._preload_from_archive(symbols, now, chunk_size=chunk_size)
 
         # Step 1 — make the local tick cache correct (no candles yet).
         # Only fetches/keeps raw ticks from the Tier-1 boundary onward
@@ -967,17 +1079,28 @@ class BackfillManager:
         if archive_on:
             step1_start = max(tier1_start, today_open)
             run_step1 = now > today_open   # pre-market / non-trading day: nothing of today's to fetch
+        today_arch = getattr(self, "_archive_bg", None) or {}
+        today_arch = today_arch.get("today", set())
+        if run_step1 and "quote" in today_arch:
+            # Post-close: today's quote Parquet is being loaded, so it OWNS
+            # today. Fetching today from Postgres now would duplicate it
+            # (no dedup on timestamp). Wait for the load, then the normal
+            # scan below only pulls whatever the archive didn't cover.
+            with timer.phase("1a wait: today's quote parquet load"):
+                self._archive_wait("quote")
         if run_step1:
-            self.sync_local_cache_with_main_db(
-                symbols, step1_start, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
-            )
+            with timer.phase("1  ticks from Postgres"):
+                self.sync_local_cache_with_main_db(
+                    symbols, step1_start, now, existing_tables, quote_outage_windows, chunk_size=chunk_size
+                )
 
         # Step 1b — Tier-2 daily rollover: whatever day(s) have aged
         # out of the Tier-1 window since the last run get converted
         # into candle1m_<symbol> (locally aggregated if that day's raw
         # ticks are still cached+trusted, else fetched pre-aggregated
         # from the main db) — see sync_1m_candle_cache()'s docstring.
-        self.sync_1m_candle_cache(symbols, start_ts, now, chunk_size=chunk_size)
+        with timer.phase("1b 1m candle cache"):
+            self.sync_1m_candle_cache(symbols, start_ts, now, chunk_size=chunk_size)
 
         # History-db connection is opened here, right before it's
         # actually used — not up front. Step 1 above can take a while
@@ -996,17 +1119,19 @@ class BackfillManager:
 
         # Step 2 — make the local history-candle cache correct.
         if history_conn is not None:
-            self.sync_history_cache_with_main_db(
-                symbols, start_ts, now, history_existing_tables, chunk_size=chunk_size
-            )
-            self._prune_history_candles_before(
-                [s["symbol"] for s in symbols],
-                self._history_candle_retention_cutoff_ms(now),
-            )
+            with timer.phase("2  history candles"):
+                self.sync_history_cache_with_main_db(
+                    symbols, start_ts, now, history_existing_tables, chunk_size=chunk_size
+                )
+                self._prune_history_candles_before(
+                    [s["symbol"] for s in symbols],
+                    self._history_candle_retention_cutoff_ms(now),
+                )
 
         # Step 2d: mirror market_history's daily_<symbol> tables locally —
         # unchanged from the old run(), not part of the RAM problem.
-        self.fetch_daily_candles(symbols)
+        with timer.phase("2d daily candles"):
+            self.fetch_daily_candles(symbols)
 
         # Step 3 — depth backfill (already chunked — see _run_depth_backfill).
         # Runs BEFORE candle building so that candle building only starts
@@ -1020,22 +1145,28 @@ class BackfillManager:
             depth_start = max(self._compute_depth_lookback_start(now), today_open)
             run_depth = now > today_open   # pre-market / non-trading day: nothing of today's
         if run_depth:
-            self._run_depth_backfill(symbols, now, start_override=depth_start)
+            if "depth" in today_arch:
+                with timer.phase("3a wait: today's depth parquet load"):
+                    self._archive_wait("depth")   # today's depth Parquet owns today — see Step 1
+            with timer.phase("3  depth from Postgres"):
+                self._run_depth_backfill(symbols, now, start_override=depth_start)
         elif depth_bg:
             # Nothing to fetch from Postgres (pre-market / non-trading day),
             # but the previous day's depth is still being loaded: let it
             # finish, then seed the RAM window from it.
-            self._archive_wait("depth")
-            self.tick_writer.flush_and_wait()
-            self._seed_depth_ram(symbols, now)
+            with timer.phase("3  depth parquet load + RAM seed"):
+                self._archive_wait("depth")
+                self.tick_writer.flush_and_wait()
+                self._seed_depth_ram(symbols, now)
 
         # Step 3b — let both background archive loads finish before
         # anything reads the local cache back. There is deliberately NO
         # Postgres re-check of the previous day here: whatever the archive
         # lacked is covered by the history db's 1m candles (Step 2).
         if quote_bg or depth_bg:
-            self._archive_wait("quote")
-            self._archive_wait("depth")
+            with timer.phase("3b wait: remaining parquet loads"):
+                self._archive_wait("quote")
+                self._archive_wait("depth")
             for kind in ("quote", "depth"):
                 if self._archive_loading(kind) and self._archive_incomplete(kind):
                     print(
@@ -1083,6 +1214,7 @@ class BackfillManager:
             except Exception:
                 pass
 
+        timer.summary()
         print("[BACKFILL] Completed (low-memory path)", flush=True)
 
     # ─────────────────────────────────────────────
@@ -1849,13 +1981,24 @@ class BackfillManager:
         """
         if self.tick_writer is None:
             return
+        # While the background Parquet loader is running, it shares this
+        # writer queue and enqueues a whole chunk at once — which alone
+        # exceeds the normal cap and made the Postgres fetch sit here
+        # waiting for the PARQUET backlog to drain. Use a much higher cap
+        # during the load so Postgres fetching runs alongside it. (Today's
+        # Postgres data is small, so RAM impact is bounded.)
+        cap = self.fetch_ahead_max_pending
+        bg = getattr(self, "_archive_bg", None)
+        loader = bg.get("thread") if bg else None
+        if loader is not None and loader.is_alive():
+            cap = max(cap, int(os.getenv("BACKFILL_FETCH_AHEAD_CAP_DURING_LOAD", "400")))
         waited = 0.0
         while waited < max_wait_secs:
             try:
                 depth = self.tick_writer.get_metrics().get("queue_depth", 0)
             except Exception:
                 return  # metrics unavailable — don't let pacing itself break the fetch loop
-            if depth < self.fetch_ahead_max_pending:
+            if depth < cap:
                 return
             time.sleep(poll_secs)
             waited += poll_secs
@@ -2879,8 +3022,6 @@ class BackfillManager:
                     local_conn.commit()
 
             if missing_dates_by_symbol:
-                preview = ", ".join(list(missing_dates_by_symbol)[:10])
-                more = f" (+{len(missing_dates_by_symbol) - 10} more)" if len(missing_dates_by_symbol) - 10 > 0 else ""
                 total_missing_dates = sum(len(v) for v in missing_dates_by_symbol.values())
                 # Which dates, and for how many symbols each — one date
                 # missing for every symbol means a date-level cause (days
@@ -2890,14 +3031,14 @@ class BackfillManager:
                 for _dates in missing_dates_by_symbol.values():
                     for _d in _dates:
                         missing_per_date[_d] = missing_per_date.get(_d, 0) + 1
-                dates_txt = ", ".join(
-                    f"{_d.isoformat()} ({_n} symbol(s))" for _d, _n in sorted(missing_per_date.items())
-                )
+                # Minimal info line only — NOT a warning: the dates are about
+                # to be re-fetched. A [WARN] is printed below only for dates
+                # the history db could not supply.
+                _md = sorted(missing_per_date)
                 print(
-                    f"[BACKFILL][WARN] {len(missing_dates_by_symbol)} symbol(s) have "
-                    f"{total_missing_dates} confirmed missing trading day(s) in their "
-                    f"cached daily candles — re-fetching just those dates: {preview}{more}\n"
-                    f"[BACKFILL] Missing daily dates: {dates_txt}",
+                    f"[BACKFILL] Daily cache: re-fetching missing candles for "
+                    f"{len(missing_dates_by_symbol)} symbol(s) over {len(_md)} date(s) "
+                    f"({_md[0].isoformat()}..{_md[-1].isoformat()})",
                     flush=True,
                 )
                 recovered_per_date = {}
